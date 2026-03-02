@@ -7,13 +7,17 @@ Web-only chat app (OpenAI-like UI) with a Fastify gateway, Next.js frontend, Pos
 - Cookie-based auth (`httpOnly` session cookie) for same-origin web usage.
 - Cloud-synced chat history in Postgres (`threads` + `messages`).
 - BYOK per user (encrypted at rest with AES-256-GCM via `KEY_ENCRYPTION_KEY`).
+- Admin controls:
+  - `ADMIN_EMAIL` bootstrapped admin access
+  - provider base URL + enabled flag management
+  - allowed model allowlist (users can only use enabled admin-approved models)
 - Multi-provider routing:
   - `openai` (`https://api.openai.com/v1`)
   - `grok2api` (`https://gapi.lyxnb.de5.net/v1`)
 - OpenAI-compatible API surface in the gateway:
   - `POST /v1/responses` (primary, supports `stream: true` SSE proxy)
   - `POST /v1/chat/completions` (compat)
-  - `GET /v1/models` (merged, 60s cache)
+  - `GET /v1/models` (enabled admin allowlist only)
   - `POST /v1/files` (multipart image upload)
 - Vision flow: uploaded images are stored privately in MinIO, then gateway fetches image bytes and injects data URLs into upstream request payload.
 - Security controls:
@@ -36,6 +40,7 @@ Tables:
 
 - `users`
 - `providers`
+- `allowed_models`
 - `user_provider_keys`
 - `threads`
 - `messages`
@@ -107,6 +112,12 @@ Gateway routes:
 - `POST /me/keys`
 - `GET /me/keys`
 - `POST /me/provider`
+- `GET /admin/providers`
+- `PATCH /admin/providers/:providerCode`
+- `GET /admin/models`
+- `POST /admin/models`
+- `PATCH /admin/models/:id`
+- `DELETE /admin/models/:id`
 - `GET /me/threads`
 - `GET /me/threads/:threadId/messages`
 - `GET /v1/models`
@@ -117,5 +128,6 @@ Gateway routes:
 ## Notes
 
 - `KEY_ENCRYPTION_KEY` is mandatory.
+- `ADMIN_EMAIL` must be set to enable admin endpoints and `/admin` UI link.
 - `APP_ORIGIN` must match the web origin used by browser clients.
 - `SECURE_COOKIES=true` should be enabled behind HTTPS.

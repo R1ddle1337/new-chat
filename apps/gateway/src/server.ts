@@ -12,6 +12,7 @@ import { runMigrations } from './migrations';
 type DbUser = {
   id: string;
   email: string;
+  is_admin: boolean;
   default_provider_id: number | null;
   default_model: string | null;
 };
@@ -21,6 +22,7 @@ type ProviderRow = {
   code: string;
   name: string;
   base_url: string;
+  enabled: boolean;
 };
 
 type UserProviderKeyRow = {
@@ -43,6 +45,16 @@ type StoredFileRow = {
   id: string;
   filename: string;
   mime_type: string;
+};
+
+type AllowedModelRow = {
+  id: number;
+  provider_id: number;
+  provider_code: string;
+  model_id: string;
+  display_name: string | null;
+  enabled: boolean;
+  created_at: string;
 };
 
 declare module 'fastify' {
@@ -70,6 +82,7 @@ const config = {
   minioBucket: process.env.MINIO_BUCKET ?? 'uploads',
   keyEncryptionKey: process.env.KEY_ENCRYPTION_KEY ?? '',
   secureCookies: process.env.SECURE_COOKIES === 'true',
+  adminEmail: (process.env.ADMIN_EMAIL ?? '').trim().toLowerCase(),
 };
 
 if (!config.keyEncryptionKey) {
@@ -118,7 +131,45 @@ const app = Fastify({
 });
 
 const stateChangingMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-const modelCache = new Map<string, { expiresAt: number; data: unknown }>();
+
+function normalizeEmail(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function isConfiguredAdminEmail(email: string): boolean {
+  return Boolean(config.adminEmail) && normalizeEmail(email) === config.adminEmail;
+}
+
+function normalizeProviderBaseUrl(raw: string): string | null {
+  const candidate = raw.trim();
+  if (!candidate) {
+    return null;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return null;
+  }
+
+  const protocol = parsed.protocol.toLowerCase();
+  if (protocol !== 'http:' && protocol !== 'https:') {
+    return null;
+  }
+
+  if (!parsed.hostname) {
+    return null;
+  }
+
+  if (parsed.search || parsed.hash) {
+    return null;
+  }
+
+  const cleanedPath = parsed.pathname.replace(/\/+$/, '');
+  const pathname = cleanedPath ? cleanedPath : '';
+  return `${parsed.origin}${pathname}`;
+}
 
 function encryptApiKey(plainText: string): { encrypted: string; iv: string; authTag: string } {
   const iv = crypto.randomBytes(12);
@@ -271,7 +322,7 @@ async function destroySession(request: FastifyRequest, reply: FastifyReply): Pro
 
 async function getUserById(userId: string): Promise<DbUser | null> {
   const result = await pool.query<DbUser>(
-    'SELECT id, email, default_provider_id, default_model FROM users WHERE id = $1',
+    'SELECT id, email, is_admin, default_provider_id, default_model FROM users WHERE id = $1',
     [userId],
   );
   return result.rowCount ? result.rows[0]! : null;
@@ -279,7 +330,7 @@ async function getUserById(userId: string): Promise<DbUser | null> {
 
 async function getProviderByCode(code: string): Promise<ProviderRow | null> {
   const result = await pool.query<ProviderRow>(
-    'SELECT id, code, name, base_url FROM providers WHERE code = $1',
+    'SELECT id, code, name, base_url, enabled FROM providers WHERE code = $1',
     [code],
   );
   return result.rowCount ? result.rows[0]! : null;
@@ -287,7 +338,7 @@ async function getProviderByCode(code: string): Promise<ProviderRow | null> {
 
 async function getProviderById(providerId: number): Promise<ProviderRow | null> {
   const result = await pool.query<ProviderRow>(
-    'SELECT id, code, name, base_url FROM providers WHERE id = $1',
+    'SELECT id, code, name, base_url, enabled FROM providers WHERE id = $1',
     [providerId],
   );
   return result.rowCount ? result.rows[0]! : null;
@@ -295,9 +346,88 @@ async function getProviderById(providerId: number): Promise<ProviderRow | null> 
 
 async function getAllProviders(): Promise<ProviderRow[]> {
   const result = await pool.query<ProviderRow>(
-    'SELECT id, code, name, base_url FROM providers ORDER BY id ASC',
+    'SELECT id, code, name, base_url, enabled FROM providers ORDER BY id ASC',
   );
   return result.rows;
+}
+
+async function getDefaultProviderForUser(): Promise<ProviderRow | null> {
+  const openai = await getProviderByCode('openai');
+  if (openai && openai.enabled) {
+    return openai;
+  }
+
+  const result = await pool.query<ProviderRow>(
+    `SELECT id, code, name, base_url, enabled
+     FROM providers
+     WHERE enabled = true
+     ORDER BY id ASC
+     LIMIT 1`,
+  );
+  return result.rowCount ? result.rows[0]! : null;
+}
+
+async function listAllowedModels(params?: {
+  includeDisabled?: boolean;
+}): Promise<AllowedModelRow[]> {
+  const includeDisabled = params?.includeDisabled ?? false;
+  const result = await pool.query<AllowedModelRow>(
+    `SELECT am.id,
+            am.provider_id,
+            p.code AS provider_code,
+            am.model_id,
+            am.display_name,
+            am.enabled,
+            am.created_at
+     FROM allowed_models am
+     JOIN providers p ON p.id = am.provider_id
+     WHERE ($1::boolean = true OR (am.enabled = true AND p.enabled = true))
+     ORDER BY p.code ASC, am.model_id ASC`,
+    [includeDisabled],
+  );
+  return result.rows;
+}
+
+async function findAllowedModel(providerId: number, modelId: string): Promise<AllowedModelRow | null> {
+  const normalizedModel = modelId.trim();
+  if (!normalizedModel) {
+    return null;
+  }
+
+  const result = await pool.query<AllowedModelRow>(
+    `SELECT am.id,
+            am.provider_id,
+            p.code AS provider_code,
+            am.model_id,
+            am.display_name,
+            am.enabled,
+            am.created_at
+     FROM allowed_models am
+     JOIN providers p ON p.id = am.provider_id
+     WHERE am.provider_id = $1
+       AND am.model_id = $2
+       AND am.enabled = true
+       AND p.enabled = true`,
+    [providerId, normalizedModel],
+  );
+  return result.rowCount ? result.rows[0]! : null;
+}
+
+async function syncUserAdminFlag(user: DbUser): Promise<DbUser> {
+  const shouldBeAdmin = isConfiguredAdminEmail(user.email);
+  if (user.is_admin === shouldBeAdmin) {
+    return user;
+  }
+
+  await pool.query('UPDATE users SET is_admin = $2, updated_at = now() WHERE id = $1', [
+    user.id,
+    shouldBeAdmin,
+  ]);
+
+  return {
+    ...user,
+    is_admin: shouldBeAdmin,
+  };
 }
 
 async function getUserProviderKey(userId: string, providerId: number): Promise<string | null> {
@@ -325,21 +455,50 @@ async function resolveProviderForRequest(
     if (!byCode) {
       throw new Error(`Unknown provider: ${providerOverride}`);
     }
+    if (!byCode.enabled) {
+      throw new Error(`Provider is disabled: ${providerOverride}`);
+    }
     return byCode;
   }
 
   if (user.default_provider_id) {
     const byId = await getProviderById(user.default_provider_id);
-    if (byId) {
+    if (byId && byId.enabled) {
       return byId;
     }
   }
 
-  const openai = await getProviderByCode('openai');
-  if (!openai) {
-    throw new Error('Provider configuration is missing for openai');
+  const defaultProvider = await getDefaultProviderForUser();
+  if (!defaultProvider) {
+    throw new Error('No enabled providers are configured');
   }
-  return openai;
+  return defaultProvider;
+}
+
+async function resolveAndValidateProviderModel(params: {
+  user: DbUser;
+  providerOverride?: string;
+  requestedModel?: string;
+}): Promise<{ provider: ProviderRow; model: string }> {
+  const provider = await resolveProviderForRequest(params.user, params.providerOverride);
+  const modelCandidate = (params.requestedModel ?? params.user.default_model ?? '').trim();
+  if (!modelCandidate) {
+    throw new Error(
+      `Model is required and must be allowed for provider "${provider.code}".`,
+    );
+  }
+
+  const allowed = await findAllowedModel(provider.id, modelCandidate);
+  if (!allowed) {
+    throw new Error(
+      `Model "${modelCandidate}" is not allowed for provider "${provider.code}".`,
+    );
+  }
+
+  return {
+    provider,
+    model: allowed.model_id,
+  };
 }
 
 const threadTitleSentenceBoundary = /[.!?]\s/;
@@ -876,8 +1035,28 @@ async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promis
     return;
   }
 
+  const syncedUser = await syncUserAdminFlag(user);
+
   request.sessionId = sessionId;
-  request.authUser = user;
+  request.authUser = syncedUser;
+}
+
+async function requireAdmin(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const user = request.authUser;
+  if (!user) {
+    reply.code(401).send({ error: 'Unauthorized' });
+    return;
+  }
+
+  if (!config.adminEmail) {
+    reply.code(403).send({ error: 'Admin access is disabled. ADMIN_EMAIL is not configured.' });
+    return;
+  }
+
+  if (!user.is_admin || !isConfiguredAdminEmail(user.email)) {
+    reply.code(403).send({ error: 'Admin access denied' });
+    return;
+  }
 }
 
 async function setupServer(): Promise<void> {
@@ -928,19 +1107,20 @@ async function setupServer(): Promise<void> {
       return;
     }
 
-    const openaiProvider = await getProviderByCode('openai');
-    if (!openaiProvider) {
+    const defaultProvider = await getDefaultProviderForUser();
+    if (!defaultProvider) {
       reply.code(500).send({ error: 'Default provider missing' });
       return;
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
+    const isAdmin = isConfiguredAdminEmail(email);
     try {
       const created = await pool.query<DbUser>(
-        `INSERT INTO users (email, password_hash, default_provider_id)
-         VALUES ($1, $2, $3)
-         RETURNING id, email, default_provider_id, default_model`,
-        [email, passwordHash, openaiProvider.id],
+        `INSERT INTO users (email, password_hash, is_admin, default_provider_id)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, email, is_admin, default_provider_id, default_model`,
+        [email, passwordHash, isAdmin, defaultProvider.id],
       );
       const user = created.rows[0]!;
       await createSession(reply, user.id);
@@ -955,7 +1135,9 @@ async function setupServer(): Promise<void> {
       reply.send({
         id: user.id,
         email: user.email,
-        default_provider: openaiProvider.code,
+        is_admin: user.is_admin,
+        admin_enabled: Boolean(config.adminEmail),
+        default_provider: defaultProvider.code,
         default_model: user.default_model,
       });
     } catch (error) {
@@ -984,7 +1166,7 @@ async function setupServer(): Promise<void> {
     }
 
     const userResult = await pool.query<DbUser & { password_hash: string }>(
-      `SELECT id, email, password_hash, default_provider_id, default_model
+      `SELECT id, email, password_hash, is_admin, default_provider_id, default_model
        FROM users
        WHERE email = $1`,
       [email],
@@ -1013,21 +1195,27 @@ async function setupServer(): Promise<void> {
       return;
     }
 
-    await createSession(reply, user.id);
+    const syncedUser = await syncUserAdminFlag(user);
+    await createSession(reply, syncedUser.id);
 
     await writeAuditEvent({
       eventType: 'auth.login_success',
       request,
-      userId: user.id,
+      userId: syncedUser.id,
       metadata: {},
     });
 
-    const provider = user.default_provider_id ? await getProviderById(user.default_provider_id) : null;
+    const provider = syncedUser.default_provider_id
+      ? await getProviderById(syncedUser.default_provider_id)
+      : null;
+    const fallbackProvider = await getDefaultProviderForUser();
     reply.send({
-      id: user.id,
-      email: user.email,
-      default_provider: provider?.code ?? 'openai',
-      default_model: user.default_model,
+      id: syncedUser.id,
+      email: syncedUser.email,
+      is_admin: syncedUser.is_admin,
+      admin_enabled: Boolean(config.adminEmail),
+      default_provider: provider?.code ?? fallbackProvider?.code ?? 'openai',
+      default_model: syncedUser.default_model,
     });
   });
 
@@ -1048,10 +1236,13 @@ async function setupServer(): Promise<void> {
   app.get('/me', { preHandler: [requireAuth] }, async (request) => {
     const user = request.authUser!;
     const provider = user.default_provider_id ? await getProviderById(user.default_provider_id) : null;
+    const fallbackProvider = await getDefaultProviderForUser();
     return {
       id: user.id,
       email: user.email,
-      default_provider: provider?.code ?? 'openai',
+      is_admin: user.is_admin && isConfiguredAdminEmail(user.email),
+      admin_enabled: Boolean(config.adminEmail),
+      default_provider: provider?.code ?? fallbackProvider?.code ?? 'openai',
       default_model: user.default_model,
     };
   });
@@ -1275,6 +1466,10 @@ async function setupServer(): Promise<void> {
       reply.code(400).send({ error: 'Unknown provider' });
       return;
     }
+    if (!provider.enabled) {
+      reply.code(400).send({ error: `Provider "${provider.code}" is disabled` });
+      return;
+    }
 
     const encrypted = encryptApiKey(apiKey);
 
@@ -1289,8 +1484,6 @@ async function setupServer(): Promise<void> {
              updated_at = now()`,
       [user.id, provider.id, encrypted.encrypted, encrypted.iv, encrypted.authTag],
     );
-
-    modelCache.delete(user.id);
 
     await writeAuditEvent({
       eventType: 'keys.updated',
@@ -1325,6 +1518,7 @@ async function setupServer(): Promise<void> {
     return {
       data: providers.map((provider) => ({
         provider: provider.code,
+        enabled: provider.enabled,
         has_key: byProvider.has(provider.id),
         masked_key: byProvider.get(provider.id)?.masked ?? null,
       })),
@@ -1335,7 +1529,8 @@ async function setupServer(): Promise<void> {
     const user = request.authUser!;
     const body = request.body as { provider?: unknown; model?: unknown };
     const providerCode = typeof body.provider === 'string' ? body.provider.trim() : '';
-    const model = typeof body.model === 'string' ? body.model.trim() : null;
+    const modelValue = typeof body.model === 'string' ? body.model.trim() : '';
+    const model = modelValue || null;
 
     if (!providerCode) {
       reply.code(400).send({ error: 'provider is required' });
@@ -1347,10 +1542,24 @@ async function setupServer(): Promise<void> {
       reply.code(400).send({ error: 'Unknown provider' });
       return;
     }
+    if (!provider.enabled) {
+      reply.code(400).send({ error: `Provider "${provider.code}" is disabled` });
+      return;
+    }
+
+    if (model) {
+      const allowed = await findAllowedModel(provider.id, model);
+      if (!allowed) {
+        reply
+          .code(400)
+          .send({ error: `Model "${model}" is not allowed for provider "${provider.code}".` });
+        return;
+      }
+    }
 
     await pool.query(
       `UPDATE users
-       SET default_provider_id = $2,
+        SET default_provider_id = $2,
            default_model = $3,
            updated_at = now()
        WHERE id = $1`,
@@ -1367,107 +1576,351 @@ async function setupServer(): Promise<void> {
     reply.send({ ok: true });
   });
 
-  app.get('/v1/models', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
+  app.get(
+    '/admin/providers',
+    { preHandler: [requireAuth, requireAdmin] },
+    async () => {
+      const providers = await getAllProviders();
+      return {
+        data: providers.map((provider) => ({
+          id: provider.id,
+          code: provider.code,
+          name: provider.name,
+          base_url: provider.base_url,
+          enabled: provider.enabled,
+        })),
+      };
+    },
+  );
+
+  app.patch(
+    '/admin/providers/:providerCode',
+    { preHandler: [requireAuth, requireAdmin] },
+    async (request, reply) => {
+      const user = request.authUser!;
+      const params = request.params as { providerCode: string };
+      const body = (request.body ?? {}) as { base_url?: unknown; enabled?: unknown };
+      const providerCode = params.providerCode.trim();
+
+      if (!providerCode) {
+        reply.code(400).send({ error: 'providerCode is required' });
+        return;
+      }
+
+      let hasBaseUrlUpdate = false;
+      let nextBaseUrl: string | null = null;
+      if (Object.prototype.hasOwnProperty.call(body, 'base_url')) {
+        if (typeof body.base_url !== 'string') {
+          reply.code(400).send({ error: 'base_url must be a string' });
+          return;
+        }
+        const normalized = normalizeProviderBaseUrl(body.base_url);
+        if (!normalized) {
+          reply.code(400).send({
+            error:
+              'base_url must be a valid http(s) URL without query string or fragment',
+          });
+          return;
+        }
+        hasBaseUrlUpdate = true;
+        nextBaseUrl = normalized;
+      }
+
+      let hasEnabledUpdate = false;
+      let nextEnabled = true;
+      if (Object.prototype.hasOwnProperty.call(body, 'enabled')) {
+        if (typeof body.enabled !== 'boolean') {
+          reply.code(400).send({ error: 'enabled must be a boolean' });
+          return;
+        }
+        hasEnabledUpdate = true;
+        nextEnabled = body.enabled;
+      }
+
+      if (!hasBaseUrlUpdate && !hasEnabledUpdate) {
+        reply.code(400).send({ error: 'At least one of base_url or enabled is required' });
+        return;
+      }
+
+      const updateParts: string[] = [];
+      const values: Array<string | boolean> = [providerCode];
+      if (hasBaseUrlUpdate) {
+        updateParts.push(`base_url = $${values.length + 1}`);
+        values.push(nextBaseUrl!);
+      }
+      if (hasEnabledUpdate) {
+        updateParts.push(`enabled = $${values.length + 1}`);
+        values.push(nextEnabled);
+      }
+
+      const updated = await pool.query<ProviderRow>(
+        `UPDATE providers
+         SET ${updateParts.join(', ')}
+         WHERE code = $1
+         RETURNING id, code, name, base_url, enabled`,
+        values,
+      );
+
+      if (!updated.rowCount) {
+        reply.code(404).send({ error: 'Provider not found' });
+        return;
+      }
+
+      const provider = updated.rows[0]!;
+
+      await writeAuditEvent({
+        eventType: 'admin.providers.updated',
+        request,
+        userId: user.id,
+        metadata: {
+          provider: provider.code,
+          base_url_updated: hasBaseUrlUpdate,
+          enabled_updated: hasEnabledUpdate,
+        },
+      });
+
+      reply.send({
+        data: {
+          id: provider.id,
+          code: provider.code,
+          name: provider.name,
+          base_url: provider.base_url,
+          enabled: provider.enabled,
+        },
+      });
+    },
+  );
+
+  app.get('/admin/models', { preHandler: [requireAuth, requireAdmin] }, async () => {
+    const models = await listAllowedModels({ includeDisabled: true });
+    return {
+      data: models.map((model) => ({
+        id: model.id,
+        provider_id: model.provider_id,
+        provider: model.provider_code,
+        model_id: model.model_id,
+        display_name: model.display_name,
+        enabled: model.enabled,
+        created_at: model.created_at,
+      })),
+    };
+  });
+
+  app.post('/admin/models', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
     const user = request.authUser!;
-    const cacheEntry = modelCache.get(user.id);
-    if (cacheEntry && cacheEntry.expiresAt > Date.now()) {
-      reply.send(cacheEntry.data);
+    const body = (request.body ?? {}) as {
+      provider?: unknown;
+      model_id?: unknown;
+      display_name?: unknown;
+      enabled?: unknown;
+    };
+    const providerCode = typeof body.provider === 'string' ? body.provider.trim() : '';
+    const modelId = typeof body.model_id === 'string' ? body.model_id.trim() : '';
+    const displayName =
+      typeof body.display_name === 'string' ? body.display_name.trim() || null : null;
+    const enabled = typeof body.enabled === 'boolean' ? body.enabled : true;
+
+    if (!providerCode || !modelId) {
+      reply.code(400).send({ error: 'provider and model_id are required' });
       return;
     }
 
-    const providers = await getAllProviders();
-    const keyRows = await pool.query<UserProviderKeyRow>(
-      `SELECT upk.provider_id, p.code, p.base_url, upk.encrypted_key, upk.iv, upk.auth_tag
-       FROM user_provider_keys upk
-       JOIN providers p ON p.id = upk.provider_id
-       WHERE upk.user_id = $1`,
-      [user.id],
-    );
-
-    const keyByProviderId = new Map<number, string>();
-    for (const row of keyRows.rows) {
-      keyByProviderId.set(row.provider_id, decryptApiKey(row.encrypted_key, row.iv, row.auth_tag));
+    const provider = await getProviderByCode(providerCode);
+    if (!provider) {
+      reply.code(400).send({ error: `Unknown provider "${providerCode}"` });
+      return;
     }
 
-    const merged: Array<Record<string, unknown>> = [];
+    try {
+      const created = await pool.query<AllowedModelRow>(
+        `INSERT INTO allowed_models (provider_id, model_id, display_name, enabled)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id,
+                   provider_id,
+                   $5 AS provider_code,
+                   model_id,
+                   display_name,
+                   enabled,
+                   created_at`,
+        [provider.id, modelId, displayName, enabled, provider.code],
+      );
 
-    for (const provider of providers) {
-      const apiKey = keyByProviderId.get(provider.id);
-      if (!apiKey) {
-        continue;
+      const model = created.rows[0]!;
+
+      await writeAuditEvent({
+        eventType: 'admin.models.created',
+        request,
+        userId: user.id,
+        metadata: {
+          provider: provider.code,
+          model_id: model.model_id,
+          enabled: model.enabled,
+        },
+      });
+
+      reply.code(201).send({
+        data: {
+          id: model.id,
+          provider_id: model.provider_id,
+          provider: model.provider_code,
+          model_id: model.model_id,
+          display_name: model.display_name,
+          enabled: model.enabled,
+          created_at: model.created_at,
+        },
+      });
+    } catch (error) {
+      const pgError = error as { code?: string };
+      if (pgError.code === '23505') {
+        reply
+          .code(409)
+          .send({ error: `Model "${modelId}" already exists for provider "${provider.code}"` });
+        return;
       }
-
-      const started = Date.now();
-      try {
-        const upstream = await fetch(`${provider.base_url}/models`, {
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-          },
-        });
-
-        const bodyText = await upstream.text();
-        let parsed: Record<string, unknown> = {};
-        try {
-          parsed = JSON.parse(bodyText) as Record<string, unknown>;
-        } catch {
-          parsed = {};
-        }
-
-        await writeAuditEvent({
-          eventType: 'upstream.models_call',
-          request,
-          userId: user.id,
-          metadata: {
-            provider: provider.code,
-            status: upstream.status,
-            duration_ms: Date.now() - started,
-          },
-        });
-
-        if (!upstream.ok) {
-          continue;
-        }
-
-        const data = Array.isArray(parsed.data) ? parsed.data : [];
-        for (const model of data) {
-          if (!model || typeof model !== 'object') {
-            continue;
-          }
-
-          const record = model as Record<string, unknown>;
-          merged.push({
-            ...record,
-            provider: provider.code,
-          });
-        }
-      } catch (error) {
-        await writeAuditEvent({
-          eventType: 'upstream.models_call_failed',
-          request,
-          userId: user.id,
-          metadata: {
-            provider: provider.code,
-            duration_ms: Date.now() - started,
-            error: error instanceof Error ? error.message : 'unknown',
-          },
-        });
-      }
+      throw error;
     }
+  });
 
-    const deduped = new Map<string, Record<string, unknown>>();
-    for (const model of merged) {
-      const id = typeof model.id === 'string' ? model.id : 'unknown';
-      const provider = typeof model.provider === 'string' ? model.provider : 'unknown';
-      deduped.set(`${provider}:${id}`, model);
-    }
-
-    const responseBody = {
-      object: 'list',
-      data: Array.from(deduped.values()),
+  app.patch('/admin/models/:id', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+    const user = request.authUser!;
+    const params = request.params as { id: string };
+    const body = (request.body ?? {}) as {
+      display_name?: unknown;
+      enabled?: unknown;
     };
 
-    modelCache.set(user.id, { expiresAt: Date.now() + 60_000, data: responseBody });
-    reply.send(responseBody);
+    const id = Number(params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      reply.code(400).send({ error: 'id must be a positive integer' });
+      return;
+    }
+
+    const updateParts: string[] = [];
+    const values: Array<string | boolean | number | null> = [id];
+
+    if (Object.prototype.hasOwnProperty.call(body, 'display_name')) {
+      if (body.display_name !== null && typeof body.display_name !== 'string') {
+        reply.code(400).send({ error: 'display_name must be a string or null' });
+        return;
+      }
+      const displayName =
+        typeof body.display_name === 'string' ? body.display_name.trim() || null : null;
+      updateParts.push(`display_name = $${values.length + 1}`);
+      values.push(displayName);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'enabled')) {
+      if (typeof body.enabled !== 'boolean') {
+        reply.code(400).send({ error: 'enabled must be a boolean' });
+        return;
+      }
+      updateParts.push(`enabled = $${values.length + 1}`);
+      values.push(body.enabled);
+    }
+
+    if (updateParts.length === 0) {
+      reply.code(400).send({ error: 'At least one of display_name or enabled is required' });
+      return;
+    }
+
+    const updated = await pool.query<AllowedModelRow>(
+      `UPDATE allowed_models am
+       SET ${updateParts.join(', ')}
+       FROM providers p
+       WHERE am.id = $1
+         AND p.id = am.provider_id
+       RETURNING am.id,
+                 am.provider_id,
+                 p.code AS provider_code,
+                 am.model_id,
+                 am.display_name,
+                 am.enabled,
+                 am.created_at`,
+      values,
+    );
+
+    if (!updated.rowCount) {
+      reply.code(404).send({ error: 'Allowed model not found' });
+      return;
+    }
+
+    const model = updated.rows[0]!;
+
+    await writeAuditEvent({
+      eventType: 'admin.models.updated',
+      request,
+      userId: user.id,
+      metadata: {
+        model_id: model.model_id,
+        provider: model.provider_code,
+      },
+    });
+
+    reply.send({
+      data: {
+        id: model.id,
+        provider_id: model.provider_id,
+        provider: model.provider_code,
+        model_id: model.model_id,
+        display_name: model.display_name,
+        enabled: model.enabled,
+        created_at: model.created_at,
+      },
+    });
+  });
+
+  app.delete(
+    '/admin/models/:id',
+    { preHandler: [requireAuth, requireAdmin] },
+    async (request, reply) => {
+      const user = request.authUser!;
+      const params = request.params as { id: string };
+      const id = Number(params.id);
+
+      if (!Number.isInteger(id) || id <= 0) {
+        reply.code(400).send({ error: 'id must be a positive integer' });
+        return;
+      }
+
+      const deleted = await pool.query<{ id: number; model_id: string }>(
+        `DELETE FROM allowed_models
+         WHERE id = $1
+         RETURNING id, model_id`,
+        [id],
+      );
+
+      if (!deleted.rowCount) {
+        reply.code(404).send({ error: 'Allowed model not found' });
+        return;
+      }
+
+      await writeAuditEvent({
+        eventType: 'admin.models.deleted',
+        request,
+        userId: user.id,
+        metadata: {
+          id,
+          model_id: deleted.rows[0]!.model_id,
+        },
+      });
+
+      reply.send({ ok: true });
+    },
+  );
+
+  app.get('/v1/models', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
+    const allowedModels = await listAllowedModels();
+    reply.send({
+      object: 'list',
+      data: allowedModels.map((entry) => ({
+        id: entry.model_id,
+        object: 'model',
+        created: Math.floor(new Date(entry.created_at).getTime() / 1000),
+        owned_by: entry.provider_code,
+        provider: entry.provider_code,
+        display_name: entry.display_name,
+      })),
+    });
   });
 
   app.post('/v1/files', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
@@ -1561,21 +2014,33 @@ async function setupServer(): Promise<void> {
     delete requestBody.thread_id;
     delete requestBody.threadId;
 
-    const provider = await resolveProviderForRequest(user, providerOverride);
+    let provider: ProviderRow;
+    let model: string;
+    try {
+      const resolved = await resolveAndValidateProviderModel({
+        user,
+        providerOverride,
+        requestedModel: typeof requestBody.model === 'string' ? requestBody.model : undefined,
+      });
+      provider = resolved.provider;
+      model = resolved.model;
+    } catch (error) {
+      reply.code(400).send({ error: error instanceof Error ? error.message : 'Invalid model selection' });
+      return;
+    }
+
     const apiKey = await getUserProviderKey(user.id, provider.id);
     if (!apiKey) {
       reply.code(400).send({ error: `No API key configured for provider: ${provider.code}` });
       return;
     }
 
-    if (!requestBody.model && user.default_model) {
-      requestBody.model = user.default_model;
-    }
+    requestBody.model = model;
 
     requestBody.input = await hydrateResponsesInput(requestBody.input, user.id);
 
     const userPrompt = extractTextFromResponsesInput(requestBody.input);
-    const effectiveModel = typeof requestBody.model === 'string' ? requestBody.model : undefined;
+    const effectiveModel = model;
 
     const targetThreadId = await getOrCreateThread({
       userId: user.id,
@@ -1744,21 +2209,33 @@ async function setupServer(): Promise<void> {
     delete requestBody.thread_id;
     delete requestBody.threadId;
 
-    const provider = await resolveProviderForRequest(user, providerOverride);
+    let provider: ProviderRow;
+    let model: string;
+    try {
+      const resolved = await resolveAndValidateProviderModel({
+        user,
+        providerOverride,
+        requestedModel: typeof requestBody.model === 'string' ? requestBody.model : undefined,
+      });
+      provider = resolved.provider;
+      model = resolved.model;
+    } catch (error) {
+      reply.code(400).send({ error: error instanceof Error ? error.message : 'Invalid model selection' });
+      return;
+    }
+
     const apiKey = await getUserProviderKey(user.id, provider.id);
     if (!apiKey) {
       reply.code(400).send({ error: `No API key configured for provider: ${provider.code}` });
       return;
     }
 
-    if (!requestBody.model && user.default_model) {
-      requestBody.model = user.default_model;
-    }
+    requestBody.model = model;
 
     requestBody.messages = await hydrateChatMessages(requestBody.messages, user.id);
 
     const userPrompt = extractTextFromChatMessages(requestBody.messages);
-    const effectiveModel = typeof requestBody.model === 'string' ? requestBody.model : undefined;
+    const effectiveModel = model;
 
     const targetThreadId = await getOrCreateThread({
       userId: user.id,
