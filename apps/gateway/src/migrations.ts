@@ -3,6 +3,13 @@ import path from 'node:path';
 import type { Pool } from 'pg';
 
 export async function runMigrations(pool: Pool): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      filename TEXT PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
   const migrationsDir = path.resolve(process.cwd(), 'apps/gateway/migrations');
   const files = (await fs.readdir(migrationsDir))
     .filter((file) => file.endsWith('.sql'))
