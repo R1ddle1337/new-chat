@@ -1,0 +1,41 @@
+You are Codex in /opt/new-chat. Goal: make the UI feel closer to OpenAI web and complete the missing functionality, while also fixing the current production blocker.
+
+CRITICAL BLOCKER (fix first)
+- Gateway container crashes on startup because migrations directory is resolved incorrectly.
+  Current code uses: path.resolve(process.cwd(), 'apps/gateway/migrations') which becomes /app/apps/gateway/apps/gateway/migrations.
+  Fix to reliably find migrations at runtime in Docker and local dev. Prefer using __dirname from compiled dist:
+    migrationsDir = path.resolve(__dirname, '../migrations')
+  Ensure `runMigrations` works when server is started via pnpm script.
+
+UI/UX FEATURES (OpenAI-like)
+1) Streaming rendering
+- Update apps/web chat to support stream=true with SSE parsing for /v1/responses.
+- Show partial assistant output as it streams.
+- Provide a Stop button (AbortController) and proper sending state.
+- Keep non-stream mode as a fallback toggle.
+
+2) Thread title improvements
+- Keep initial title as "New chat".
+- After first user message (or after first assistant response), auto-update title using a better heuristic (first sentence, trimmed, max 60 chars).
+- Add an API endpoint to rename thread explicitly:
+    PATCH /me/threads/:threadId { title }
+  and add UI inline rename in sidebar.
+
+3) Attachment previews (before send + history)
+- Before sending: show local thumbnail preview of selected image + remove button.
+- After sending and on history reload: show thumbnail for image attachments.
+- To do this, ensure messages endpoint returns enough metadata. Options:
+  - Include raw_content in GET /me/threads/:threadId/messages OR add a separate attachments field.
+- Implement an authenticated endpoint to fetch file content for preview:
+    GET /v1/files/:fileId/content  -> streams the image bytes; enforce user ownership.
+  Web should render images using src="/api/v1/files/<id>/content".
+
+4) Polishing
+- Sidebar layout closer to OpenAI: threads list, selected highlight, new chat button.
+- Better error toasts/messages.
+
+Guardrails
+- Do not introduce heavy UI deps.
+- Keep security constraints: cookie session only, strict Origin check, no key leakage.
+- After changes: run pnpm -r build.
+- Commit logically and push to origin/main.
