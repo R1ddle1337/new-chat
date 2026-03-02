@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: newchat
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d newchat']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ':9001'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+
+  gateway:
+    build:
+      context: ../../
+      dockerfile: apps/gateway/Dockerfile
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3001
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/newchat
+      REDIS_URL: redis://redis:6379
+      APP_ORIGIN: https://nchat.lyxnb.de5.net
+      SESSION_COOKIE_NAME: nc_session
+      SESSION_TTL_SECONDS: 604800
+      AUTH_RATE_LIMIT_PER_MIN: 20
+      V1_RATE_LIMIT_PER_MIN: 120
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_USE_SSL: 'false'
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: uploads
+      KEY_ENCRYPTION_KEY: ${KEY_ENCRYPTION_KEY}
+      SECURE_COOKIES: 'true'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+    ports:
+      - '127.0.0.1:3101:3001'
+
+  web:
+    build:
+      context: ../../
+      dockerfile: apps/web/Dockerfile
+    environment:
+      GATEWAY_URL_INTERNAL: http://gateway:3001
+    depends_on:
+      - gateway
+    ports:
+      - '127.0.0.1:3100:3000'
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
