@@ -1,0 +1,15 @@
+You are Codex in /opt/new-chat. The production deploy attempt failed because Docker build for apps/gateway failed TypeScript checks:
+- TS7016 missing declaration files for modules 'pg' and 'bcryptjs'.
+Fix the repo so:
+1) `pnpm -r install` then `pnpm -r build` succeeds cleanly.
+2) Docker builds for apps/gateway and apps/web succeed.
+3) Keep changes minimal and production-safe.
+
+Implementation guidance:
+- Add the correct @types packages (e.g. @types/pg, @types/bcryptjs) as devDependencies in the appropriate workspace package(s) so TypeScript build passes.
+- If any other missing types appear during build, fix them similarly.
+- Do NOT weaken type safety broadly (avoid blanket "skipLibCheck": true unless absolutely necessary).
+
+After fixing:
+- Run: pnpm -r install && pnpm -r build
+- Commit with a clear message and push to origin/main.

@@ -1,0 +1,61 @@
+You are Codex running inside a git repo at /opt/new-chat. Build an MVP that matches these requirements:
+
+PRODUCT
+- Web-only app: users log in and use a chat UI similar to OpenAI web.
+- Cloud-synced chat history (threads + messages) stored server-side.
+- BYOK per user: each user stores their own upstream API keys.
+- Multi-provider: OpenAI official + grok2api (OpenAI-compatible) at https://gapi.lyxnb.de5.net/v1.
+- Implement BOTH OpenAI standard endpoints shapes:
+  - POST /v1/responses (primary)
+  - POST /v1/chat/completions (compat layer; can internally translate to responses or proxy)
+- Prioritize IMAGE UNDERSTANDING:
+  - Implement POST /v1/files for image upload (multipart/form-data).
+  - Store images in MinIO (private) and record metadata in Postgres.
+  - When calling upstream for vision, gateway loads image from MinIO and sends as data URL (base64) in responses input_image.
+
+SECURITY
+- Frontend must NOT call upstream directly.
+- Authentication is cookie-based session (httpOnly) for same-origin web app.
+- Add CSRF protection OR strict Origin checking on state-changing requests.
+- Encrypt BYOK keys at rest using AES-256-GCM with KEY_ENCRYPTION_KEY env var.
+- Add rate limiting via Redis (IP + user) for auth and /v1 endpoints.
+- Add structured audit logging for auth events and upstream calls (without leaking keys or prompt contents).
+
+ARCHITECTURE
+- Monorepo using pnpm workspaces.
+- apps/gateway: Node.js + Fastify + TypeScript.
+- apps/web: Next.js (TypeScript). Use a simple UI: login page, settings page (manage provider keys, choose default provider/model), chat page.
+- infra/compose: docker-compose.yml for postgres, redis, minio, gateway, web.
+- Provide a README with setup instructions.
+
+DB
+- Use Postgres.
+- Implement migrations (plain SQL in a migrations folder + a small migration runner) to create tables:
+  users, providers, user_provider_keys, threads, messages, files, audit_events.
+
+API DETAILS
+- Gateway must expose:
+  - POST /auth/register, /auth/login, /auth/logout, GET /me
+  - POST /me/keys (add/update a provider key), GET /me/keys (list masked), POST /me/provider (set defaults)
+  - GET /v1/models (merge provider model lists; cache for 60s)
+  - POST /v1/responses (supports stream true via SSE; proxy upstream stream)
+  - POST /v1/chat/completions (compat)
+  - POST /v1/files (upload image)
+
+UPSTREAM CALLS
+- Use OpenAI-compatible HTTP calls. It is OK to use openai-node SDK with configurable baseURL, or implement raw fetch.
+- Provider selection:
+  - Default provider saved per user.
+  - Each request can override provider/model.
+
+DELIVERABLES
+- Code compiles.
+- docker compose up works.
+- Basic smoke steps in README.
+- Commit logically with messages.
+
+When finished, run:
+  pnpm -r install
+  pnpm -r build
+  (If tests exist) pnpm -r test
+Then commit and push all changes to origin/main.

@@ -1,0 +1,24 @@
+services:
+  postgres:
+    ports: []
+  redis:
+    ports: []
+  minio:
+    ports: []
+  gateway:
+    ports:
+      - '127.0.0.1:3101:3001'
+    environment:
+      APP_ORIGIN: https://nchat.lyxnb.de5.net
+      SECURE_COOKIES: 'true'
+      KEY_ENCRYPTION_KEY: ${KEY_ENCRYPTION_KEY}
+      # stronger prod defaults (override if needed)
+      AUTH_RATE_LIMIT_PER_MIN: 20
+      V1_RATE_LIMIT_PER_MIN: 120
+      # set non-default minio creds via env file
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: uploads
+  web:
+    ports:
+      - '127.0.0.1:3100:3000'
