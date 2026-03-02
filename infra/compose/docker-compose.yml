@@ -1,0 +1,85 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: newchat
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d newchat']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ':9001'
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    volumes:
+      - minio_data:/data
+
+  gateway:
+    build:
+      context: ../../
+      dockerfile: apps/gateway/Dockerfile
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3001
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/newchat
+      REDIS_URL: redis://redis:6379
+      APP_ORIGIN: http://localhost:3000
+      SESSION_COOKIE_NAME: nc_session
+      SESSION_TTL_SECONDS: 604800
+      AUTH_RATE_LIMIT_PER_MIN: 30
+      V1_RATE_LIMIT_PER_MIN: 120
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_USE_SSL: 'false'
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: uploads
+      KEY_ENCRYPTION_KEY: change-this-to-a-strong-random-string
+      SECURE_COOKIES: 'false'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+    ports:
+      - '3001:3001'
+
+  web:
+    build:
+      context: ../../
+      dockerfile: apps/web/Dockerfile
+    environment:
+      GATEWAY_URL_INTERNAL: http://gateway:3001
+    depends_on:
+      - gateway
+    ports:
+      - '3000:3000'
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
