@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
 
 type ThreadItem = {
@@ -38,6 +38,144 @@ type Toast = {
   kind: ToastKind;
   message: string;
 };
+
+const autoScrollThresholdPx = 120;
+
+function sanitizeLinkHref(rawHref: string): string | null {
+  const href = rawHref.trim();
+  if (!href) {
+    return null;
+  }
+
+  if (href.startsWith('/')) {
+    return href;
+  }
+
+  try {
+    const parsed = new URL(href, 'https://example.com');
+    const protocol = parsed.protocol.toLowerCase();
+    if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:' || protocol === 'tel:') {
+      return href;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
+  if (!text) {
+    return [''];
+  }
+
+  const nodes: ReactNode[] = [];
+  const tokenPattern = /(`[^`\n]+`)|(\[([^\]]+)\]\(([^)\s]+)\))/g;
+  let cursor = 0;
+  let tokenIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = tokenPattern.exec(text)) !== null) {
+    if (match.index > cursor) {
+      nodes.push(text.slice(cursor, match.index));
+    }
+
+    if (match[1]) {
+      nodes.push(
+        <code key={`${keyPrefix}-code-${tokenIndex}`} className="chat-inline-code">
+          {match[1].slice(1, -1)}
+        </code>,
+      );
+    } else if (match[2] && match[3] && match[4]) {
+      const safeHref = sanitizeLinkHref(match[4]);
+      if (safeHref) {
+        nodes.push(
+          <a
+            key={`${keyPrefix}-link-${tokenIndex}`}
+            className="chat-markdown-link"
+            href={safeHref}
+            target="_blank"
+            rel="noreferrer"
+          >
+            {match[3]}
+          </a>,
+        );
+      } else {
+        nodes.push(match[2]);
+      }
+    }
+
+    cursor = tokenPattern.lastIndex;
+    tokenIndex += 1;
+  }
+
+  if (cursor < text.length) {
+    nodes.push(text.slice(cursor));
+  }
+
+  return nodes;
+}
+
+function renderTextParagraphs(text: string, keyPrefix: string): ReactNode[] {
+  const normalized = text.replace(/\r\n/g, '\n');
+  if (!normalized.trim()) {
+    return [];
+  }
+
+  const paragraphs = normalized.split(/\n{2,}/).filter((paragraph) => paragraph.trim());
+  return paragraphs.map((paragraph, paragraphIndex) => {
+    const lines = paragraph.split('\n');
+    const lineNodes: ReactNode[] = [];
+
+    lines.forEach((line, lineIndex) => {
+      lineNodes.push(
+        ...renderInlineMarkdown(line, `${keyPrefix}-paragraph-${paragraphIndex}-line-${lineIndex}`),
+      );
+
+      if (lineIndex < lines.length - 1) {
+        lineNodes.push(
+          <br key={`${keyPrefix}-paragraph-${paragraphIndex}-linebreak-${lineIndex}`} />,
+        );
+      }
+    });
+
+    return <p key={`${keyPrefix}-paragraph-${paragraphIndex}`}>{lineNodes}</p>;
+  });
+}
+
+function renderSimpleMarkdown(content: string): ReactNode[] {
+  const normalized = content.replace(/\r\n/g, '\n');
+  const blocks: ReactNode[] = [];
+  const codeBlockPattern = /```([^\n`]*)\n([\s\S]*?)```/g;
+  let cursor = 0;
+  let sectionIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = codeBlockPattern.exec(normalized)) !== null) {
+    const textBeforeCodeBlock = normalized.slice(cursor, match.index);
+    blocks.push(...renderTextParagraphs(textBeforeCodeBlock, `section-${sectionIndex}-text`));
+
+    const language = match[1].trim();
+    const code = match[2].replace(/\n$/, '');
+    blocks.push(
+      <pre key={`section-${sectionIndex}-code`} className="chat-code-block">
+        <code className={language ? `language-${language}` : undefined}>{code}</code>
+      </pre>,
+    );
+
+    cursor = codeBlockPattern.lastIndex;
+    sectionIndex += 1;
+  }
+
+  const trailingText = normalized.slice(cursor);
+  blocks.push(...renderTextParagraphs(trailingText, `section-${sectionIndex}-tail`));
+
+  return blocks;
+}
+
+function MessageMarkdown({ content }: { content: string }) {
+  return <>{renderSimpleMarkdown(content)}</>;
+}
 
 function findSseBoundary(input: string): { index: number; length: number } | null {
   const idxLf = input.indexOf('\n\n');
@@ -170,9 +308,45 @@ function makeLocalMessageId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function isNearBottom(element: HTMLElement): boolean {
+  const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+  return distance <= autoScrollThresholdPx;
+}
+
+async function copyTextToClipboard(value: string): Promise<void> {
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const textArea = document.createElement('textarea');
+  textArea.value = value;
+  textArea.setAttribute('readonly', 'true');
+  textArea.style.position = 'absolute';
+  textArea.style.left = '-9999px';
+  document.body.appendChild(textArea);
+  textArea.select();
+  const copied = document.execCommand('copy');
+  document.body.removeChild(textArea);
+
+  if (!copied) {
+    throw new Error('Clipboard unavailable');
+  }
+}
+
+function ThreadDeleteIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-2 6h2v9H7V9Zm4 0h2v9h-2V9Zm4 0h2v9h-2V9Z" />
+    </svg>
+  );
+}
+
 export default function ChatPage() {
   const router = useRouter();
+  const messageListRef = useRef<HTMLDivElement | null>(null);
   const messageListEndRef = useRef<HTMLDivElement | null>(null);
+  const shouldAutoScrollRef = useRef(true);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const toastCounterRef = useRef(0);
   const [loading, setLoading] = useState(true);
@@ -190,11 +364,14 @@ export default function ChatPage() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
 
   const selectedThread = useMemo(
     () => threads.find((thread) => thread.id === selectedThreadId) ?? null,
     [threads, selectedThreadId],
   );
+
+  const canSend = !sending && (input.trim().length > 0 || Boolean(image));
 
   const pushToast = (kind: ToastKind, message: string) => {
     const id = toastCounterRef.current + 1;
@@ -218,6 +395,23 @@ export default function ChatPage() {
       return null;
     });
   };
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = 'auto') => {
+    messageListEndRef.current?.scrollIntoView({ behavior, block: 'end' });
+    shouldAutoScrollRef.current = true;
+    setShowJumpToLatest(false);
+  }, []);
+
+  const updateAutoScrollState = useCallback(() => {
+    const container = messageListRef.current;
+    if (!container) {
+      return;
+    }
+
+    const nearBottom = isNearBottom(container);
+    shouldAutoScrollRef.current = nearBottom;
+    setShowJumpToLatest(!nearBottom);
+  }, []);
 
   const loadThreads = async (preferredThreadId?: string | null) => {
     const res = await fetch('/api/me/threads', { credentials: 'include' });
@@ -285,16 +479,29 @@ export default function ChatPage() {
   }, []);
 
   useEffect(() => {
+    shouldAutoScrollRef.current = true;
+    setShowJumpToLatest(false);
+
     if (!selectedThreadId) {
       setMessages([]);
       return;
     }
+
     void loadMessages(selectedThreadId);
   }, [selectedThreadId]);
 
   useEffect(() => {
-    messageListEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    const frame = window.requestAnimationFrame(() => {
+      if (shouldAutoScrollRef.current) {
+        scrollToLatest('auto');
+        return;
+      }
+
+      updateAutoScrollState();
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [messages, scrollToLatest, updateAutoScrollState]);
 
   useEffect(() => {
     return () => {
@@ -333,6 +540,88 @@ export default function ChatPage() {
     pushToast('success', 'Thread renamed');
   };
 
+  const createThread = async () => {
+    const res = await fetch('/api/me/threads', {
+      method: 'POST',
+      credentials: 'include',
+    });
+
+    if (!res.ok) {
+      if (res.status === 401) {
+        router.replace('/login');
+        return;
+      }
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      pushToast('error', parseErrorMessage(body, 'Failed to create thread'));
+      return;
+    }
+
+    const payload = (await res.json()) as { data: ThreadItem };
+    const thread = payload.data;
+
+    setThreads((previous) => [thread, ...previous.filter((item) => item.id !== thread.id)]);
+    setSelectedThreadId(thread.id);
+    setMessages([]);
+    setRenamingThreadId(null);
+    setRenameDraft('');
+    shouldAutoScrollRef.current = true;
+    setShowJumpToLatest(false);
+    pushToast('success', 'New chat created');
+
+    void loadThreads(thread.id);
+  };
+
+  const deleteThread = async (thread: ThreadItem) => {
+    const confirmed = window.confirm(`Delete "${thread.title}"? This cannot be undone.`);
+    if (!confirmed) {
+      return;
+    }
+
+    const res = await fetch(`/api/me/threads/${thread.id}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
+
+    if (!res.ok) {
+      if (res.status === 401) {
+        router.replace('/login');
+        return;
+      }
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      pushToast('error', parseErrorMessage(body, 'Failed to delete thread'));
+      return;
+    }
+
+    const previouslySelected = selectedThreadId;
+    const deletedSelectedThread = previouslySelected === thread.id;
+
+    setThreads((previous) => previous.filter((item) => item.id !== thread.id));
+    setRenamingThreadId((current) => (current === thread.id ? null : current));
+    setRenameDraft('');
+
+    if (deletedSelectedThread) {
+      setSelectedThreadId(null);
+      setMessages([]);
+    }
+
+    shouldAutoScrollRef.current = true;
+    setShowJumpToLatest(false);
+
+    await loadThreads(deletedSelectedThread ? null : previouslySelected);
+    pushToast('success', 'Thread deleted');
+  };
+
+  const copyAssistantMessage = async (message: MessageItem) => {
+    try {
+      await copyTextToClipboard(message.content);
+      pushToast('success', 'Copied response');
+    } catch {
+      pushToast('error', 'Failed to copy response');
+    }
+  };
+
   const stopStreaming = () => {
     if (!activeAbortController) {
       return;
@@ -341,7 +630,8 @@ export default function ChatPage() {
   };
 
   const sendMessage = async () => {
-    if (sending || (!input.trim() && !image)) {
+    const promptText = input.trim();
+    if (sending || (!promptText && !image)) {
       return;
     }
 
@@ -376,10 +666,10 @@ export default function ChatPage() {
       }
 
       const content: Array<Record<string, unknown>> = [];
-      if (input.trim()) {
+      if (promptText) {
         content.push({
           type: 'input_text',
-          text: input.trim(),
+          text: promptText,
         });
       }
       if (fileId) {
@@ -429,7 +719,7 @@ export default function ChatPage() {
         {
           id: optimisticUserId,
           role: 'user',
-          content: input.trim() || '[image]',
+          content: promptText || '[image]',
           created_at: new Date().toISOString(),
           attachments: optimisticAttachments,
         },
@@ -557,13 +847,6 @@ export default function ChatPage() {
     }
   };
 
-  const startNewThread = () => {
-    setSelectedThreadId(null);
-    setMessages([]);
-    setRenamingThreadId(null);
-    setRenameDraft('');
-  };
-
   if (loading) {
     return <section className="panel">Loading chat...</section>;
   }
@@ -572,12 +855,14 @@ export default function ChatPage() {
     <section className="chat-layout">
       <aside className="chat-sidebar">
         <div className="chat-sidebar-header">
-          <button className="primary" type="button" onClick={startNewThread}>
+          <button className="primary" type="button" onClick={() => void createThread()} disabled={sending}>
             + New chat
           </button>
         </div>
 
         <div className="chat-thread-list">
+          {threads.length === 0 ? <div className="notice">No threads yet.</div> : null}
+
           {threads.map((thread) => (
             <div
               key={thread.id}
@@ -636,16 +921,26 @@ export default function ChatPage() {
                   </button>
                 </div>
               ) : (
-                <button
-                  type="button"
-                  className="ghost"
-                  onClick={() => {
-                    setRenamingThreadId(thread.id);
-                    setRenameDraft(thread.title);
-                  }}
-                >
-                  Rename
-                </button>
+                <div className="chat-thread-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => {
+                      setRenamingThreadId(thread.id);
+                      setRenameDraft(thread.title);
+                    }}
+                  >
+                    Rename
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost chat-thread-delete"
+                    aria-label={`Delete ${thread.title}`}
+                    onClick={() => void deleteThread(thread)}
+                  >
+                    <ThreadDeleteIcon />
+                  </button>
+                </div>
               )}
             </div>
           ))}
@@ -696,40 +991,93 @@ export default function ChatPage() {
         </div>
 
         <div className="panel chat-messages-panel">
-          <div className="chat-messages">
+          <div
+            ref={messageListRef}
+            className="chat-messages"
+            onScroll={updateAutoScrollState}
+          >
             {messages.length === 0 ? (
               <div className="notice">No messages yet. Start a new conversation.</div>
             ) : null}
 
-            {messages.map((message) => (
-              <article
-                key={message.id}
-                className={`chat-message ${message.role === 'assistant' ? 'assistant' : 'user'}`}
-              >
-                <div className="chat-message-role mono">{message.role}</div>
+            {messages.map((message) => {
+              const assistantMessage = message.role === 'assistant';
+              const showGenerating = assistantMessage && sending && !message.content.trim();
 
-                {message.attachments.length > 0 ? (
-                  <div className="chat-message-attachments">
-                    {message.attachments.map((attachment) => (
-                      <a
-                        key={`${message.id}-${attachment.file_id}`}
-                        href={attachment.content_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="chat-message-attachment"
+              return (
+                <article
+                  key={message.id}
+                  className={`chat-message ${assistantMessage ? 'assistant' : 'user'}`}
+                >
+                  <div className="chat-message-header">
+                    <div className="chat-message-role mono">{assistantMessage ? 'assistant' : 'user'}</div>
+                    {assistantMessage && message.content.trim() ? (
+                      <button
+                        type="button"
+                        className="chat-copy-button"
+                        onClick={() => void copyAssistantMessage(message)}
                       >
-                        <img src={attachment.content_url} alt={attachment.filename} loading="lazy" />
-                      </a>
-                    ))}
+                        Copy
+                      </button>
+                    ) : null}
                   </div>
-                ) : null}
 
-                <div className="chat-message-content">{message.content}</div>
-              </article>
-            ))}
+                  {message.attachments.length > 0 ? (
+                    <div className="chat-message-attachments-grid">
+                      {message.attachments.map((attachment) => {
+                        const imageAttachment = attachment.mime_type.startsWith('image/');
+
+                        return (
+                          <a
+                            key={`${message.id}-${attachment.file_id}`}
+                            href={attachment.content_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="chat-message-attachment"
+                            title={attachment.filename}
+                          >
+                            {imageAttachment ? (
+                              <img
+                                src={attachment.content_url}
+                                alt={attachment.filename}
+                                loading="lazy"
+                              />
+                            ) : (
+                              <div className="chat-message-attachment-fallback">FILE</div>
+                            )}
+                            <span className="chat-message-attachment-name">{attachment.filename}</span>
+                          </a>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+
+                  <div className="chat-message-content">
+                    {showGenerating ? (
+                      <div className="chat-inline-streaming">
+                        <span className="chat-streaming-dot" />
+                        Generating...
+                      </div>
+                    ) : (
+                      <MessageMarkdown content={message.content} />
+                    )}
+                  </div>
+                </article>
+              );
+            })}
 
             <div ref={messageListEndRef} />
           </div>
+
+          {showJumpToLatest && messages.length > 0 ? (
+            <button
+              type="button"
+              className="chat-jump-latest"
+              onClick={() => scrollToLatest('smooth')}
+            >
+              Jump to latest
+            </button>
+          ) : null}
         </div>
 
         <div className="panel chat-composer-panel">
@@ -746,6 +1094,14 @@ export default function ChatPage() {
                 rows={4}
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    if (canSend) {
+                      void sendMessage();
+                    }
+                  }
+                }}
                 placeholder="Message new-chat..."
                 disabled={sending}
               />
@@ -781,8 +1137,8 @@ export default function ChatPage() {
             ) : null}
 
             <div className="chat-composer-actions">
-              <button className="primary" type="submit" disabled={sending}>
-                {sending ? 'Sending...' : streamResponses ? 'Send & Stream' : 'Send'}
+              <button className="primary" type="submit" disabled={!canSend}>
+                Send
               </button>
               <button
                 className="ghost"
@@ -803,6 +1159,12 @@ export default function ChatPage() {
               >
                 Clear
               </button>
+              {sending ? (
+                <div className="chat-streaming-indicator" role="status" aria-live="polite">
+                  <span className="chat-streaming-dot" />
+                  Generating
+                </div>
+              ) : null}
             </div>
           </form>
         </div>
