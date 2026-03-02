@@ -1074,6 +1074,35 @@ async function setupServer(): Promise<void> {
     return { data: result.rows };
   });
 
+  app.post('/me/threads', { preHandler: [requireAuth] }, async (request, reply) => {
+    const user = request.authUser!;
+    const created = await pool.query<{
+      id: string;
+      title: string;
+      model: string | null;
+      updated_at: string;
+      created_at: string;
+    }>(
+      `INSERT INTO threads (user_id, title, provider_id, model)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, title, model, updated_at, created_at`,
+      [user.id, 'New chat', user.default_provider_id, user.default_model],
+    );
+
+    const thread = created.rows[0]!;
+
+    await writeAuditEvent({
+      eventType: 'threads.created',
+      request,
+      userId: user.id,
+      metadata: {
+        thread_id: thread.id,
+      },
+    });
+
+    reply.code(201).send({ data: thread });
+  });
+
   app.patch('/me/threads/:threadId', { preHandler: [requireAuth] }, async (request, reply) => {
     const user = request.authUser!;
     const params = request.params as { threadId: string };
@@ -1121,6 +1150,34 @@ async function setupServer(): Promise<void> {
     });
 
     reply.send({ data: updated.rows[0] });
+  });
+
+  app.delete('/me/threads/:threadId', { preHandler: [requireAuth] }, async (request, reply) => {
+    const user = request.authUser!;
+    const params = request.params as { threadId: string };
+
+    const deleted = await pool.query<{ id: string }>(
+      `DELETE FROM threads
+       WHERE id = $1 AND user_id = $2
+       RETURNING id`,
+      [params.threadId, user.id],
+    );
+
+    if (!deleted.rowCount) {
+      reply.code(404).send({ error: 'Thread not found' });
+      return;
+    }
+
+    await writeAuditEvent({
+      eventType: 'threads.deleted',
+      request,
+      userId: user.id,
+      metadata: {
+        thread_id: params.threadId,
+      },
+    });
+
+    reply.send({ ok: true });
   });
 
   app.get('/me/threads/:threadId/messages', { preHandler: [requireAuth] }, async (request, reply) => {
