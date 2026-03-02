@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import { Space_Grotesk, IBM_Plex_Mono } from 'next/font/google';
 import './globals.css';
-import TopNav from './components/top-nav';
+import AppShell from './components/app-shell';
 
 const headingFont = Space_Grotesk({
   subsets: ['latin'],
@@ -27,13 +27,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${headingFont.variable} ${monoFont.variable}`}>
-        <div className="shell">
-          <header className="topbar">
-            <div className="brand">new-chat</div>
-            <TopNav />
-          </header>
-          <main>{children}</main>
-        </div>
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   );

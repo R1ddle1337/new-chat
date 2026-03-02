@@ -2,14 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
-
-type ThreadItem = {
-  id: string;
-  title: string;
-  model: string | null;
-  updated_at: string;
-  created_at?: string;
-};
+import MainHeader from '../components/main-header';
+import { useChatShell } from '../components/chat-shell-context';
 
 type MessageAttachment = {
   file_id: string;
@@ -349,24 +343,19 @@ async function copyTextToClipboard(value: string): Promise<void> {
   }
 }
 
-function ThreadDeleteIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-2 6h2v9H7V9Zm4 0h2v9h-2V9Zm4 0h2v9h-2V9Z" />
-    </svg>
-  );
-}
-
 export default function ChatPage() {
   const router = useRouter();
+  const { loading: shellLoading, selectedThreadId, selectedThread, refreshThreads, selectThread } =
+    useChatShell();
+
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const messageListEndRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const toastCounterRef = useRef(0);
+
   const [loading, setLoading] = useState(true);
-  const [threads, setThreads] = useState<ThreadItem[]>([]);
-  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [input, setInput] = useState('');
   const [image, setImage] = useState<File | null>(null);
@@ -378,24 +367,22 @@ export default function ChatPage() {
   const [sending, setSending] = useState(false);
   const [activeAbortController, setActiveAbortController] = useState<AbortController | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
-  const [renameDraft, setRenameDraft] = useState('');
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
 
-  const selectedThread = useMemo(
-    () => threads.find((thread) => thread.id === selectedThreadId) ?? null,
-    [threads, selectedThreadId],
-  );
-
-  const providerOptions = useMemo(() => {
-    return Array.from(new Set(allowedModels.map((entry) => entry.provider))).sort((a, b) =>
-      a.localeCompare(b),
-    );
+  const modelSelectionOptions = useMemo(() => {
+    return allowedModels.map((entry) => ({
+      ...entry,
+      value: `${entry.provider}::${entry.id}`,
+    }));
   }, [allowedModels]);
 
-  const modelsForSelectedProvider = useMemo(() => {
-    return allowedModels.filter((entry) => entry.provider === provider);
-  }, [allowedModels, provider]);
+  const selectedModelValue = useMemo(() => {
+    if (!provider || !model) {
+      return '';
+    }
+
+    return `${provider}::${model}`;
+  }, [provider, model]);
 
   const canSend =
     !sending && Boolean(provider.trim()) && Boolean(model.trim()) && (input.trim().length > 0 || Boolean(image));
@@ -422,6 +409,17 @@ export default function ChatPage() {
       return null;
     });
   };
+
+  const adjustComposerHeight = useCallback(() => {
+    const textarea = composerInputRef.current;
+    if (!textarea) {
+      return;
+    }
+
+    textarea.style.height = '0px';
+    const nextHeight = Math.min(textarea.scrollHeight, 220);
+    textarea.style.height = `${Math.max(nextHeight, 44)}px`;
+  }, []);
 
   const scrollToLatest = useCallback((behavior: ScrollBehavior = 'auto') => {
     messageListEndRef.current?.scrollIntoView({ behavior, block: 'end' });
@@ -465,28 +463,6 @@ export default function ChatPage() {
     return list;
   };
 
-  const loadThreads = async (preferredThreadId?: string | null) => {
-    const res = await fetch('/api/me/threads', { credentials: 'include' });
-    if (!res.ok) {
-      if (res.status === 401) {
-        router.replace('/login');
-      } else {
-        pushToast('error', 'Failed to load threads');
-      }
-      return;
-    }
-
-    const payload = (await res.json()) as { data: ThreadItem[] };
-    setThreads(payload.data);
-    setSelectedThreadId((current) => {
-      const candidate = preferredThreadId ?? current;
-      if (candidate && payload.data.some((thread) => thread.id === candidate)) {
-        return candidate;
-      }
-      return payload.data[0]?.id ?? null;
-    });
-  };
-
   const loadMessages = async (threadId: string) => {
     const res = await fetch(`/api/me/threads/${threadId}/messages`, { credentials: 'include' });
     if (!res.ok) {
@@ -516,10 +492,12 @@ export default function ChatPage() {
       const meRes = await fetch('/api/me', { credentials: 'include' });
       if (!meRes.ok) {
         router.replace('/login');
+        setLoading(false);
         return;
       }
 
       const me = (await meRes.json()) as MePayload;
+
       try {
         const models = await loadAllowedModels();
         const modelProviders = Array.from(new Set(models.map((entry) => entry.provider)));
@@ -536,18 +514,14 @@ export default function ChatPage() {
             : providerModels[0]?.id ?? '';
         setModel(preferredModel);
       } catch (error) {
-        pushToast(
-          'error',
-          error instanceof Error ? error.message : 'Failed to load allowed models',
-        );
+        pushToast('error', error instanceof Error ? error.message : 'Failed to load allowed models');
+      } finally {
+        setLoading(false);
       }
-
-      await loadThreads();
-      setLoading(false);
     };
 
     void bootstrap();
-  }, []);
+  }, [router]);
 
   useEffect(() => {
     if (!provider) {
@@ -592,114 +566,16 @@ export default function ChatPage() {
   }, [messages, scrollToLatest, updateAutoScrollState]);
 
   useEffect(() => {
+    adjustComposerHeight();
+  }, [adjustComposerHeight, input]);
+
+  useEffect(() => {
     return () => {
       if (imagePreviewUrl) {
         URL.revokeObjectURL(imagePreviewUrl);
       }
     };
   }, [imagePreviewUrl]);
-
-  const renameThread = async (threadId: string) => {
-    const title = renameDraft.replace(/\s+/g, ' ').trim();
-    if (!title) {
-      pushToast('error', 'Thread title cannot be empty');
-      return;
-    }
-
-    const res = await fetch(`/api/me/threads/${threadId}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title }),
-      credentials: 'include',
-    });
-
-    if (!res.ok) {
-      const body = (await res.json().catch(() => null)) as unknown;
-      pushToast('error', parseErrorMessage(body, 'Failed to rename thread'));
-      return;
-    }
-
-    const payload = (await res.json()) as { data: ThreadItem };
-    setThreads((previous) =>
-      previous.map((thread) => (thread.id === threadId ? payload.data : thread)),
-    );
-    setRenamingThreadId(null);
-    setRenameDraft('');
-    pushToast('success', 'Thread renamed');
-  };
-
-  const createThread = async () => {
-    const res = await fetch('/api/me/threads', {
-      method: 'POST',
-      credentials: 'include',
-    });
-
-    if (!res.ok) {
-      if (res.status === 401) {
-        router.replace('/login');
-        return;
-      }
-
-      const body = (await res.json().catch(() => null)) as unknown;
-      pushToast('error', parseErrorMessage(body, 'Failed to create thread'));
-      return;
-    }
-
-    const payload = (await res.json()) as { data: ThreadItem };
-    const thread = payload.data;
-
-    setThreads((previous) => [thread, ...previous.filter((item) => item.id !== thread.id)]);
-    setSelectedThreadId(thread.id);
-    setMessages([]);
-    setRenamingThreadId(null);
-    setRenameDraft('');
-    shouldAutoScrollRef.current = true;
-    setShowJumpToLatest(false);
-    pushToast('success', 'New chat created');
-
-    void loadThreads(thread.id);
-  };
-
-  const deleteThread = async (thread: ThreadItem) => {
-    const confirmed = window.confirm(`Delete "${thread.title}"? This cannot be undone.`);
-    if (!confirmed) {
-      return;
-    }
-
-    const res = await fetch(`/api/me/threads/${thread.id}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-
-    if (!res.ok) {
-      if (res.status === 401) {
-        router.replace('/login');
-        return;
-      }
-
-      const body = (await res.json().catch(() => null)) as unknown;
-      pushToast('error', parseErrorMessage(body, 'Failed to delete thread'));
-      return;
-    }
-
-    const previouslySelected = selectedThreadId;
-    const deletedSelectedThread = previouslySelected === thread.id;
-
-    setThreads((previous) => previous.filter((item) => item.id !== thread.id));
-    setRenamingThreadId((current) => (current === thread.id ? null : current));
-    setRenameDraft('');
-
-    if (deletedSelectedThread) {
-      setSelectedThreadId(null);
-      setMessages([]);
-    }
-
-    shouldAutoScrollRef.current = true;
-    setShowJumpToLatest(false);
-
-    await loadThreads(deletedSelectedThread ? null : previouslySelected);
-    pushToast('success', 'Thread deleted');
-  };
 
   const copyAssistantMessage = async (message: MessageItem) => {
     try {
@@ -724,7 +600,7 @@ export default function ChatPage() {
     }
 
     if (!provider.trim() || !model.trim()) {
-      pushToast('error', 'Select provider and model from the admin allowlist');
+      pushToast('error', 'Select a model from the allowlist');
       return;
     }
 
@@ -842,7 +718,7 @@ export default function ChatPage() {
       const responseThreadId = res.headers.get('x-thread-id');
       if (responseThreadId) {
         latestThreadId = responseThreadId;
-        setSelectedThreadId(responseThreadId);
+        selectThread(responseThreadId);
       }
 
       if (streamResponses) {
@@ -904,31 +780,24 @@ export default function ChatPage() {
         );
       }
 
-      await loadThreads(latestThreadId);
+      await refreshThreads(latestThreadId);
       if (latestThreadId) {
         await loadMessages(latestThreadId);
       }
 
       pushToast('success', 'Response received');
     } catch (requestError) {
-      setMessages((previous) =>
-        previous.filter((message) => !optimisticMessageIds.includes(message.id)),
-      );
+      setMessages((previous) => previous.filter((message) => !optimisticMessageIds.includes(message.id)));
 
+      await refreshThreads(latestThreadId);
       if (latestThreadId) {
-        await loadThreads(latestThreadId);
         await loadMessages(latestThreadId);
-      } else {
-        await loadThreads();
       }
 
       if (requestError instanceof Error && requestError.name === 'AbortError') {
         pushToast('info', 'Generation stopped');
       } else {
-        pushToast(
-          'error',
-          requestError instanceof Error ? requestError.message : 'Failed to send message',
-        );
+        pushToast('error', requestError instanceof Error ? requestError.message : 'Failed to send message');
       }
     } finally {
       setSending(false);
@@ -936,204 +805,81 @@ export default function ChatPage() {
     }
   };
 
-  if (loading) {
-    return <section className="panel">Loading chat...</section>;
+  if (loading || shellLoading) {
+    return <section className="panel page-loading">Loading chat...</section>;
   }
 
   return (
-    <section className="chat-layout">
-      <aside className="chat-sidebar">
-        <div className="chat-sidebar-header">
-          <button className="primary" type="button" onClick={() => void createThread()} disabled={sending}>
-            + New chat
-          </button>
-        </div>
+    <section className="chat-page app-page">
+      <MainHeader
+        title={selectedThread?.title ?? 'New chat'}
+        subtitle={selectedThread ? 'Conversation' : 'Start a conversation'}
+        right={
+          <div className="chat-header-controls">
+            <label className="inline-field">
+              <span>Model</span>
+              <select
+                value={selectedModelValue}
+                onChange={(event) => {
+                  const [nextProvider, nextModel] = event.target.value.split('::');
+                  if (!nextProvider || !nextModel) {
+                    setProvider('');
+                    setModel('');
+                    return;
+                  }
 
-        <div className="chat-thread-list">
-          {threads.length === 0 ? <div className="notice">No threads yet.</div> : null}
-
-          {threads.map((thread) => (
-            <div
-              key={thread.id}
-              className={`chat-thread-row ${thread.id === selectedThreadId ? 'selected' : ''}`}
-            >
-              <button
-                type="button"
-                className="chat-thread-select"
-                onClick={() => {
-                  setSelectedThreadId(thread.id);
-                  setRenamingThreadId(null);
-                  setRenameDraft('');
+                  setProvider(nextProvider);
+                  setModel(nextModel);
                 }}
+                disabled={sending || modelSelectionOptions.length === 0}
               >
-                {renamingThreadId === thread.id ? (
-                  <input
-                    value={renameDraft}
-                    onChange={(event) => setRenameDraft(event.target.value)}
-                    onClick={(event) => event.stopPropagation()}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') {
-                        event.preventDefault();
-                        void renameThread(thread.id);
-                      } else if (event.key === 'Escape') {
-                        setRenamingThreadId(null);
-                        setRenameDraft('');
-                      }
-                    }}
-                    className="chat-thread-rename-input"
-                    autoFocus
-                  />
+                {modelSelectionOptions.length === 0 ? (
+                  <option value="">No allowed models</option>
                 ) : (
-                  <span className="chat-thread-title">{thread.title}</span>
+                  modelSelectionOptions.map((item) => (
+                    <option key={item.value} value={item.value}>
+                      {item.provider}/{makeModelLabel(item)}
+                    </option>
+                  ))
                 )}
-                <span className="chat-thread-model">{thread.model ?? 'default model'}</span>
-              </button>
+              </select>
+            </label>
 
-              {renamingThreadId === thread.id ? (
-                <div className="chat-thread-actions">
-                  <button
-                    type="button"
-                    className="secondary"
-                    onClick={() => void renameThread(thread.id)}
-                  >
-                    Save
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => {
-                      setRenamingThreadId(null);
-                      setRenameDraft('');
-                    }}
-                  >
-                    Cancel
-                  </button>
-                </div>
-              ) : (
-                <div className="chat-thread-actions">
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => {
-                      setRenamingThreadId(thread.id);
-                      setRenameDraft(thread.title);
-                    }}
-                  >
-                    Rename
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost chat-thread-delete"
-                    aria-label={`Delete ${thread.title}`}
-                    onClick={() => void deleteThread(thread)}
-                  >
-                    <ThreadDeleteIcon />
-                  </button>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      </aside>
-
-      <div className="chat-main">
-        <div className="panel chat-toolbar">
-          <div>
-            <h1>Chat</h1>
-            <p className="notice">
-              Thread: <span className="mono">{selectedThread?.title ?? 'New chat'}</span>
-            </p>
-          </div>
-
-          <div className="chat-toolbar-controls">
-            <label className="chat-toggle">
+            <label className="chat-toggle-field">
               <input
                 type="checkbox"
                 checked={streamResponses}
                 onChange={(event) => setStreamResponses(event.target.checked)}
                 disabled={sending}
               />
-              Stream responses
-            </label>
-            <label>
-              Provider
-              <select
-                value={provider}
-                onChange={(event) => setProvider(event.target.value)}
-                disabled={sending || providerOptions.length === 0}
-              >
-                {providerOptions.length === 0 ? (
-                  <option value="">No allowed providers</option>
-                ) : (
-                  providerOptions.map((providerCode) => (
-                    <option key={providerCode} value={providerCode}>
-                      {providerCode}
-                    </option>
-                  ))
-                )}
-              </select>
-            </label>
-            <label>
-              Model
-              <select
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-                disabled={sending || !provider || modelsForSelectedProvider.length === 0}
-              >
-                {modelsForSelectedProvider.length === 0 ? (
-                  <option value="">No allowed models</option>
-                ) : (
-                  modelsForSelectedProvider.map((item) => (
-                    <option key={`${item.provider}:${item.id}`} value={item.id}>
-                      {makeModelLabel(item)}
-                    </option>
-                  ))
-                )}
-              </select>
+              <span>Stream</span>
             </label>
           </div>
+        }
+      />
 
-          {providerOptions.length === 0 ? (
-            <p className="error" style={{ margin: 0 }}>
-              No allowed models are configured by admin.
-            </p>
+      {modelSelectionOptions.length === 0 ? (
+        <p className="error chat-header-error">No allowed models are configured by admin.</p>
+      ) : null}
+
+      <div className="chat-surface">
+        <div ref={messageListRef} className="chat-messages-scroll" onScroll={updateAutoScrollState}>
+          {messages.length === 0 ? (
+            <div className="chat-empty-state">No messages yet. Start a new conversation.</div>
           ) : null}
-        </div>
 
-        <div className="panel chat-messages-panel">
-          <div
-            ref={messageListRef}
-            className="chat-messages"
-            onScroll={updateAutoScrollState}
-          >
-            {messages.length === 0 ? (
-              <div className="notice">No messages yet. Start a new conversation.</div>
-            ) : null}
+          {messages.map((message) => {
+            const assistantMessage = message.role === 'assistant';
+            const showGenerating = assistantMessage && sending && !message.content.trim();
 
-            {messages.map((message) => {
-              const assistantMessage = message.role === 'assistant';
-              const showGenerating = assistantMessage && sending && !message.content.trim();
-
-              return (
-                <article
-                  key={message.id}
-                  className={`chat-message ${assistantMessage ? 'assistant' : 'user'}`}
-                >
-                  <div className="chat-message-header">
-                    <div className="chat-message-role mono">{assistantMessage ? 'assistant' : 'user'}</div>
-                    {assistantMessage && message.content.trim() ? (
-                      <button
-                        type="button"
-                        className="chat-copy-button"
-                        onClick={() => void copyAssistantMessage(message)}
-                      >
-                        Copy
-                      </button>
-                    ) : null}
-                  </div>
-
+            return (
+              <article
+                key={message.id}
+                className={`chat-message-row ${assistantMessage ? 'assistant' : 'user'}`}
+              >
+                <div className="chat-message-inner">
                   {message.attachments.length > 0 ? (
-                    <div className="chat-message-attachments-grid">
+                    <div className="chat-message-attachments-row">
                       {message.attachments.map((attachment) => {
                         const imageAttachment = attachment.mime_type.startsWith('image/');
 
@@ -1172,111 +918,134 @@ export default function ChatPage() {
                       <MessageMarkdown content={message.content} />
                     )}
                   </div>
-                </article>
-              );
-            })}
 
-            <div ref={messageListEndRef} />
-          </div>
+                  {assistantMessage && message.content.trim() ? (
+                    <button
+                      type="button"
+                      className="chat-copy-button"
+                      onClick={() => void copyAssistantMessage(message)}
+                    >
+                      Copy
+                    </button>
+                  ) : null}
+                </div>
+              </article>
+            );
+          })}
 
-          {showJumpToLatest && messages.length > 0 ? (
-            <button
-              type="button"
-              className="chat-jump-latest"
-              onClick={() => scrollToLatest('smooth')}
-            >
-              Jump to latest
-            </button>
-          ) : null}
+          <div ref={messageListEndRef} />
         </div>
 
-        <div className="panel chat-composer-panel">
-          <form
-            className="chat-composer"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void sendMessage();
+        {showJumpToLatest && messages.length > 0 ? (
+          <button type="button" className="chat-jump-latest" onClick={() => scrollToLatest('smooth')}>
+            Jump to latest
+          </button>
+        ) : null}
+      </div>
+
+      <div className="chat-composer-region">
+        {imagePreviewUrl ? (
+          <div className="chat-image-preview-row">
+            <img src={imagePreviewUrl} alt={image?.name ?? 'Selected image'} />
+            <button className="ghost" type="button" onClick={clearImage} disabled={sending}>
+              Remove image
+            </button>
+          </div>
+        ) : null}
+
+        <form
+          className="chat-composer-bar"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void sendMessage();
+          }}
+        >
+          <input
+            ref={fileInputRef}
+            className="sr-only"
+            type="file"
+            accept="image/*"
+            disabled={sending}
+            onChange={(event) => {
+              const next = event.target.files?.[0] ?? null;
+              setImage(next);
+              setImagePreviewUrl((current) => {
+                if (current) {
+                  URL.revokeObjectURL(current);
+                }
+                return next ? URL.createObjectURL(next) : null;
+              });
+            }}
+          />
+
+          <button
+            type="button"
+            className="chat-attach-button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={sending}
+            aria-label="Attach image"
+            title="Attach image"
+          >
+            +
+          </button>
+
+          <textarea
+            ref={composerInputRef}
+            className="chat-composer-input"
+            rows={1}
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                if (canSend) {
+                  void sendMessage();
+                }
+              }
+            }}
+            placeholder="Message new-chat"
+            disabled={sending}
+          />
+
+          {sending ? (
+            <button
+              className="chat-stop-button"
+              type="button"
+              disabled={!activeAbortController}
+              onClick={stopStreaming}
+            >
+              Stop
+            </button>
+          ) : (
+            <button className="chat-send-button" type="submit" disabled={!canSend}>
+              Send
+            </button>
+          )}
+        </form>
+
+        <div className="chat-composer-status">
+          <div className="chat-composer-status-left">
+            {sending ? (
+              <span className="chat-streaming-indicator" role="status" aria-live="polite">
+                <span className="chat-streaming-dot" />
+                Generating response
+              </span>
+            ) : (
+              'Enter to send, Shift+Enter for newline'
+            )}
+          </div>
+
+          <button
+            className="ghost chat-clear-button"
+            type="button"
+            disabled={sending}
+            onClick={() => {
+              setInput('');
+              clearImage();
             }}
           >
-            <label>
-              Prompt
-              <textarea
-                rows={4}
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                    event.preventDefault();
-                    if (canSend) {
-                      void sendMessage();
-                    }
-                  }
-                }}
-                placeholder="Message new-chat..."
-                disabled={sending}
-              />
-            </label>
-
-            <label>
-              Image attachment
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                disabled={sending}
-                onChange={(event) => {
-                  const next = event.target.files?.[0] ?? null;
-                  setImage(next);
-                  setImagePreviewUrl((current) => {
-                    if (current) {
-                      URL.revokeObjectURL(current);
-                    }
-                    return next ? URL.createObjectURL(next) : null;
-                  });
-                }}
-              />
-            </label>
-
-            {imagePreviewUrl ? (
-              <div className="chat-image-preview">
-                <img src={imagePreviewUrl} alt={image?.name ?? 'Selected image'} />
-                <button className="ghost" type="button" onClick={clearImage} disabled={sending}>
-                  Remove image
-                </button>
-              </div>
-            ) : null}
-
-            <div className="chat-composer-actions">
-              <button className="primary" type="submit" disabled={!canSend}>
-                Send
-              </button>
-              <button
-                className="ghost"
-                type="button"
-                disabled={!sending || !activeAbortController}
-                onClick={stopStreaming}
-              >
-                Stop
-              </button>
-              <button
-                className="ghost"
-                type="button"
-                disabled={sending}
-                onClick={() => {
-                  setInput('');
-                  clearImage();
-                }}
-              >
-                Clear
-              </button>
-              {sending ? (
-                <div className="chat-streaming-indicator" role="status" aria-live="polite">
-                  <span className="chat-streaming-dot" />
-                  Generating
-                </div>
-              ) : null}
-            </div>
-          </form>
+            Clear
+          </button>
         </div>
       </div>
 

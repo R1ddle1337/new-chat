@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import MainHeader from '../components/main-header';
 
 type MePayload = {
   is_admin: boolean;
@@ -77,11 +78,11 @@ export default function AdminPage() {
     setProviders(payload.data);
     setProviderDrafts(
       Object.fromEntries(
-        payload.data.map((provider) => [
-          provider.code,
+        payload.data.map((providerItem) => [
+          providerItem.code,
           {
-            base_url: provider.base_url,
-            enabled: provider.enabled,
+            base_url: providerItem.base_url,
+            enabled: providerItem.enabled,
           },
         ]),
       ),
@@ -99,11 +100,11 @@ export default function AdminPage() {
     setModels(payload.data);
     setModelDrafts(
       Object.fromEntries(
-        payload.data.map((model) => [
-          model.id,
+        payload.data.map((modelItem) => [
+          modelItem.id,
           {
-            display_name: model.display_name ?? '',
-            enabled: model.enabled,
+            display_name: modelItem.display_name ?? '',
+            enabled: modelItem.enabled,
           },
         ]),
       ),
@@ -280,199 +281,211 @@ export default function AdminPage() {
   };
 
   if (loading) {
-    return <section className="panel">Loading admin console...</section>;
+    return <section className="panel page-loading">Loading admin console...</section>;
   }
 
   if (!authorized) {
     return (
-      <section className="panel">
-        <h1 style={{ marginTop: 0 }}>Admin</h1>
-        <p className="error">403 Forbidden. Admin access requires ADMIN_EMAIL and matching user.</p>
+      <section className="admin-page app-page">
+        <MainHeader title="Admin" subtitle="Restricted" />
+        <div className="page-stack">
+          <div className="card">
+            <p className="error">403 Forbidden. Admin access requires ADMIN_EMAIL and matching user.</p>
+          </div>
+        </div>
       </section>
     );
   }
 
   return (
-    <section style={{ display: 'grid', gap: '1rem' }}>
-      <div className="panel">
-        <h1 style={{ marginTop: 0 }}>Admin</h1>
-        <p className="notice">Manage provider base URLs and model allowlist used by all users.</p>
-      </div>
+    <section className="admin-page app-page">
+      <MainHeader title="Admin" subtitle="Manage provider base URLs and model allowlist" />
 
-      <div className="panel" style={{ display: 'grid', gap: '0.85rem' }}>
-        <h2 style={{ margin: 0 }}>Providers</h2>
-        {providers.map((provider) => {
-          const draft = providerDrafts[provider.code];
-          if (!draft) {
-            return null;
-          }
+      <div className="page-stack">
+        <div className="card">
+          <h2>Providers</h2>
+          <div className="stack-tight">
+            {providers.map((providerItem) => {
+              const draft = providerDrafts[providerItem.code];
+              if (!draft) {
+                return null;
+              }
 
-          return (
-            <div key={provider.code} style={{ border: '1px solid var(--border)', borderRadius: 10, padding: '0.8rem' }}>
-              <div className="mono" style={{ marginBottom: '.5rem' }}>
-                {provider.code}
-              </div>
+              return (
+                <div key={providerItem.code} className="admin-item">
+                  <div className="mono admin-item-title">{providerItem.code}</div>
 
-              <label>
-                Base URL
-                <input
-                  value={draft.base_url}
-                  onChange={(event) =>
-                    setProviderDrafts((previous) => ({
-                      ...previous,
-                      [provider.code]: {
-                        ...previous[provider.code],
-                        base_url: event.target.value,
-                      },
-                    }))
-                  }
-                />
-              </label>
+                  <label>
+                    Base URL
+                    <input
+                      value={draft.base_url}
+                      onChange={(event) =>
+                        setProviderDrafts((previous) => ({
+                          ...previous,
+                          [providerItem.code]: {
+                            ...previous[providerItem.code],
+                            base_url: event.target.value,
+                          },
+                        }))
+                      }
+                    />
+                  </label>
 
-              <label style={{ display: 'flex', alignItems: 'center', gap: '.5rem', marginTop: '.6rem' }}>
-                <input
-                  type="checkbox"
-                  checked={draft.enabled}
-                  onChange={(event) =>
-                    setProviderDrafts((previous) => ({
-                      ...previous,
-                      [provider.code]: {
-                        ...previous[provider.code],
-                        enabled: event.target.checked,
-                      },
-                    }))
-                  }
-                  style={{ width: 'auto' }}
-                />
-                Enabled
-              </label>
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={draft.enabled}
+                      onChange={(event) =>
+                        setProviderDrafts((previous) => ({
+                          ...previous,
+                          [providerItem.code]: {
+                            ...previous[providerItem.code],
+                            enabled: event.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    Enabled
+                  </label>
 
-              <button type="button" className="secondary" onClick={() => void saveProvider(provider.code)}>
-                Save provider
-              </button>
-            </div>
-          );
-        })}
-      </div>
-
-      <div className="panel" style={{ display: 'grid', gap: '0.85rem' }}>
-        <h2 style={{ margin: 0 }}>Allowed Models</h2>
-
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            void createModel();
-          }}
-        >
-          <label>
-            Provider
-            <select value={newProvider} onChange={(event) => setNewProvider(event.target.value)}>
-              {providerCodes.map((code) => (
-                <option key={code} value={code}>
-                  {code}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <label>
-            Model ID
-            <input
-              value={newModelId}
-              onChange={(event) => setNewModelId(event.target.value)}
-              placeholder="gpt-4o-mini"
-              required
-            />
-          </label>
-
-          <label>
-            Display name (optional)
-            <input
-              value={newDisplayName}
-              onChange={(event) => setNewDisplayName(event.target.value)}
-              placeholder="GPT-4o Mini"
-            />
-          </label>
-
-          <label style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-            <input
-              type="checkbox"
-              checked={newEnabled}
-              onChange={(event) => setNewEnabled(event.target.checked)}
-              style={{ width: 'auto' }}
-            />
-            Enabled
-          </label>
-
-          <button className="primary" type="submit">
-            Add allowed model
-          </button>
-        </form>
-
-        <div style={{ display: 'grid', gap: '.65rem' }}>
-          {models.map((model) => {
-            const draft = modelDrafts[model.id];
-            if (!draft) {
-              return null;
-            }
-
-            return (
-              <div key={model.id} style={{ border: '1px solid var(--border)', borderRadius: 10, padding: '0.8rem' }}>
-                <div className="mono" style={{ marginBottom: '.5rem' }}>
-                  {model.provider}/{model.model_id}
-                </div>
-
-                <label>
-                  Display name
-                  <input
-                    value={draft.display_name}
-                    onChange={(event) =>
-                      setModelDrafts((previous) => ({
-                        ...previous,
-                        [model.id]: {
-                          ...previous[model.id],
-                          display_name: event.target.value,
-                        },
-                      }))
-                    }
-                    placeholder="Optional label"
-                  />
-                </label>
-
-                <label style={{ display: 'flex', alignItems: 'center', gap: '.5rem', marginTop: '.6rem' }}>
-                  <input
-                    type="checkbox"
-                    checked={draft.enabled}
-                    onChange={(event) =>
-                      setModelDrafts((previous) => ({
-                        ...previous,
-                        [model.id]: {
-                          ...previous[model.id],
-                          enabled: event.target.checked,
-                        },
-                      }))
-                    }
-                    style={{ width: 'auto' }}
-                  />
-                  Enabled
-                </label>
-
-                <div style={{ display: 'flex', gap: '.5rem', marginTop: '.7rem' }}>
-                  <button type="button" className="secondary" onClick={() => void saveModel(model.id)}>
-                    Save model
-                  </button>
-                  <button type="button" className="ghost" onClick={() => void deleteModel(model.id)}>
-                    Delete
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => void saveProvider(providerItem.code)}
+                  >
+                    Save provider
                   </button>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </div>
-      </div>
 
-      {status ? <div className="notice">{status}</div> : null}
-      {error ? <div className="error">{error}</div> : null}
+        <div className="card">
+          <h2>Allowed Models</h2>
+
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void createModel();
+            }}
+          >
+            <label>
+              Provider
+              <select value={newProvider} onChange={(event) => setNewProvider(event.target.value)}>
+                {providerCodes.map((code) => (
+                  <option key={code} value={code}>
+                    {code}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              Model ID
+              <input
+                value={newModelId}
+                onChange={(event) => setNewModelId(event.target.value)}
+                placeholder="gpt-4o-mini"
+                required
+              />
+            </label>
+
+            <label>
+              Display name (optional)
+              <input
+                value={newDisplayName}
+                onChange={(event) => setNewDisplayName(event.target.value)}
+                placeholder="GPT-4o Mini"
+              />
+            </label>
+
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={newEnabled}
+                onChange={(event) => setNewEnabled(event.target.checked)}
+              />
+              Enabled
+            </label>
+
+            <button className="primary" type="submit">
+              Add allowed model
+            </button>
+          </form>
+
+          <div className="stack-tight">
+            {models.map((modelItem) => {
+              const draft = modelDrafts[modelItem.id];
+              if (!draft) {
+                return null;
+              }
+
+              return (
+                <div key={modelItem.id} className="admin-item">
+                  <div className="mono admin-item-title">
+                    {modelItem.provider}/{modelItem.model_id}
+                  </div>
+
+                  <label>
+                    Display name
+                    <input
+                      value={draft.display_name}
+                      onChange={(event) =>
+                        setModelDrafts((previous) => ({
+                          ...previous,
+                          [modelItem.id]: {
+                            ...previous[modelItem.id],
+                            display_name: event.target.value,
+                          },
+                        }))
+                      }
+                      placeholder="Optional label"
+                    />
+                  </label>
+
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={draft.enabled}
+                      onChange={(event) =>
+                        setModelDrafts((previous) => ({
+                          ...previous,
+                          [modelItem.id]: {
+                            ...previous[modelItem.id],
+                            enabled: event.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    Enabled
+                  </label>
+
+                  <div className="button-row">
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void saveModel(modelItem.id)}
+                    >
+                      Save model
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void deleteModel(modelItem.id)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {status ? <div className="notice">{status}</div> : null}
+        {error ? <div className="error">{error}</div> : null}
+      </div>
     </section>
   );
 }

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import MainHeader from '../components/main-header';
 
 type MePayload = {
   id: string;
@@ -241,126 +242,140 @@ export default function SettingsPage() {
   };
 
   return (
-    <section style={{ display: 'grid', gap: '1rem' }}>
-      <div className="panel">
-        <h1 style={{ marginTop: 0 }}>Settings</h1>
-        <p className="notice">
-          {me ? (
+    <section className="settings-page app-page">
+      <MainHeader
+        title="Settings"
+        subtitle={
+          me ? (
             <>
               Signed in as <span className="mono">{me.email}</span>
             </>
           ) : (
             'Loading profile...'
-          )}
-        </p>
-        <button type="button" className="ghost" onClick={logout}>
-          Logout
-        </button>
-      </div>
+          )
+        }
+      />
 
-      <div className="panel" style={{ display: 'grid', gap: '1rem' }}>
-        <h2 style={{ margin: 0 }}>Provider API Keys (BYOK)</h2>
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            void saveKey();
-          }}
-        >
-          <label>
-            Provider
-            <select value={provider} onChange={(event) => setProvider(event.target.value)}>
-              {keys
-                .filter((item) => item.enabled)
-                .map((item) => (
-                  <option key={item.provider} value={item.provider}>
-                    {item.provider}
-                  </option>
-                ))}
-            </select>
-          </label>
-          <label>
-            API key
-            <input
-              value={apiKey}
-              onChange={(event) => setApiKey(event.target.value)}
-              placeholder="sk-..."
-              required
-            />
-          </label>
-          <button className="primary" type="submit" disabled={!provider}>
-            Save key
-          </button>
-        </form>
-        <div>
-          {keys.map((item) => (
-            <div key={item.provider} className="notice">
-              <span className="mono">{item.provider}</span> ({item.enabled ? 'enabled' : 'disabled'}):{' '}
-              {item.has_key ? item.masked_key : 'not set'}
-            </div>
-          ))}
+      <div className="page-stack">
+        <div className="card">
+          <div className="card-title-row">
+            <h2>Account</h2>
+            <button type="button" className="ghost" onClick={logout}>
+              Logout
+            </button>
+          </div>
+          <p className="notice">Session is cookie-based and scoped to this web app origin.</p>
         </div>
-      </div>
 
-      <div className="panel" style={{ display: 'grid', gap: '1rem' }}>
-        <h2 style={{ margin: 0 }}>Default Provider and Model</h2>
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            void saveDefaults();
-          }}
-        >
-          <label>
-            Default provider
-            <select
-              value={defaultProvider}
-              onChange={(event) => setDefaultProvider(event.target.value)}
-            >
-              {providersWithModels.map((providerCode) => (
-                <option key={providerCode} value={providerCode}>
-                  {providerCode}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Default model
-            <select
-              value={defaultModel}
-              onChange={(event) => setDefaultModel(event.target.value)}
-              disabled={!defaultProvider || modelsForDefaultProvider.length === 0}
-            >
-              {modelsForDefaultProvider.length === 0 ? (
-                <option value="">No allowed models for this provider</option>
-              ) : (
-                modelsForDefaultProvider.map((model) => (
-                  <option key={`${model.provider}:${model.id}`} value={model.id}>
-                    {makeModelLabel(model)}
-                  </option>
-                ))
-              )}
-            </select>
-          </label>
-          <button className="primary" type="submit" disabled={!defaultProvider || !defaultModel}>
-            Save defaults
-          </button>
-        </form>
+        <div className="card">
+          <h2>Provider API Keys (BYOK)</h2>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveKey();
+            }}
+          >
+            <label>
+              Provider
+              <select value={provider} onChange={(event) => setProvider(event.target.value)}>
+                {keys
+                  .filter((item) => item.enabled)
+                  .map((item) => (
+                    <option key={item.provider} value={item.provider}>
+                      {item.provider}
+                    </option>
+                  ))}
+              </select>
+            </label>
 
-        <div>
-          <button className="secondary" type="button" onClick={() => void refreshModels()}>
-            Refresh allowed models
-          </button>
-          <div style={{ marginTop: '.75rem', maxHeight: 180, overflow: 'auto' }}>
-            {modelsForDisplay.map((model) => (
-              <div key={`${model.provider}:${model.id}`} className="notice">
-                <span className="mono">{model.provider}</span>/{makeModelLabel(model)}
+            <label>
+              API key
+              <input
+                value={apiKey}
+                onChange={(event) => setApiKey(event.target.value)}
+                placeholder="sk-..."
+                required
+              />
+            </label>
+
+            <button className="primary" type="submit" disabled={!provider}>
+              Save key
+            </button>
+          </form>
+
+          <div className="stack-tight">
+            {keys.map((item) => (
+              <div key={item.provider} className="notice">
+                <span className="mono">{item.provider}</span> ({item.enabled ? 'enabled' : 'disabled'}):{' '}
+                {item.has_key ? item.masked_key : 'not set'}
               </div>
             ))}
           </div>
         </div>
-      </div>
 
-      {status ? <div className="notice">{status}</div> : null}
-      {error ? <div className="error">{error}</div> : null}
+        <div className="card">
+          <h2>Default Provider and Model</h2>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveDefaults();
+            }}
+          >
+            <label>
+              Default provider
+              <select
+                value={defaultProvider}
+                onChange={(event) => setDefaultProvider(event.target.value)}
+              >
+                {providersWithModels.map((providerCode) => (
+                  <option key={providerCode} value={providerCode}>
+                    {providerCode}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              Default model
+              <select
+                value={defaultModel}
+                onChange={(event) => setDefaultModel(event.target.value)}
+                disabled={!defaultProvider || modelsForDefaultProvider.length === 0}
+              >
+                {modelsForDefaultProvider.length === 0 ? (
+                  <option value="">No allowed models for this provider</option>
+                ) : (
+                  modelsForDefaultProvider.map((modelItem) => (
+                    <option key={`${modelItem.provider}:${modelItem.id}`} value={modelItem.id}>
+                      {makeModelLabel(modelItem)}
+                    </option>
+                  ))
+                )}
+              </select>
+            </label>
+
+            <button className="primary" type="submit" disabled={!defaultProvider || !defaultModel}>
+              Save defaults
+            </button>
+          </form>
+
+          <div className="stack-tight">
+            <button className="secondary" type="button" onClick={() => void refreshModels()}>
+              Refresh allowed models
+            </button>
+            <div className="allowlist-preview">
+              {modelsForDisplay.map((modelItem) => (
+                <div key={`${modelItem.provider}:${modelItem.id}`} className="notice">
+                  <span className="mono">{modelItem.provider}</span>/{makeModelLabel(modelItem)}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {status ? <div className="notice">{status}</div> : null}
+        {error ? <div className="error">{error}</div> : null}
+      </div>
     </section>
   );
 }
