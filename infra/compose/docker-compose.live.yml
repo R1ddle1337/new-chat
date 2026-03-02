@@ -49,6 +49,7 @@ services:
       MINIO_BUCKET: uploads
       KEY_ENCRYPTION_KEY: ${KEY_ENCRYPTION_KEY}
       SECURE_COOKIES: 'true'
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
     depends_on:
       postgres:
         condition: service_healthy
