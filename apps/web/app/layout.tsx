@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import { Space_Grotesk, IBM_Plex_Mono } from 'next/font/google';
-import Link from 'next/link';
 import './globals.css';
+import TopNav from './components/top-nav';
 
 const headingFont = Space_Grotesk({
   subsets: ['latin'],
@@ -30,11 +30,7 @@ export default function RootLayout({
         <div className="shell">
           <header className="topbar">
             <div className="brand">new-chat</div>
-            <nav>
-              <Link href="/chat">Chat</Link>
-              <Link href="/settings">Settings</Link>
-              <Link href="/login">Login</Link>
-            </nav>
+            <TopNav />
           </header>
           <main>{children}</main>
         </div>

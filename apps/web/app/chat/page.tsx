@@ -31,6 +31,16 @@ type MePayload = {
   default_model: string | null;
 };
 
+type AllowedModelItem = {
+  id: string;
+  provider: string;
+  display_name?: string | null;
+};
+
+type ModelsPayload = {
+  data: Array<{ id?: string; provider?: string; display_name?: string | null }>;
+};
+
 type ToastKind = 'info' | 'success' | 'error';
 
 type Toast = {
@@ -301,6 +311,11 @@ function parseErrorMessage(payload: unknown, fallback: string): string {
   return fallback;
 }
 
+function makeModelLabel(model: AllowedModelItem): string {
+  const displayName = model.display_name?.trim();
+  return displayName ? `${displayName} (${model.id})` : model.id;
+}
+
 function makeLocalMessageId(prefix: string): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return `${prefix}-${crypto.randomUUID()}`;
@@ -358,6 +373,7 @@ export default function ChatPage() {
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
   const [provider, setProvider] = useState('');
   const [model, setModel] = useState('');
+  const [allowedModels, setAllowedModels] = useState<AllowedModelItem[]>([]);
   const [streamResponses, setStreamResponses] = useState(true);
   const [sending, setSending] = useState(false);
   const [activeAbortController, setActiveAbortController] = useState<AbortController | null>(null);
@@ -371,7 +387,18 @@ export default function ChatPage() {
     [threads, selectedThreadId],
   );
 
-  const canSend = !sending && (input.trim().length > 0 || Boolean(image));
+  const providerOptions = useMemo(() => {
+    return Array.from(new Set(allowedModels.map((entry) => entry.provider))).sort((a, b) =>
+      a.localeCompare(b),
+    );
+  }, [allowedModels]);
+
+  const modelsForSelectedProvider = useMemo(() => {
+    return allowedModels.filter((entry) => entry.provider === provider);
+  }, [allowedModels, provider]);
+
+  const canSend =
+    !sending && Boolean(provider.trim()) && Boolean(model.trim()) && (input.trim().length > 0 || Boolean(image));
 
   const pushToast = (kind: ToastKind, message: string) => {
     const id = toastCounterRef.current + 1;
@@ -412,6 +439,31 @@ export default function ChatPage() {
     shouldAutoScrollRef.current = nearBottom;
     setShowJumpToLatest(!nearBottom);
   }, []);
+
+  const loadAllowedModels = async (): Promise<AllowedModelItem[]> => {
+    const response = await fetch('/api/v1/models', { credentials: 'include' });
+    if (!response.ok) {
+      if (response.status === 401) {
+        router.replace('/login');
+      }
+      throw new Error('Failed to load allowed models');
+    }
+
+    const payload = (await response.json()) as ModelsPayload;
+    const list = payload.data
+      .filter((item): item is { id: string; provider: string; display_name?: string | null } => {
+        return typeof item.id === 'string' && typeof item.provider === 'string';
+      })
+      .map((item) => ({
+        id: item.id,
+        provider: item.provider,
+        display_name: item.display_name ?? null,
+      }))
+      .sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+
+    setAllowedModels(list);
+    return list;
+  };
 
   const loadThreads = async (preferredThreadId?: string | null) => {
     const res = await fetch('/api/me/threads', { credentials: 'include' });
@@ -468,8 +520,27 @@ export default function ChatPage() {
       }
 
       const me = (await meRes.json()) as MePayload;
-      setProvider(me.default_provider);
-      setModel(me.default_model ?? '');
+      try {
+        const models = await loadAllowedModels();
+        const modelProviders = Array.from(new Set(models.map((entry) => entry.provider)));
+
+        const preferredProvider = modelProviders.includes(me.default_provider)
+          ? me.default_provider
+          : modelProviders[0] ?? '';
+        setProvider(preferredProvider);
+
+        const providerModels = models.filter((entry) => entry.provider === preferredProvider);
+        const preferredModel =
+          me.default_model && providerModels.some((entry) => entry.id === me.default_model)
+            ? me.default_model
+            : providerModels[0]?.id ?? '';
+        setModel(preferredModel);
+      } catch (error) {
+        pushToast(
+          'error',
+          error instanceof Error ? error.message : 'Failed to load allowed models',
+        );
+      }
 
       await loadThreads();
       setLoading(false);
@@ -477,6 +548,23 @@ export default function ChatPage() {
 
     void bootstrap();
   }, []);
+
+  useEffect(() => {
+    if (!provider) {
+      setModel('');
+      return;
+    }
+
+    const providerModels = allowedModels.filter((entry) => entry.provider === provider);
+    if (providerModels.length === 0) {
+      setModel('');
+      return;
+    }
+
+    if (!providerModels.some((entry) => entry.id === model)) {
+      setModel(providerModels[0]!.id);
+    }
+  }, [allowedModels, provider, model]);
 
   useEffect(() => {
     shouldAutoScrollRef.current = true;
@@ -635,6 +723,11 @@ export default function ChatPage() {
       return;
     }
 
+    if (!provider.trim() || !model.trim()) {
+      pushToast('error', 'Select provider and model from the admin allowlist');
+      return;
+    }
+
     setSending(true);
     const requestAbortController = new AbortController();
     setActiveAbortController(requestAbortController);
@@ -687,16 +780,12 @@ export default function ChatPage() {
           },
         ],
         stream: streamResponses,
+        provider: provider.trim(),
+        model: model.trim(),
       };
 
       if (selectedThreadId) {
         body.thread_id = selectedThreadId;
-      }
-      if (provider.trim()) {
-        body.provider = provider.trim();
-      }
-      if (model.trim()) {
-        body.model = model.trim();
       }
 
       const optimisticUserId = makeLocalMessageId('local-user');
@@ -971,23 +1060,44 @@ export default function ChatPage() {
               <select
                 value={provider}
                 onChange={(event) => setProvider(event.target.value)}
-                disabled={sending}
+                disabled={sending || providerOptions.length === 0}
               >
-                <option value="">(default)</option>
-                <option value="openai">openai</option>
-                <option value="grok2api">grok2api</option>
+                {providerOptions.length === 0 ? (
+                  <option value="">No allowed providers</option>
+                ) : (
+                  providerOptions.map((providerCode) => (
+                    <option key={providerCode} value={providerCode}>
+                      {providerCode}
+                    </option>
+                  ))
+                )}
               </select>
             </label>
             <label>
               Model
-              <input
+              <select
                 value={model}
                 onChange={(event) => setModel(event.target.value)}
-                placeholder="use default if empty"
-                disabled={sending}
-              />
+                disabled={sending || !provider || modelsForSelectedProvider.length === 0}
+              >
+                {modelsForSelectedProvider.length === 0 ? (
+                  <option value="">No allowed models</option>
+                ) : (
+                  modelsForSelectedProvider.map((item) => (
+                    <option key={`${item.provider}:${item.id}`} value={item.id}>
+                      {makeModelLabel(item)}
+                    </option>
+                  ))
+                )}
+              </select>
             </label>
           </div>
+
+          {providerOptions.length === 0 ? (
+            <p className="error" style={{ margin: 0 }}>
+              No allowed models are configured by admin.
+            </p>
+          ) : null}
         </div>
 
         <div className="panel chat-messages-panel">
