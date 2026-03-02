@@ -39,6 +39,12 @@ type UploadedFileRow = {
   mime_type: string;
 };
 
+type StoredFileRow = {
+  id: string;
+  filename: string;
+  mime_type: string;
+};
+
 declare module 'fastify' {
   interface FastifyRequest {
     authUser?: DbUser;
@@ -336,12 +342,87 @@ async function resolveProviderForRequest(
   return openai;
 }
 
-function summarizeText(text: string): string {
+const threadTitleSentenceBoundary = /[.!?]\s/;
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function deriveThreadTitleFromText(text: string): string | null {
   const cleaned = text.replace(/\s+/g, ' ').trim();
-  if (cleaned.length <= 80) {
-    return cleaned;
+  if (!cleaned) {
+    return null;
   }
-  return `${cleaned.slice(0, 80)}...`;
+
+  const boundaryMatch = threadTitleSentenceBoundary.exec(cleaned);
+  let candidate =
+    boundaryMatch && boundaryMatch.index >= 0
+      ? cleaned.slice(0, boundaryMatch.index + 1)
+      : cleaned;
+
+  candidate = candidate.replace(/\s+/g, ' ').trim();
+  if (!candidate) {
+    return null;
+  }
+
+  if (candidate.length <= 60) {
+    return candidate;
+  }
+
+  return `${candidate.slice(0, 57).trimEnd()}...`;
+}
+
+async function maybeAutoRenameThread(params: {
+  threadId: string;
+  userId: string;
+  sourceText: string;
+}): Promise<void> {
+  const title = deriveThreadTitleFromText(params.sourceText);
+  if (!title) {
+    return;
+  }
+
+  await pool.query(
+    `UPDATE threads
+     SET title = $3,
+         updated_at = now()
+     WHERE id = $1
+       AND user_id = $2
+       AND title = 'New chat'`,
+    [params.threadId, params.userId, title],
+  );
+}
+
+function collectFileIds(value: unknown, ids: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectFileIds(item, ids);
+    }
+    return;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  const maybeFileId =
+    typeof record.file_id === 'string'
+      ? record.file_id
+      : typeof record.fileId === 'string'
+        ? record.fileId
+        : null;
+
+  if (maybeFileId && uuidPattern.test(maybeFileId)) {
+    ids.add(maybeFileId);
+  }
+
+  for (const nested of Object.values(record)) {
+    collectFileIds(nested, ids);
+  }
+}
+
+function extractFileIdsFromRawContent(rawContent: unknown): string[] {
+  const ids = new Set<string>();
+  collectFileIds(rawContent, ids);
+  return Array.from(ids);
 }
 
 function extractTextFromResponsesInput(input: unknown): string {
@@ -711,7 +792,6 @@ function parseSseAssistantDelta(params: {
 async function getOrCreateThread(params: {
   userId: string;
   threadId?: string;
-  promptPreview: string;
   providerId: number;
   model?: string;
 }): Promise<string> {
@@ -737,12 +817,11 @@ async function getOrCreateThread(params: {
     return params.threadId;
   }
 
-  const title = params.promptPreview ? summarizeText(params.promptPreview) : 'New chat';
   const result = await pool.query<{ id: string }>(
     `INSERT INTO threads (user_id, title, provider_id, model)
      VALUES ($1, $2, $3, $4)
      RETURNING id`,
-    [params.userId, title, params.providerId, params.model ?? null],
+    [params.userId, 'New chat', params.providerId, params.model ?? null],
   );
   return result.rows[0]!.id;
 }
@@ -995,6 +1074,55 @@ async function setupServer(): Promise<void> {
     return { data: result.rows };
   });
 
+  app.patch('/me/threads/:threadId', { preHandler: [requireAuth] }, async (request, reply) => {
+    const user = request.authUser!;
+    const params = request.params as { threadId: string };
+    const body = (request.body ?? {}) as { title?: unknown };
+    const title =
+      typeof body.title === 'string' ? body.title.replace(/\s+/g, ' ').trim() : '';
+
+    if (!title) {
+      reply.code(400).send({ error: 'title is required' });
+      return;
+    }
+
+    if (title.length > 120) {
+      reply.code(400).send({ error: 'title must be 120 characters or fewer' });
+      return;
+    }
+
+    const updated = await pool.query<{
+      id: string;
+      title: string;
+      model: string | null;
+      updated_at: string;
+      created_at: string;
+    }>(
+      `UPDATE threads
+       SET title = $3,
+           updated_at = now()
+       WHERE id = $1 AND user_id = $2
+       RETURNING id, title, model, updated_at, created_at`,
+      [params.threadId, user.id, title],
+    );
+
+    if (!updated.rowCount) {
+      reply.code(404).send({ error: 'Thread not found' });
+      return;
+    }
+
+    await writeAuditEvent({
+      eventType: 'threads.renamed',
+      request,
+      userId: user.id,
+      metadata: {
+        thread_id: params.threadId,
+      },
+    });
+
+    reply.send({ data: updated.rows[0] });
+  });
+
   app.get('/me/threads/:threadId/messages', { preHandler: [requireAuth] }, async (request, reply) => {
     const user = request.authUser!;
     const params = request.params as { threadId: string };
@@ -1014,15 +1142,64 @@ async function setupServer(): Promise<void> {
       role: string;
       content: string;
       created_at: string;
+      raw_content: unknown;
     }>(
-      `SELECT id, role, content, created_at
+      `SELECT id, role, content, created_at, raw_content
        FROM messages
        WHERE thread_id = $1
        ORDER BY created_at ASC`,
       [params.threadId],
     );
 
-    reply.send({ data: messages.rows });
+    const attachmentIds = new Set<string>();
+    const attachmentIdsByMessage = new Map<string, string[]>();
+    for (const message of messages.rows) {
+      const ids = extractFileIdsFromRawContent(message.raw_content);
+      attachmentIdsByMessage.set(message.id, ids);
+      for (const id of ids) {
+        attachmentIds.add(id);
+      }
+    }
+
+    let filesById = new Map<string, StoredFileRow>();
+    if (attachmentIds.size > 0) {
+      const files = await pool.query<StoredFileRow>(
+        `SELECT id, filename, mime_type
+         FROM files
+         WHERE user_id = $1
+           AND id = ANY($2::uuid[])`,
+        [user.id, Array.from(attachmentIds)],
+      );
+
+      filesById = new Map(files.rows.map((file) => [file.id, file]));
+    }
+
+    reply.send({
+      data: messages.rows.map((message) => {
+        const attachments = (attachmentIdsByMessage.get(message.id) ?? [])
+          .map((fileId) => {
+            const file = filesById.get(fileId);
+            if (!file) {
+              return null;
+            }
+            return {
+              file_id: file.id,
+              filename: file.filename,
+              mime_type: file.mime_type,
+              content_url: `/api/v1/files/${file.id}/content`,
+            };
+          })
+          .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
+
+        return {
+          id: message.id,
+          role: message.role,
+          content: message.content,
+          created_at: message.created_at,
+          attachments,
+        };
+      }),
+    });
   });
 
   app.post('/me/keys', { preHandler: [requireAuth] }, async (request, reply) => {
@@ -1286,6 +1463,30 @@ async function setupServer(): Promise<void> {
     });
   });
 
+  app.get('/v1/files/:fileId/content', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
+    const user = request.authUser!;
+    const params = request.params as { fileId: string };
+
+    const fileResult = await pool.query<UploadedFileRow>(
+      `SELECT id, bucket, object_key, mime_type
+       FROM files
+       WHERE id = $1 AND user_id = $2`,
+      [params.fileId, user.id],
+    );
+
+    if (!fileResult.rowCount) {
+      reply.code(404).send({ error: 'File not found' });
+      return;
+    }
+
+    const file = fileResult.rows[0]!;
+    const stream = (await minio.getObject(file.bucket, file.object_key)) as Readable;
+
+    reply.header('Content-Type', file.mime_type);
+    reply.header('Cache-Control', 'private, max-age=300');
+    reply.send(stream);
+  });
+
   app.post('/v1/responses', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
     const user = request.authUser!;
     const requestBody = { ...((request.body ?? {}) as Record<string, unknown>) };
@@ -1322,7 +1523,6 @@ async function setupServer(): Promise<void> {
     const targetThreadId = await getOrCreateThread({
       userId: user.id,
       threadId,
-      promptPreview: userPrompt,
       providerId: provider.id,
       model: effectiveModel,
     });
@@ -1333,6 +1533,12 @@ async function setupServer(): Promise<void> {
       role: 'user',
       content: userPrompt || '[non-text input]',
       rawContent: requestBody.input,
+    });
+
+    await maybeAutoRenameThread({
+      threadId: targetThreadId,
+      userId: user.id,
+      sourceText: userPrompt,
     });
 
     const stream = requestBody.stream === true;
@@ -1434,6 +1640,12 @@ async function setupServer(): Promise<void> {
         content: assistantText || '[streamed response]',
       });
 
+      await maybeAutoRenameThread({
+        threadId: targetThreadId,
+        userId: user.id,
+        sourceText: assistantText,
+      });
+
       reply.raw.end();
       return;
     }
@@ -1447,6 +1659,12 @@ async function setupServer(): Promise<void> {
       role: 'assistant',
       content: assistantText || '[empty response]',
       rawContent: payload,
+    });
+
+    await maybeAutoRenameThread({
+      threadId: targetThreadId,
+      userId: user.id,
+      sourceText: assistantText,
     });
 
     reply.header('X-Thread-Id', targetThreadId).send(payload);
@@ -1488,7 +1706,6 @@ async function setupServer(): Promise<void> {
     const targetThreadId = await getOrCreateThread({
       userId: user.id,
       threadId,
-      promptPreview: userPrompt,
       providerId: provider.id,
       model: effectiveModel,
     });
@@ -1499,6 +1716,12 @@ async function setupServer(): Promise<void> {
       role: 'user',
       content: userPrompt || '[non-text input]',
       rawContent: requestBody.messages,
+    });
+
+    await maybeAutoRenameThread({
+      threadId: targetThreadId,
+      userId: user.id,
+      sourceText: userPrompt,
     });
 
     const stream = requestBody.stream === true;
@@ -1600,6 +1823,12 @@ async function setupServer(): Promise<void> {
         content: assistantText || '[streamed response]',
       });
 
+      await maybeAutoRenameThread({
+        threadId: targetThreadId,
+        userId: user.id,
+        sourceText: assistantText,
+      });
+
       reply.raw.end();
       return;
     }
@@ -1613,6 +1842,12 @@ async function setupServer(): Promise<void> {
       role: 'assistant',
       content: assistantText || '[empty response]',
       rawContent: payload,
+    });
+
+    await maybeAutoRenameThread({
+      threadId: targetThreadId,
+      userId: user.id,
+      sourceText: assistantText,
     });
 
     reply.header('X-Thread-Id', targetThreadId).send(payload);

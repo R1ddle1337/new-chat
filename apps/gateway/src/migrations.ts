@@ -2,6 +2,27 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { Pool } from 'pg';
 
+async function resolveMigrationsDir(): Promise<string> {
+  const candidates = [
+    path.resolve(__dirname, '../migrations'),
+    path.resolve(process.cwd(), 'apps/gateway/migrations'),
+    path.resolve(process.cwd(), 'migrations'),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+
+  throw new Error(
+    `Unable to locate migrations directory. Tried: ${candidates.join(', ')}`,
+  );
+}
+
 export async function runMigrations(pool: Pool): Promise<void> {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -10,7 +31,7 @@ export async function runMigrations(pool: Pool): Promise<void> {
     )
   `);
 
-  const migrationsDir = path.resolve(process.cwd(), 'apps/gateway/migrations');
+  const migrationsDir = await resolveMigrationsDir();
   const files = (await fs.readdir(migrationsDir))
     .filter((file) => file.endsWith('.sql'))
     .sort();
