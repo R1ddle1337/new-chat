@@ -66,8 +66,160 @@ function resolveMarkdownPlugin<T>(plugin: T): T {
 const remarkMathPlugin = resolveMarkdownPlugin(remarkMath);
 const rehypeKatexPlugin = resolveMarkdownPlugin(rehypeKatex);
 
+type MarkdownFenceState = {
+  markerChar: '`' | '~';
+  markerLength: number;
+  openerLine: string;
+  isMathFence: boolean;
+  body: string;
+};
+
+const markdownFenceOpenPattern = /^( {0,3})(`{3,}|~{3,})([^\r\n]*)$/;
+
 const emojiOnlyTokenPattern =
   /(?:\p{Regional_Indicator}{2}|[#*0-9]\uFE0F?\u20E3|\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?(?:\p{Emoji_Modifier})?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?(?:\p{Emoji_Modifier})?)*)/gu;
+
+function isEscapedCharacter(input: string, index: number): boolean {
+  let slashCount = 0;
+  for (let cursor = index - 1; cursor >= 0 && input[cursor] === '\\'; cursor -= 1) {
+    slashCount += 1;
+  }
+  return slashCount % 2 === 1;
+}
+
+function findUnescapedToken(input: string, token: string, fromIndex: number): number {
+  let tokenIndex = input.indexOf(token, fromIndex);
+  while (tokenIndex !== -1) {
+    if (!isEscapedCharacter(input, tokenIndex)) {
+      return tokenIndex;
+    }
+    tokenIndex = input.indexOf(token, tokenIndex + token.length);
+  }
+  return -1;
+}
+
+function replaceLatexDelimitedMath(
+  input: string,
+  openToken: string,
+  closeToken: string,
+  replacementToken: '$' | '$$',
+): string {
+  let cursor = 0;
+  let output = '';
+
+  while (cursor < input.length) {
+    const openIndex = findUnescapedToken(input, openToken, cursor);
+    if (openIndex === -1) {
+      output += input.slice(cursor);
+      break;
+    }
+
+    output += input.slice(cursor, openIndex);
+    const contentStart = openIndex + openToken.length;
+    const closeIndex = findUnescapedToken(input, closeToken, contentStart);
+    if (closeIndex === -1) {
+      output += input.slice(openIndex);
+      break;
+    }
+
+    output += `${replacementToken}${input.slice(contentStart, closeIndex)}${replacementToken}`;
+    cursor = closeIndex + closeToken.length;
+  }
+
+  return output;
+}
+
+function normalizeLatexMathDelimiters(content: string): string {
+  const withDisplayMath = replaceLatexDelimitedMath(content, '\\[', '\\]', '$$');
+  return replaceLatexDelimitedMath(withDisplayMath, '\\(', '\\)', '$');
+}
+
+function parseFenceLanguage(infoString: string): string {
+  const token = infoString.trim().split(/\s+/)[0] ?? '';
+  return token.replace(/^[{.]*/, '').replace(/[}]*$/, '').toLowerCase();
+}
+
+function renderMathFenceAsDisplayMath(body: string): string {
+  const trimmedBody = body.replace(/(?:\r?\n)+$/, '');
+  if (!trimmedBody.trim()) {
+    return '$$\n$$\n';
+  }
+  return `$$\n${trimmedBody}\n$$\n`;
+}
+
+function normalizeMarkdownMath(content: string): string {
+  const lines = content.match(/[^\r\n]*(?:\r?\n|$)/g);
+  if (!lines) {
+    return content;
+  }
+
+  const output: string[] = [];
+  let outsideFenceBuffer = '';
+  let activeFence: MarkdownFenceState | null = null;
+
+  const flushOutsideFenceBuffer = () => {
+    if (!outsideFenceBuffer) {
+      return;
+    }
+    output.push(normalizeLatexMathDelimiters(outsideFenceBuffer));
+    outsideFenceBuffer = '';
+  };
+
+  for (const line of lines) {
+    if (!line) {
+      continue;
+    }
+
+    if (!activeFence) {
+      const openMatch = line.match(markdownFenceOpenPattern);
+      if (!openMatch) {
+        outsideFenceBuffer += line;
+        continue;
+      }
+
+      const marker = openMatch[2];
+      const markerChar = marker[0] as '`' | '~';
+      const markerLength = marker.length;
+      const language = parseFenceLanguage(openMatch[3] ?? '');
+      const isMathFence = language === 'math' || language === 'latex' || language === 'tex';
+
+      flushOutsideFenceBuffer();
+      activeFence = {
+        markerChar,
+        markerLength,
+        openerLine: line,
+        isMathFence,
+        body: '',
+      };
+      continue;
+    }
+
+    const fenceMarker = activeFence.markerChar === '`' ? '`' : '~';
+    const closePattern = new RegExp(
+      `^ {0,3}${fenceMarker}{${activeFence.markerLength},}[ \\t]*\\r?\\n?$`,
+    );
+
+    if (!closePattern.test(line)) {
+      activeFence.body += line;
+      continue;
+    }
+
+    if (activeFence.isMathFence) {
+      output.push(renderMathFenceAsDisplayMath(activeFence.body));
+    } else {
+      output.push(activeFence.openerLine + activeFence.body + line);
+    }
+
+    activeFence = null;
+  }
+
+  if (activeFence) {
+    output.push(activeFence.openerLine + activeFence.body);
+  }
+
+  flushOutsideFenceBuffer();
+  return output.join('');
+}
 
 function sanitizeLinkHref(rawHref: string | undefined): string | null {
   if (!rawHref) {
@@ -162,13 +314,15 @@ const markdownComponents = {
 };
 
 function MessageMarkdown({ content }: { content: string }) {
+  const normalizedContent = useMemo(() => normalizeMarkdownMath(content), [content]);
+
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm, remarkMathPlugin]}
       rehypePlugins={[rehypeKatexPlugin]}
       components={markdownComponents}
     >
-      {content}
+      {normalizedContent}
     </ReactMarkdown>
   );
 }
@@ -1083,7 +1237,7 @@ export default function ChatPage() {
               Generating response
             </span>
           ) : (
-            'Enter to send, Shift+Enter for newline. Math: $...$ inline, $$...$$ block.'
+            'Enter to send, Shift+Enter for newline. Math: $...$, $$...$$, \\(...\\), \\[...\\].'
           )}
         </div>
 
