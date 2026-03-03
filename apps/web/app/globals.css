@@ -903,6 +903,10 @@ code {
   margin-top: 0.76rem;
 }
 
+.chat-markdown-pending {
+  white-space: pre-wrap;
+}
+
 .chat-message-content ul,
 .chat-message-content ol {
   padding-left: 1.25rem;

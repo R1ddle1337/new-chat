@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -73,6 +74,8 @@ type MarkdownFenceState = {
   isMathFence: boolean;
   body: string;
 };
+
+type InlineMathState = 'none' | 'inline-dollar' | 'block-dollar' | 'inline-paren' | 'block-bracket';
 
 const markdownFenceOpenPattern = /^( {0,3})(`{3,}|~{3,})([^\r\n]*)$/;
 
@@ -221,6 +224,202 @@ function normalizeMarkdownMath(content: string): string {
   return output.join('');
 }
 
+function countConsecutiveCharacter(input: string, fromIndex: number, character: string): number {
+  let count = 0;
+  while (fromIndex + count < input.length && input[fromIndex + count] === character) {
+    count += 1;
+  }
+  return count;
+}
+
+function normalizeLineForFenceChecks(line: string): string {
+  return line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+function looksLikeInlineMathStart(input: string, index: number): boolean {
+  const next = input[index + 1];
+  if (!next || /\s/.test(next)) {
+    return false;
+  }
+
+  const prev = index > 0 ? input[index - 1] : '';
+  if (/\d/.test(prev) && /\d/.test(next)) {
+    return false;
+  }
+
+  return true;
+}
+
+function findLastSafeMarkdownBoundary(input: string): number {
+  let safeBoundary = 0;
+  let index = 0;
+  let atLineStart = true;
+  let activeFence: { markerChar: '`' | '~'; markerLength: number } | null = null;
+  let inlineCodeTickCount = 0;
+  let inlineMathState: InlineMathState = 'none';
+
+  while (index < input.length) {
+    if (atLineStart) {
+      const lineEnd = input.indexOf('\n', index);
+      const segmentEnd = lineEnd === -1 ? input.length : lineEnd;
+      const rawLine = input.slice(index, segmentEnd);
+      const line = normalizeLineForFenceChecks(rawLine);
+
+      if (activeFence) {
+        const closePattern = new RegExp(
+          `^ {0,3}${activeFence.markerChar}{${activeFence.markerLength},}[ \\t]*$`,
+        );
+        if (closePattern.test(line)) {
+          activeFence = null;
+          inlineCodeTickCount = 0;
+          inlineMathState = 'none';
+          safeBoundary = lineEnd === -1 ? segmentEnd : segmentEnd + 1;
+        }
+        index = lineEnd === -1 ? segmentEnd : segmentEnd + 1;
+        atLineStart = true;
+        continue;
+      }
+
+      if (inlineCodeTickCount === 0 && inlineMathState === 'none') {
+        const openMatch = line.match(markdownFenceOpenPattern);
+        if (openMatch) {
+          const marker = openMatch[2];
+          activeFence = {
+            markerChar: marker[0] as '`' | '~',
+            markerLength: marker.length,
+          };
+          index = lineEnd === -1 ? segmentEnd : segmentEnd + 1;
+          atLineStart = true;
+          continue;
+        }
+      }
+    }
+
+    if (activeFence) {
+      const character = input[index];
+      index += 1;
+      atLineStart = character === '\n';
+      continue;
+    }
+
+    if (inlineCodeTickCount > 0) {
+      if (input[index] === '`' && !isEscapedCharacter(input, index)) {
+        const tickCount = countConsecutiveCharacter(input, index, '`');
+        if (tickCount === inlineCodeTickCount) {
+          inlineCodeTickCount = 0;
+          index += tickCount;
+          safeBoundary = index;
+          atLineStart = false;
+          continue;
+        }
+        index += tickCount;
+        atLineStart = false;
+        continue;
+      }
+
+      const character = input[index];
+      index += 1;
+      atLineStart = character === '\n';
+      continue;
+    }
+
+    if (inlineMathState !== 'none') {
+      if (inlineMathState === 'inline-dollar') {
+        if (input[index] === '$' && !isEscapedCharacter(input, index) && input[index + 1] !== '$') {
+          inlineMathState = 'none';
+          index += 1;
+          safeBoundary = index;
+          atLineStart = false;
+          continue;
+        }
+      } else if (inlineMathState === 'block-dollar') {
+        if (
+          input[index] === '$' &&
+          input[index + 1] === '$' &&
+          !isEscapedCharacter(input, index)
+        ) {
+          inlineMathState = 'none';
+          index += 2;
+          safeBoundary = index;
+          atLineStart = false;
+          continue;
+        }
+      } else if (inlineMathState === 'inline-paren') {
+        if (
+          input[index] === '\\' &&
+          input[index + 1] === ')' &&
+          !isEscapedCharacter(input, index)
+        ) {
+          inlineMathState = 'none';
+          index += 2;
+          safeBoundary = index;
+          atLineStart = false;
+          continue;
+        }
+      } else if (inlineMathState === 'block-bracket') {
+        if (
+          input[index] === '\\' &&
+          input[index + 1] === ']' &&
+          !isEscapedCharacter(input, index)
+        ) {
+          inlineMathState = 'none';
+          index += 2;
+          safeBoundary = index;
+          atLineStart = false;
+          continue;
+        }
+      }
+
+      const character = input[index];
+      index += 1;
+      atLineStart = character === '\n';
+      continue;
+    }
+
+    if (input[index] === '`' && !isEscapedCharacter(input, index)) {
+      inlineCodeTickCount = countConsecutiveCharacter(input, index, '`');
+      index += inlineCodeTickCount;
+      atLineStart = false;
+      continue;
+    }
+
+    if (
+      input[index] === '\\' &&
+      !isEscapedCharacter(input, index) &&
+      (input[index + 1] === '(' || input[index + 1] === '[')
+    ) {
+      inlineMathState = input[index + 1] === '(' ? 'inline-paren' : 'block-bracket';
+      index += 2;
+      atLineStart = false;
+      continue;
+    }
+
+    if (input[index] === '$' && !isEscapedCharacter(input, index)) {
+      if (input[index + 1] === '$') {
+        inlineMathState = 'block-dollar';
+        index += 2;
+        atLineStart = false;
+        continue;
+      }
+      if (looksLikeInlineMathStart(input, index)) {
+        inlineMathState = 'inline-dollar';
+        index += 1;
+        atLineStart = false;
+        continue;
+      }
+    }
+
+    const character = input[index];
+    index += 1;
+    atLineStart = character === '\n';
+    if (character === '\n' || character === ' ' || character === '\t' || character === '\r') {
+      safeBoundary = index;
+    }
+  }
+
+  return safeBoundary;
+}
+
 function sanitizeLinkHref(rawHref: string | undefined): string | null {
   if (!rawHref) {
     return null;
@@ -313,8 +512,10 @@ const markdownComponents = {
   },
 };
 
-function MessageMarkdown({ content }: { content: string }) {
-  const normalizedContent = useMemo(() => normalizeMarkdownMath(content), [content]);
+const ParsedMessageMarkdown = memo(function ParsedMessageMarkdown({ content }: { content: string }) {
+  if (!content) {
+    return null;
+  }
 
   return (
     <ReactMarkdown
@@ -322,10 +523,172 @@ function MessageMarkdown({ content }: { content: string }) {
       rehypePlugins={[rehypeKatexPlugin]}
       components={markdownComponents}
     >
-      {normalizedContent}
+      {content}
     </ReactMarkdown>
   );
+});
+
+function MessageMarkdown({ content, streaming = false }: { content: string; streaming?: boolean }) {
+  const normalizedContent = useMemo(() => normalizeMarkdownMath(content), [content]);
+  const normalizedContentRef = useRef(normalizedContent);
+  const splitFrameRef = useRef<number | null>(null);
+  const lastSplitAtRef = useRef(0);
+  const [renderablePrefix, setRenderablePrefix] = useState(() => normalizedContent);
+  const [pendingSuffix, setPendingSuffix] = useState('');
+
+  const runStreamingSplit = useCallback(() => {
+    const source = normalizedContentRef.current;
+    const boundary = findLastSafeMarkdownBoundary(source);
+    const nextPrefix = source.slice(0, boundary);
+    const nextSuffix = source.slice(boundary);
+
+    setRenderablePrefix((previous) => (previous === nextPrefix ? previous : nextPrefix));
+    setPendingSuffix((previous) => (previous === nextSuffix ? previous : nextSuffix));
+  }, []);
+
+  const scheduleStreamingSplit = useCallback(() => {
+    if (splitFrameRef.current !== null) {
+      return;
+    }
+
+    const minSplitIntervalMs = 64;
+    const scheduleFrame = (timestamp: number) => {
+      if (timestamp - lastSplitAtRef.current < minSplitIntervalMs) {
+        splitFrameRef.current = window.requestAnimationFrame(scheduleFrame);
+        return;
+      }
+
+      splitFrameRef.current = null;
+      lastSplitAtRef.current = timestamp;
+      runStreamingSplit();
+    };
+
+    splitFrameRef.current = window.requestAnimationFrame(scheduleFrame);
+  }, [runStreamingSplit]);
+
+  useEffect(() => {
+    normalizedContentRef.current = normalizedContent;
+    if (!streaming) {
+      setRenderablePrefix((previous) => (previous === normalizedContent ? previous : normalizedContent));
+      setPendingSuffix((previous) => (previous ? '' : previous));
+      return;
+    }
+    scheduleStreamingSplit();
+  }, [normalizedContent, scheduleStreamingSplit, streaming]);
+
+  useEffect(() => {
+    if (!streaming) {
+      if (splitFrameRef.current !== null) {
+        window.cancelAnimationFrame(splitFrameRef.current);
+        splitFrameRef.current = null;
+      }
+      return;
+    }
+
+    lastSplitAtRef.current = 0;
+    runStreamingSplit();
+    scheduleStreamingSplit();
+  }, [runStreamingSplit, scheduleStreamingSplit, streaming]);
+
+  useEffect(() => {
+    return () => {
+      if (splitFrameRef.current !== null) {
+        window.cancelAnimationFrame(splitFrameRef.current);
+        splitFrameRef.current = null;
+      }
+    };
+  }, []);
+
+  if (!streaming) {
+    return <ParsedMessageMarkdown content={normalizedContent} />;
+  }
+
+  return (
+    <>
+      <ParsedMessageMarkdown content={renderablePrefix} />
+      {pendingSuffix ? <span className="chat-markdown-pending">{pendingSuffix}</span> : null}
+    </>
+  );
 }
+
+type ChatMessageRowProps = {
+  message: MessageItem;
+  isEntering: boolean;
+  isStreaming: boolean;
+  onCopyAssistantMessage: (message: MessageItem) => void;
+};
+
+const ChatMessageRow = memo(
+  function ChatMessageRow({
+    message,
+    isEntering,
+    isStreaming,
+    onCopyAssistantMessage,
+  }: ChatMessageRowProps) {
+    const assistantMessage = message.role === 'assistant';
+    const showGenerating = assistantMessage && isStreaming && !message.content.trim();
+    const emojiOnly = !showGenerating && isEmojiOnlyMessage(message.content);
+
+    return (
+      <article
+        className={`chat-message-row ${assistantMessage ? 'assistant' : 'user'}${isEntering ? ' chat-message-enter' : ''}`}
+      >
+        <div className="chat-message-inner">
+          {message.attachments.length > 0 ? (
+            <div className="chat-message-attachments-row">
+              {message.attachments.map((attachment) => {
+                const imageAttachment = attachment.mime_type.startsWith('image/');
+
+                return (
+                  <a
+                    key={`${message.id}-${attachment.file_id}`}
+                    href={attachment.content_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="chat-message-attachment"
+                    title={attachment.filename}
+                  >
+                    {imageAttachment ? (
+                      <img src={attachment.content_url} alt={attachment.filename} loading="lazy" />
+                    ) : (
+                      <div className="chat-message-attachment-fallback">FILE</div>
+                    )}
+                    <span className="chat-message-attachment-name">{attachment.filename}</span>
+                  </a>
+                );
+              })}
+            </div>
+          ) : null}
+
+          <div className={`chat-message-content${emojiOnly ? ' emoji-only' : ''}`}>
+            {showGenerating ? (
+              <div className="chat-inline-streaming">
+                <span className="chat-streaming-dot" />
+                Generating...
+              </div>
+            ) : (
+              <MessageMarkdown content={message.content} streaming={isStreaming} />
+            )}
+          </div>
+
+          {assistantMessage && message.content.trim() ? (
+            <button
+              type="button"
+              className="chat-copy-button"
+              onClick={() => onCopyAssistantMessage(message)}
+            >
+              Copy
+            </button>
+          ) : null}
+        </div>
+      </article>
+    );
+  },
+  (previous, next) =>
+    previous.message === next.message &&
+    previous.isEntering === next.isEntering &&
+    previous.isStreaming === next.isStreaming,
+);
 
 function findSseBoundary(input: string): { index: number; length: number } | null {
   const idxLf = input.indexOf('\n\n');
@@ -566,6 +929,7 @@ export default function ChatPage() {
   const [activeAbortController, setActiveAbortController] = useState<AbortController | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [streamingAssistantId, setStreamingAssistantId] = useState<string | null>(null);
 
   const modelSelectionOptions = useMemo(() => {
     return allowedModels.map((entry) => ({
@@ -885,6 +1249,27 @@ export default function ChatPage() {
     activeAbortController.abort();
   };
 
+  const updateMessageContent = useCallback((messageId: string, nextContent: string) => {
+    setMessages((previous) => {
+      const targetIndex = previous.findIndex((message) => message.id === messageId);
+      if (targetIndex === -1) {
+        return previous;
+      }
+
+      const targetMessage = previous[targetIndex]!;
+      if (targetMessage.content === nextContent) {
+        return previous;
+      }
+
+      const nextMessages = previous.slice();
+      nextMessages[targetIndex] = {
+        ...targetMessage,
+        content: nextContent,
+      };
+      return nextMessages;
+    });
+  }, []);
+
   const sendMessage = async () => {
     const promptText = input.trim();
     if (sending || (!promptText && !image)) {
@@ -958,6 +1343,7 @@ export default function ChatPage() {
       const optimisticUserId = makeLocalMessageId('local-user');
       const optimisticAssistantId = makeLocalMessageId('local-assistant');
       optimisticMessageIds.push(optimisticUserId, optimisticAssistantId);
+      setStreamingAssistantId(optimisticAssistantId);
 
       const optimisticAttachments: MessageAttachment[] = fileId
         ? [
@@ -1020,55 +1406,77 @@ export default function ChatPage() {
 
         let parserBuffer = '';
         let assistantText = '';
+        let renderedAssistantText = '';
+        let streamFlushFrameId: number | null = null;
+        let lastStreamFlushAt = 0;
         const decoder = new TextDecoder();
+        const streamFlushIntervalMs = 64;
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            break;
+        const flushAssistantContent = (force: boolean) => {
+          if (!force && assistantText === renderedAssistantText) {
+            return;
+          }
+          renderedAssistantText = assistantText;
+          lastStreamFlushAt = Date.now();
+          updateMessageContent(optimisticAssistantId, renderedAssistantText);
+        };
+
+        const scheduleAssistantFlush = () => {
+          if (streamFlushFrameId !== null) {
+            return;
           }
 
-          const chunk = decoder.decode(value, { stream: true });
-          parserBuffer += chunk;
+          const flushFrame = () => {
+            if (Date.now() - lastStreamFlushAt < streamFlushIntervalMs) {
+              streamFlushFrameId = window.requestAnimationFrame(flushFrame);
+              return;
+            }
+            streamFlushFrameId = null;
+            flushAssistantContent(false);
+          };
 
-          const parsed = parseResponsesSseBuffer(parserBuffer);
-          parserBuffer = parsed.remaining;
-          if (!parsed.assistantDelta) {
-            continue;
+          streamFlushFrameId = window.requestAnimationFrame(flushFrame);
+        };
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              break;
+            }
+
+            const chunk = decoder.decode(value, { stream: true });
+            parserBuffer += chunk;
+
+            const parsed = parseResponsesSseBuffer(parserBuffer);
+            parserBuffer = parsed.remaining;
+            if (!parsed.assistantDelta) {
+              continue;
+            }
+
+            assistantText += parsed.assistantDelta;
+            scheduleAssistantFlush();
           }
 
-          assistantText += parsed.assistantDelta;
-          setMessages((previous) =>
-            previous.map((message) =>
-              message.id === optimisticAssistantId ? { ...message, content: assistantText } : message,
-            ),
-          );
-        }
+          const tail = decoder.decode();
+          if (tail) {
+            parserBuffer += tail;
+            const parsedTail = parseResponsesSseBuffer(parserBuffer);
+            assistantText += parsedTail.assistantDelta;
+          }
 
-        const tail = decoder.decode();
-        if (tail) {
-          parserBuffer += tail;
-          const parsedTail = parseResponsesSseBuffer(parserBuffer);
-          assistantText += parsedTail.assistantDelta;
+          flushAssistantContent(true);
+          updateMessageContent(optimisticAssistantId, assistantText || '[stream ended without text]');
+        } finally {
+          if (streamFlushFrameId !== null) {
+            window.cancelAnimationFrame(streamFlushFrameId);
+            streamFlushFrameId = null;
+          }
         }
-
-        setMessages((previous) =>
-          previous.map((message) =>
-            message.id === optimisticAssistantId
-              ? { ...message, content: assistantText || '[stream ended without text]' }
-              : message,
-          ),
-        );
       } else {
         const payload = (await res.json()) as unknown;
         const assistantText = extractAssistantText(payload);
-        setMessages((previous) =>
-          previous.map((message) =>
-            message.id === optimisticAssistantId
-              ? { ...message, content: assistantText || '[empty response]' }
-              : message,
-          ),
-        );
+        updateMessageContent(optimisticAssistantId, assistantText || '[empty response]');
       }
 
       await refreshThreads(latestThreadId);
@@ -1099,6 +1507,7 @@ export default function ChatPage() {
     } finally {
       setSending(false);
       setActiveAbortController(null);
+      setStreamingAssistantId(null);
     }
   };
 
@@ -1289,69 +1698,19 @@ export default function ChatPage() {
               ) : null}
 
               {messages.map((message) => {
-                const assistantMessage = message.role === 'assistant';
-                const showGenerating = assistantMessage && sending && !message.content.trim();
                 const isEntering = animatingMessageIds.includes(message.id);
-                const emojiOnly = !showGenerating && isEmojiOnlyMessage(message.content);
+                const isStreaming = sending && message.id === streamingAssistantId;
 
                 return (
-                  <article
+                  <ChatMessageRow
                     key={message.id}
-                    className={`chat-message-row ${assistantMessage ? 'assistant' : 'user'}${isEntering ? ' chat-message-enter' : ''}`}
-                  >
-                    <div className="chat-message-inner">
-                      {message.attachments.length > 0 ? (
-                        <div className="chat-message-attachments-row">
-                          {message.attachments.map((attachment) => {
-                            const imageAttachment = attachment.mime_type.startsWith('image/');
-
-                            return (
-                              <a
-                                key={`${message.id}-${attachment.file_id}`}
-                                href={attachment.content_url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="chat-message-attachment"
-                                title={attachment.filename}
-                              >
-                                {imageAttachment ? (
-                                  <img
-                                    src={attachment.content_url}
-                                    alt={attachment.filename}
-                                    loading="lazy"
-                                  />
-                                ) : (
-                                  <div className="chat-message-attachment-fallback">FILE</div>
-                                )}
-                                <span className="chat-message-attachment-name">{attachment.filename}</span>
-                              </a>
-                            );
-                          })}
-                        </div>
-                      ) : null}
-
-                      <div className={`chat-message-content${emojiOnly ? ' emoji-only' : ''}`}>
-                        {showGenerating ? (
-                          <div className="chat-inline-streaming">
-                            <span className="chat-streaming-dot" />
-                            Generating...
-                          </div>
-                        ) : (
-                          <MessageMarkdown content={message.content} />
-                        )}
-                      </div>
-
-                      {assistantMessage && message.content.trim() ? (
-                        <button
-                          type="button"
-                          className="chat-copy-button"
-                          onClick={() => void copyAssistantMessage(message)}
-                        >
-                          Copy
-                        </button>
-                      ) : null}
-                    </div>
-                  </article>
+                    message={message}
+                    isEntering={isEntering}
+                    isStreaming={isStreaming}
+                    onCopyAssistantMessage={(targetMessage) => {
+                      void copyAssistantMessage(targetMessage);
+                    }}
+                  />
                 );
               })}
 
