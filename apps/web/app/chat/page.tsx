@@ -1762,28 +1762,14 @@ export default function ChatPage() {
         </div>
       </form>
 
-      <div className="chat-composer-status">
-        {sending ? (
-          <div className="chat-composer-status-left">
-            <span className="chat-streaming-indicator" role="status" aria-live="polite">
-              <span className="chat-streaming-dot" />
-              Generating response
-            </span>
-          </div>
-        ) : null}
-
-        <button
-          className="ghost chat-clear-button"
-          type="button"
-          disabled={sending}
-          onClick={() => {
-            setInput('');
-            clearImage();
-          }}
-        >
-          Clear
-        </button>
-      </div>
+      {sending ? (
+        <div className="chat-composer-status">
+          <span className="chat-streaming-indicator" role="status" aria-live="polite">
+            <span className="chat-streaming-dot" />
+            Generating response
+          </span>
+        </div>
+      ) : null}
     </div>
   );
 
