@@ -840,11 +840,15 @@ code {
   width: 100%;
   max-width: var(--content-max);
   margin: 0 auto;
-  padding: 0.2rem 1.2rem;
+  padding: 0.35rem 1.2rem;
   display: flex;
   justify-content: flex-start;
   content-visibility: auto;
   contain-intrinsic-size: 200px;
+}
+
+.chat-message-row + .chat-message-row {
+  border-top: 1px solid #eceff4;
 }
 
 .chat-message-row.assistant {
@@ -859,11 +863,11 @@ code {
   display: inline-block;
   width: auto;
   max-width: min(100%, 680px);
-  border-radius: 16px;
-  border: 1px solid #e4e6eb;
-  background: #ffffff;
-  box-shadow: 0 8px 24px rgba(16, 24, 40, 0.05);
-  padding: 0.9rem 1rem;
+  border-radius: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0.55rem 0;
   vertical-align: top;
 }
 
@@ -873,15 +877,10 @@ code {
 
 .chat-message-row.assistant .chat-message-inner {
   margin-right: auto;
-  border-bottom-left-radius: 6px;
 }
 
 .chat-message-row.user .chat-message-inner {
   margin-left: auto;
-  border-bottom-right-radius: 6px;
-  border-color: #111111;
-  background: #111111;
-  color: #f8fafc;
 }
 
 .chat-message-content {
@@ -939,29 +938,12 @@ code {
   color: #115e59;
 }
 
-.chat-message-row.user .chat-message-content {
-  color: #f8fafc;
-}
-
-.chat-message-row.user .chat-markdown-link {
-  color: #bfdbfe;
-}
-
-.chat-message-row.user .chat-markdown-link:hover {
-  color: #dbeafe;
-}
-
 .chat-inline-code {
   background: #f2f3f7;
   border: 1px solid #e1e4ea;
   border-radius: 6px;
   padding: 0.07rem 0.34rem;
   font-size: 0.9em;
-}
-
-.chat-message-row.user .chat-inline-code {
-  background: rgba(255, 255, 255, 0.14);
-  border-color: rgba(255, 255, 255, 0.26);
 }
 
 .chat-code-block {
@@ -976,11 +958,6 @@ code {
 .chat-code-block code {
   font-size: 0.84rem;
   line-height: 1.5;
-}
-
-.chat-message-row.user .chat-code-block {
-  border-color: rgba(255, 255, 255, 0.26);
-  background: rgba(255, 255, 255, 0.08);
 }
 
 .chat-copy-button {
@@ -1040,16 +1017,6 @@ code {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.chat-message-row.user .chat-message-attachment {
-  border-color: rgba(255, 255, 255, 0.28);
-  background: rgba(255, 255, 255, 0.1);
-}
-
-.chat-message-row.user .chat-message-attachment-name {
-  border-top-color: rgba(255, 255, 255, 0.18);
-  color: #f8fafc;
 }
 
 .chat-jump-latest {
@@ -1518,7 +1485,7 @@ code {
 
   .chat-message-inner {
     max-width: 100%;
-    padding: 0.82rem 0.9rem;
+    padding: 0.5rem 0;
   }
 
   .chat-image-preview-row,
