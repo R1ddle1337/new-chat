@@ -45,7 +45,7 @@ services:
       PORT: 3001
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/newchat
       REDIS_URL: redis://redis:6379
-      APP_ORIGIN: http://localhost:3000
+      APP_ORIGIN: https://newchat.chhsrmt.xyz
       SESSION_COOKIE_NAME: nc_session
       SESSION_TTL_SECONDS: 604800
       AUTH_RATE_LIMIT_PER_MIN: 30

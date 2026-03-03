@@ -9,7 +9,7 @@ services:
     ports:
       - '127.0.0.1:3101:3001'
     environment:
-      APP_ORIGIN: https://nchat.lyxnb.de5.net
+      APP_ORIGIN: https://newchat.chhsrmt.xyz
       SECURE_COOKIES: 'true'
       KEY_ENCRYPTION_KEY: ${KEY_ENCRYPTION_KEY}
       # stronger prod defaults (override if needed)
