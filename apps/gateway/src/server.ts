@@ -131,6 +131,7 @@ const app = Fastify({
 });
 
 const stateChangingMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const MAX_RAW_CONTENT_JSON_BYTES = 200 * 1024;
 
 function normalizeEmail(value: string): string {
   return value.trim().toLowerCase();
@@ -198,6 +199,75 @@ function maskApiKey(value: string): string {
     return '********';
   }
   return `${value.slice(0, 4)}...${value.slice(-4)}`;
+}
+
+function jsonBigintSafeReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    return null;
+  }
+
+  return value;
+}
+
+function trySerializeJson(value: unknown): { json: string | null; error?: string } {
+  try {
+    const serialized = JSON.stringify(value, jsonBigintSafeReplacer);
+    if (typeof serialized !== 'string') {
+      return { json: null, error: 'JSON.stringify returned undefined' };
+    }
+    return { json: serialized };
+  } catch (error) {
+    return {
+      json: null,
+      error: error instanceof Error ? error.message : 'Unknown serialization error',
+    };
+  }
+}
+
+function serializeRawContentForStorage(rawContent: unknown): string | null {
+  if (typeof rawContent === 'undefined') {
+    return null;
+  }
+
+  let normalized: unknown = rawContent;
+  if (typeof rawContent === 'string') {
+    try {
+      normalized = JSON.parse(rawContent);
+    } catch {
+      normalized = { type: 'string', value: rawContent };
+    }
+  }
+
+  const serialized = trySerializeJson(normalized);
+  if (!serialized.json) {
+    const fallback = trySerializeJson({
+      type: 'unserializable',
+      note: serialized.error ?? 'Unable to stringify raw_content',
+    });
+    return (
+      fallback.json ??
+      '{"type":"unserializable","note":"Unable to stringify raw_content"}'
+    );
+  }
+
+  const sizeBytes = Buffer.byteLength(serialized.json, 'utf8');
+  if (sizeBytes > MAX_RAW_CONTENT_JSON_BYTES) {
+    const truncated = trySerializeJson({
+      type: 'truncated',
+      note: `raw_content exceeded ${MAX_RAW_CONTENT_JSON_BYTES} byte limit`,
+      original_size_bytes: sizeBytes,
+    });
+    return (
+      truncated.json ??
+      '{"type":"truncated","note":"raw_content exceeded storage limit"}'
+    );
+  }
+
+  return serialized.json;
 }
 
 function getClientIp(request: FastifyRequest): string {
@@ -996,11 +1066,36 @@ async function persistMessage(params: {
     return;
   }
 
-  await pool.query(
-    `INSERT INTO messages (thread_id, user_id, role, content, raw_content)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [params.threadId, params.userId, params.role, params.content, params.rawContent ?? null],
-  );
+  const rawContentJson = serializeRawContentForStorage(params.rawContent);
+  const insertSql = `INSERT INTO messages (thread_id, user_id, role, content, raw_content)
+     VALUES ($1, $2, $3, $4, $5::jsonb)`;
+
+  try {
+    await pool.query(insertSql, [
+      params.threadId,
+      params.userId,
+      params.role,
+      params.content,
+      rawContentJson,
+    ]);
+  } catch (error) {
+    if (rawContentJson === null) {
+      throw error;
+    }
+
+    app.log.warn(
+      { err: error, threadId: params.threadId, userId: params.userId, role: params.role },
+      'Failed to persist raw_content. Retrying message insert with null raw_content.',
+    );
+
+    await pool.query(insertSql, [
+      params.threadId,
+      params.userId,
+      params.role,
+      params.content,
+      null,
+    ]);
+  }
 
   await pool.query('UPDATE threads SET updated_at = now() WHERE id = $1 AND user_id = $2', [
     params.threadId,
