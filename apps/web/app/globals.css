@@ -721,6 +721,45 @@ code {
   gap: 0.4rem;
 }
 
+.admin-throttle-inputs {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0.4rem;
+}
+
+.admin-abuse-table {
+  min-width: 1380px;
+}
+
+.admin-events-panel {
+  display: grid;
+  gap: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.65rem;
+  background: #fbfbfd;
+}
+
+.admin-event-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.55rem;
+  display: grid;
+  gap: 0.3rem;
+  background: #ffffff;
+}
+
+.admin-event-metadata {
+  margin: 0;
+  padding: 0.45rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #f8f9fb;
+  max-height: 180px;
+  overflow: auto;
+  font-size: 0.72rem;
+}
+
 .chat-page {
   position: relative;
   overflow: hidden;

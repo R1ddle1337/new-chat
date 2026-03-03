@@ -15,6 +15,7 @@ type DbUser = {
   is_admin: boolean;
   default_model: string | null;
   status: string;
+  ban_expires_at: string | null;
 };
 
 type ProviderRow = {
@@ -70,11 +71,66 @@ type UserLimitRow = {
   tpm_limit: number | null;
 };
 
+type BaseUserRateLimits = {
+  rpm_override: number | null;
+  tpm_override: number | null;
+  rpm_effective: number;
+  tpm_effective: number;
+};
+
 type EffectiveUserRateLimits = {
   rpm_override: number | null;
   tpm_override: number | null;
   rpm_effective: number;
   tpm_effective: number;
+  throttle_source: 'none' | 'auto' | 'admin';
+  throttle_expires_at: string | null;
+  throttle_rpm_limit: number | null;
+  throttle_tpm_limit: number | null;
+};
+
+type AbuseUserStateRow = {
+  user_id: string;
+  anomaly_score: number;
+  last_rule_hits: unknown;
+  throttle_expires_at: string | null;
+  throttle_rpm_limit: number | null;
+  throttle_tpm_limit: number | null;
+  throttle_reason: string | null;
+  admin_throttle_expires_at: string | null;
+  admin_throttle_rpm_limit: number | null;
+  admin_throttle_tpm_limit: number | null;
+  last_action: string | null;
+  last_action_at: string | null;
+  last_action_metadata: unknown;
+};
+
+type AbuseRuleHit = {
+  rule: string;
+  score: number;
+  value: number;
+  threshold: number;
+  window_seconds: number;
+  detail?: Record<string, unknown>;
+};
+
+type ActiveThrottleState = {
+  source: 'none' | 'auto' | 'admin';
+  expires_at: string | null;
+  rpm_limit: number | null;
+  tpm_limit: number | null;
+};
+
+type AbuseEvaluationResult = {
+  score: number;
+  ruleHits: AbuseRuleHit[];
+  action: 'none' | 'throttle' | 'ban';
+  ban_expires_at: string | null;
+};
+
+type StreamLease = {
+  key: string;
+  token: string;
 };
 
 type UpstreamModelItem = {
@@ -114,6 +170,12 @@ const config = {
   keyEncryptionKey: process.env.KEY_ENCRYPTION_KEY ?? '',
   secureCookies: process.env.SECURE_COOKIES === 'true',
   adminEmail: (process.env.ADMIN_EMAIL ?? '').trim().toLowerCase(),
+  abuseThrottleDurationMinutes: Number(process.env.ABUSE_THROTTLE_DURATION_MINUTES ?? 20),
+  abuseBanDurationMinutes: Number(process.env.ABUSE_TEMP_BAN_DURATION_MINUTES ?? 60),
+  abuseThrottleScoreThreshold: Number(process.env.ABUSE_THROTTLE_SCORE_THRESHOLD ?? 55),
+  abuseBanScoreThreshold: Number(process.env.ABUSE_BAN_SCORE_THRESHOLD ?? 95),
+  abuseStreamConcurrencyLimit: Number(process.env.ABUSE_STREAM_CONCURRENCY_LIMIT ?? 2),
+  telegramAlertWebhookUrl: (process.env.TELEGRAM_ALERT_WEBHOOK_URL ?? '').trim(),
 };
 
 if (!config.keyEncryptionKey) {
@@ -169,6 +231,26 @@ const TPM_COUNTER_TTL_SECONDS = RATE_LIMIT_WINDOW_SECONDS * 3;
 const RATE_LIMIT_SETTINGS_CACHE_TTL_MS = 5000;
 const THREAD_CONTEXT_MAX_MESSAGES = 30;
 const THREAD_CONTEXT_MAX_TOKENS = 8000;
+const ABUSE_COUNTER_WINDOW_SECONDS = 60;
+const ABUSE_COUNTER_TTL_SECONDS = 60 * 60 * 24 * 2;
+const ABUSE_MULTI_ACCOUNT_WINDOW_SECONDS = 15 * 60;
+const ABUSE_IP_UA_CHURN_WINDOW_SECONDS = 15 * 60;
+const ABUSE_ERROR_WINDOW_SECONDS = 5 * 60;
+const ABUSE_LOGIN_FAIL_WINDOW_SECONDS = 10 * 60;
+const ABUSE_RPM_WINDOW_SECONDS = 60;
+const ABUSE_TPM_WINDOW_SECONDS = 60;
+const ABUSE_STREAM_REJECT_WINDOW_SECONDS = 10 * 60;
+const STREAM_SESSION_TTL_SECONDS = 2 * 60 * 60;
+const STREAM_LEASE_ACQUIRE_LUA = `
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[3])
+local active = redis.call('ZCARD', KEYS[1])
+if active >= tonumber(ARGV[1]) then
+  return {0, active}
+end
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+return {1, active + 1}
+`;
 
 let rateLimitSettingsCache:
   | {
@@ -315,6 +397,24 @@ function getClientIp(request: FastifyRequest): string {
   return request.ip;
 }
 
+function getClientUserAgent(request: FastifyRequest): string | null {
+  const raw = request.headers['user-agent'];
+  if (typeof raw !== 'string') {
+    return null;
+  }
+
+  const value = raw.trim();
+  if (!value) {
+    return null;
+  }
+
+  return value.length <= 256 ? value : value.slice(0, 256);
+}
+
+function shortHash(value: string): string {
+  return crypto.createHash('sha1').update(value).digest('hex').slice(0, 16);
+}
+
 function sanitizeAuditMetadata(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.slice(0, 20).map((item) => sanitizeAuditMetadata(item));
@@ -370,6 +470,42 @@ async function writeAuditEvent(params: {
   );
 }
 
+async function sendAbuseAlert(payload: Record<string, unknown>): Promise<void> {
+  const sanitized = (sanitizeAuditMetadata(payload) ?? {}) as Record<string, unknown>;
+
+  app.log.warn({
+    event: 'abuse_alert',
+    prefix: '[ABUSE_ALERT]',
+    payload: sanitized,
+  });
+
+  if (!config.telegramAlertWebhookUrl) {
+    return;
+  }
+
+  try {
+    const response = await fetch(config.telegramAlertWebhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text: '[ABUSE_ALERT]',
+        payload: sanitized,
+      }),
+    });
+
+    if (!response.ok) {
+      app.log.warn(
+        { status: response.status },
+        'Failed to send abuse alert webhook',
+      );
+    }
+  } catch (error) {
+    app.log.warn({ err: error }, 'Failed to send abuse alert webhook');
+  }
+}
+
 async function checkRateLimit(key: string, max: number, windowSeconds: number): Promise<boolean> {
   if (max <= 0) {
     return false;
@@ -420,7 +556,7 @@ function resolveEffectiveRateLimit(overrideLimit: number | null, fallbackLimit: 
   return fallbackLimit;
 }
 
-async function loadEffectiveRateLimitsForUser(userId: string): Promise<EffectiveUserRateLimits> {
+async function loadBaseRateLimitsForUser(userId: string): Promise<BaseUserRateLimits> {
   const [settings, overrideResult] = await Promise.all([
     loadRateLimitSettings(),
     pool.query<UserLimitRow>(
@@ -443,13 +579,772 @@ async function loadEffectiveRateLimitsForUser(userId: string): Promise<Effective
   };
 }
 
+function parseTimestampMs(value: string | null): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return parsed;
+}
+
+function isFutureTimestamp(value: string | null, nowMs = Date.now()): boolean {
+  const parsed = parseTimestampMs(value);
+  return parsed !== null && parsed > nowMs;
+}
+
+function hasActiveBan(user: DbUser, nowMs = Date.now()): boolean {
+  if (user.status !== 'banned') {
+    return false;
+  }
+
+  if (!user.ban_expires_at) {
+    return true;
+  }
+
+  return isFutureTimestamp(user.ban_expires_at, nowMs);
+}
+
+async function maybeLiftExpiredBan(user: DbUser): Promise<DbUser> {
+  if (user.status !== 'banned' || !user.ban_expires_at) {
+    return user;
+  }
+
+  const expiresAtMs = parseTimestampMs(user.ban_expires_at);
+  if (expiresAtMs === null || expiresAtMs > Date.now()) {
+    return user;
+  }
+
+  const lifted = await pool.query<DbUser>(
+    `UPDATE users
+     SET status = 'active',
+         banned_at = NULL,
+         ban_expires_at = NULL,
+         updated_at = now()
+     WHERE id = $1
+     RETURNING id, email, is_admin, default_model, status, ban_expires_at`,
+    [user.id],
+  );
+
+  if (!lifted.rowCount) {
+    return {
+      ...user,
+      status: 'active',
+      ban_expires_at: null,
+    };
+  }
+
+  return lifted.rows[0]!;
+}
+
+async function loadAbuseUserState(userId: string): Promise<AbuseUserStateRow | null> {
+  const result = await pool.query<AbuseUserStateRow>(
+    `SELECT user_id,
+            anomaly_score,
+            last_rule_hits,
+            throttle_expires_at,
+            throttle_rpm_limit,
+            throttle_tpm_limit,
+            throttle_reason,
+            admin_throttle_expires_at,
+            admin_throttle_rpm_limit,
+            admin_throttle_tpm_limit,
+            last_action,
+            last_action_at,
+            last_action_metadata
+     FROM abuse_user_state
+     WHERE user_id = $1`,
+    [userId],
+  );
+  return result.rowCount ? result.rows[0]! : null;
+}
+
+function getActiveThrottleFromState(
+  state: AbuseUserStateRow | null,
+  nowMs = Date.now(),
+): ActiveThrottleState {
+  if (!state) {
+    return {
+      source: 'none',
+      expires_at: null,
+      rpm_limit: null,
+      tpm_limit: null,
+    };
+  }
+
+  const hasAdminThrottle =
+    isFutureTimestamp(state.admin_throttle_expires_at, nowMs) &&
+    ((state.admin_throttle_rpm_limit ?? null) !== null ||
+      (state.admin_throttle_tpm_limit ?? null) !== null);
+  if (hasAdminThrottle) {
+    return {
+      source: 'admin',
+      expires_at: state.admin_throttle_expires_at,
+      rpm_limit: state.admin_throttle_rpm_limit,
+      tpm_limit: state.admin_throttle_tpm_limit,
+    };
+  }
+
+  const hasAutoThrottle =
+    isFutureTimestamp(state.throttle_expires_at, nowMs) &&
+    ((state.throttle_rpm_limit ?? null) !== null || (state.throttle_tpm_limit ?? null) !== null);
+  if (hasAutoThrottle) {
+    return {
+      source: 'auto',
+      expires_at: state.throttle_expires_at,
+      rpm_limit: state.throttle_rpm_limit,
+      tpm_limit: state.throttle_tpm_limit,
+    };
+  }
+
+  return {
+    source: 'none',
+    expires_at: null,
+    rpm_limit: null,
+    tpm_limit: null,
+  };
+}
+
+async function loadEffectiveRateLimitsForUser(userId: string): Promise<EffectiveUserRateLimits> {
+  const [baseLimits, abuseState] = await Promise.all([
+    loadBaseRateLimitsForUser(userId),
+    loadAbuseUserState(userId),
+  ]);
+  const throttle = getActiveThrottleFromState(abuseState);
+
+  let rpmEffective = baseLimits.rpm_effective;
+  let tpmEffective = baseLimits.tpm_effective;
+
+  if (typeof throttle.rpm_limit === 'number' && throttle.rpm_limit > 0) {
+    rpmEffective = Math.min(rpmEffective, throttle.rpm_limit);
+  }
+
+  if (typeof throttle.tpm_limit === 'number' && throttle.tpm_limit > 0) {
+    tpmEffective = Math.min(tpmEffective, throttle.tpm_limit);
+  }
+
+  return {
+    rpm_override: baseLimits.rpm_override,
+    tpm_override: baseLimits.tpm_override,
+    rpm_effective: rpmEffective,
+    tpm_effective: tpmEffective,
+    throttle_source: throttle.source,
+    throttle_expires_at: throttle.expires_at,
+    throttle_rpm_limit: throttle.rpm_limit,
+    throttle_tpm_limit: throttle.tpm_limit,
+  };
+}
+
+function toSafeInteger(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.floor(value);
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return 0;
+}
+
+function getAbuseCounterWindowStartIso(nowMs = Date.now()): string {
+  const roundedMs = Math.floor(nowMs / (ABUSE_COUNTER_WINDOW_SECONDS * 1000))
+    * ABUSE_COUNTER_WINDOW_SECONDS
+    * 1000;
+  return new Date(roundedMs).toISOString();
+}
+
+async function maybeCleanupAbuseCounters(): Promise<void> {
+  const acquired = await redis.set(
+    'abuse:counters:cleanup:v1',
+    '1',
+    'EX',
+    60 * 60,
+    'NX',
+  );
+  if (!acquired) {
+    return;
+  }
+
+  await pool.query(
+    `DELETE FROM abuse_event_counters
+     WHERE window_start < now() - ($1::integer * interval '1 second')`,
+    [ABUSE_COUNTER_TTL_SECONDS],
+  );
+}
+
+async function incrementAbuseCounter(
+  userId: string,
+  dimension: string,
+  value = 1,
+  nowMs = Date.now(),
+): Promise<void> {
+  const normalized = toSafeInteger(value);
+  if (normalized <= 0 || !dimension.trim()) {
+    return;
+  }
+
+  const windowStartIso = getAbuseCounterWindowStartIso(nowMs);
+  await pool.query(
+    `INSERT INTO abuse_event_counters (user_id, dimension, window_start, value, updated_at)
+     VALUES ($1, $2, $3, $4, now())
+     ON CONFLICT (user_id, dimension, window_start) DO UPDATE
+       SET value = abuse_event_counters.value + EXCLUDED.value,
+           updated_at = now()`,
+    [userId, dimension, windowStartIso, normalized],
+  );
+}
+
+async function incrementAbuseCounters(
+  userId: string,
+  entries: Array<{ dimension: string; value: number }>,
+): Promise<void> {
+  if (entries.length === 0) {
+    return;
+  }
+
+  const nowMs = Date.now();
+  for (const entry of entries) {
+    await incrementAbuseCounter(userId, entry.dimension, entry.value, nowMs);
+  }
+
+  await maybeCleanupAbuseCounters();
+}
+
+async function loadAbuseCounterTotals(
+  userId: string,
+  dimensions: string[],
+  windowSeconds: number,
+): Promise<Record<string, number>> {
+  const cutoffIso = new Date(Date.now() - windowSeconds * 1000).toISOString();
+  const result = await pool.query<{ dimension: string; total: string }>(
+    `SELECT dimension, COALESCE(SUM(value), 0)::bigint::text AS total
+     FROM abuse_event_counters
+     WHERE user_id = $1
+       AND dimension = ANY($2::text[])
+       AND window_start >= $3::timestamptz
+     GROUP BY dimension`,
+    [userId, dimensions, cutoffIso],
+  );
+
+  const totals: Record<string, number> = {};
+  for (const dimension of dimensions) {
+    totals[dimension] = 0;
+  }
+
+  for (const row of result.rows) {
+    totals[row.dimension] = toSafeInteger(row.total);
+  }
+
+  return totals;
+}
+
+async function countDistinctAbuseDimensions(
+  userId: string,
+  dimensionPrefix: string,
+  windowSeconds: number,
+): Promise<number> {
+  const cutoffIso = new Date(Date.now() - windowSeconds * 1000).toISOString();
+  const result = await pool.query<{ count: string }>(
+    `SELECT COUNT(DISTINCT dimension)::bigint::text AS count
+     FROM abuse_event_counters
+     WHERE user_id = $1
+       AND dimension LIKE $2
+       AND window_start >= $3::timestamptz`,
+    [userId, `${dimensionPrefix}%`, cutoffIso],
+  );
+
+  return toSafeInteger(result.rows[0]?.count);
+}
+
+async function countRecentUsersForIp(ip: string | null, windowSeconds: number): Promise<number> {
+  if (!ip) {
+    return 0;
+  }
+
+  const cutoffIso = new Date(Date.now() - windowSeconds * 1000).toISOString();
+  const result = await pool.query<{ count: string }>(
+    `SELECT COUNT(*)::bigint::text AS count
+     FROM users
+     WHERE last_seen_ip = $1
+       AND last_seen_at IS NOT NULL
+       AND last_seen_at >= $2::timestamptz`,
+    [ip, cutoffIso],
+  );
+
+  return toSafeInteger(result.rows[0]?.count);
+}
+
+async function touchUserLastSeen(userId: string, ip: string, userAgent: string | null): Promise<void> {
+  await pool.query(
+    `UPDATE users
+     SET last_seen_ip = $2,
+         last_seen_ua = $3,
+         last_seen_at = now(),
+         updated_at = now()
+     WHERE id = $1`,
+    [userId, ip, userAgent],
+  );
+}
+
+function buildAutoThrottleLimits(baseLimits: BaseUserRateLimits): {
+  rpm_limit: number;
+  tpm_limit: number;
+} {
+  const rpm = Math.max(5, Math.floor(baseLimits.rpm_effective * 0.35));
+  const tpm = Math.max(1000, Math.floor(baseLimits.tpm_effective * 0.35));
+  return {
+    rpm_limit: Math.min(baseLimits.rpm_effective, rpm),
+    tpm_limit: Math.min(baseLimits.tpm_effective, tpm),
+  };
+}
+
+async function ensureAbuseStateRow(
+  userId: string,
+  score: number,
+  ruleHits: AbuseRuleHit[],
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO abuse_user_state (user_id, anomaly_score, last_rule_hits, updated_at)
+     VALUES ($1, $2, $3::jsonb, now())
+     ON CONFLICT (user_id) DO UPDATE
+       SET anomaly_score = EXCLUDED.anomaly_score,
+           last_rule_hits = EXCLUDED.last_rule_hits,
+           updated_at = now()`,
+    [userId, score, JSON.stringify(ruleHits)],
+  );
+}
+
+async function applyAutoThrottle(params: {
+  userId: string;
+  score: number;
+  ruleHits: AbuseRuleHit[];
+  rpmLimit: number;
+  tpmLimit: number;
+}): Promise<string> {
+  const result = await pool.query<{ throttle_expires_at: string }>(
+    `INSERT INTO abuse_user_state (
+       user_id,
+       anomaly_score,
+       last_rule_hits,
+       throttle_expires_at,
+       throttle_rpm_limit,
+       throttle_tpm_limit,
+       throttle_reason,
+       last_action,
+       last_action_at,
+       last_action_metadata,
+       updated_at
+     )
+     VALUES (
+       $1,
+       $2,
+       $3::jsonb,
+       now() + ($4::integer * interval '1 minute'),
+       $5,
+       $6,
+       'auto_anomaly_score',
+       'abuse.action.throttle_auto',
+       now(),
+       $7::jsonb,
+       now()
+     )
+     ON CONFLICT (user_id) DO UPDATE
+       SET anomaly_score = EXCLUDED.anomaly_score,
+           last_rule_hits = EXCLUDED.last_rule_hits,
+           throttle_expires_at = GREATEST(
+             COALESCE(abuse_user_state.throttle_expires_at, to_timestamp(0)),
+             now() + ($4::integer * interval '1 minute')
+           ),
+           throttle_rpm_limit = EXCLUDED.throttle_rpm_limit,
+           throttle_tpm_limit = EXCLUDED.throttle_tpm_limit,
+           throttle_reason = EXCLUDED.throttle_reason,
+           last_action = EXCLUDED.last_action,
+           last_action_at = now(),
+           last_action_metadata = EXCLUDED.last_action_metadata,
+           updated_at = now()
+     RETURNING throttle_expires_at`,
+    [
+      params.userId,
+      params.score,
+      JSON.stringify(params.ruleHits),
+      config.abuseThrottleDurationMinutes,
+      params.rpmLimit,
+      params.tpmLimit,
+      JSON.stringify({
+        score: params.score,
+        rpm_limit: params.rpmLimit,
+        tpm_limit: params.tpmLimit,
+        duration_minutes: config.abuseThrottleDurationMinutes,
+      }),
+    ],
+  );
+
+  return result.rows[0]?.throttle_expires_at ?? new Date().toISOString();
+}
+
+async function applyAutoTempBan(params: {
+  userId: string;
+  score: number;
+  ruleHits: AbuseRuleHit[];
+}): Promise<string> {
+  const banResult = await pool.query<{ ban_expires_at: string }>(
+    `UPDATE users
+     SET status = 'banned',
+         banned_at = COALESCE(banned_at, now()),
+         ban_expires_at = now() + ($2::integer * interval '1 minute'),
+         updated_at = now()
+     WHERE id = $1
+     RETURNING ban_expires_at`,
+    [params.userId, config.abuseBanDurationMinutes],
+  );
+
+  const banExpiresAt = banResult.rows[0]?.ban_expires_at ?? new Date().toISOString();
+
+  await pool.query(
+    `INSERT INTO abuse_user_state (
+       user_id,
+       anomaly_score,
+       last_rule_hits,
+       last_action,
+       last_action_at,
+       last_action_metadata,
+       updated_at
+     )
+     VALUES (
+       $1,
+       $2,
+       $3::jsonb,
+       'abuse.action.temp_ban_auto',
+       now(),
+       $4::jsonb,
+       now()
+     )
+     ON CONFLICT (user_id) DO UPDATE
+       SET anomaly_score = EXCLUDED.anomaly_score,
+           last_rule_hits = EXCLUDED.last_rule_hits,
+           last_action = EXCLUDED.last_action,
+           last_action_at = now(),
+           last_action_metadata = EXCLUDED.last_action_metadata,
+           updated_at = now()`,
+    [
+      params.userId,
+      params.score,
+      JSON.stringify(params.ruleHits),
+      JSON.stringify({
+        score: params.score,
+        ban_expires_at: banExpiresAt,
+        duration_minutes: config.abuseBanDurationMinutes,
+      }),
+    ],
+  );
+
+  return banExpiresAt;
+}
+
+function pushRuleHit(
+  target: AbuseRuleHit[],
+  params: {
+    rule: string;
+    score: number;
+    value: number;
+    threshold: number;
+    windowSeconds: number;
+    detail?: Record<string, unknown>;
+  },
+): number {
+  target.push({
+    rule: params.rule,
+    score: params.score,
+    value: params.value,
+    threshold: params.threshold,
+    window_seconds: params.windowSeconds,
+    detail: params.detail,
+  });
+  return params.score;
+}
+
+async function evaluateUserAbuseAndMaybeAct(params: {
+  request: FastifyRequest;
+  user: DbUser;
+  currentIp: string | null;
+  currentUa: string | null;
+}): Promise<AbuseEvaluationResult> {
+  const userId = params.user.id;
+  const [baseLimits, abuseState, rpmTotals, tpmTotals, errorTotals, loginTotals, streamTotals] =
+    await Promise.all([
+      loadBaseRateLimitsForUser(userId),
+      loadAbuseUserState(userId),
+      loadAbuseCounterTotals(userId, ['request_total'], ABUSE_RPM_WINDOW_SECONDS),
+      loadAbuseCounterTotals(userId, ['tpm_tokens'], ABUSE_TPM_WINDOW_SECONDS),
+      loadAbuseCounterTotals(
+        userId,
+        ['request_total', 'request_error', 'request_429'],
+        ABUSE_ERROR_WINDOW_SECONDS,
+      ),
+      loadAbuseCounterTotals(userId, ['auth_login_fail'], ABUSE_LOGIN_FAIL_WINDOW_SECONDS),
+      loadAbuseCounterTotals(
+        userId,
+        ['stream_concurrency_rejected'],
+        ABUSE_STREAM_REJECT_WINDOW_SECONDS,
+      ),
+    ]);
+
+  const [distinctIpCount, distinctUaCount, sharedIpUsers] = await Promise.all([
+    countDistinctAbuseDimensions(userId, 'seen_ip:', ABUSE_IP_UA_CHURN_WINDOW_SECONDS),
+    countDistinctAbuseDimensions(userId, 'seen_ua:', ABUSE_IP_UA_CHURN_WINDOW_SECONDS),
+    countRecentUsersForIp(params.currentIp, ABUSE_MULTI_ACCOUNT_WINDOW_SECONDS),
+  ]);
+
+  const ruleHits: AbuseRuleHit[] = [];
+  let score = 0;
+
+  const rpm1m = rpmTotals.request_total ?? 0;
+  const rpmSpikeThreshold = Math.max(12, Math.ceil(baseLimits.rpm_effective * 1.4));
+  if (rpm1m >= rpmSpikeThreshold) {
+    score += pushRuleHit(ruleHits, {
+      rule: 'rpm_spike',
+      score: rpm1m >= Math.max(20, Math.ceil(baseLimits.rpm_effective * 2)) ? 40 : 25,
+      value: rpm1m,
+      threshold: rpmSpikeThreshold,
+      windowSeconds: ABUSE_RPM_WINDOW_SECONDS,
+      detail: { rpm_limit_effective: baseLimits.rpm_effective },
+    });
+  }
+
+  const tpm1m = tpmTotals.tpm_tokens ?? 0;
+  const tpmSpikeThreshold = Math.max(1000, Math.ceil(baseLimits.tpm_effective * 1.25));
+  if (tpm1m >= tpmSpikeThreshold) {
+    score += pushRuleHit(ruleHits, {
+      rule: 'tpm_spike',
+      score: tpm1m >= Math.max(3000, Math.ceil(baseLimits.tpm_effective * 1.8)) ? 45 : 30,
+      value: tpm1m,
+      threshold: tpmSpikeThreshold,
+      windowSeconds: ABUSE_TPM_WINDOW_SECONDS,
+      detail: { tpm_limit_effective: baseLimits.tpm_effective },
+    });
+  }
+
+  const loginFails = loginTotals.auth_login_fail ?? 0;
+  if (loginFails >= 6) {
+    score += pushRuleHit(ruleHits, {
+      rule: 'login_bruteforce',
+      score: loginFails >= 10 ? 65 : 45,
+      value: loginFails,
+      threshold: 6,
+      windowSeconds: ABUSE_LOGIN_FAIL_WINDOW_SECONDS,
+    });
+  }
+
+  const streamRejected = streamTotals.stream_concurrency_rejected ?? 0;
+  if (streamRejected >= 2) {
+    score += pushRuleHit(ruleHits, {
+      rule: 'stream_concurrency_abuse',
+      score: streamRejected >= 5 ? 45 : 25,
+      value: streamRejected,
+      threshold: 2,
+      windowSeconds: ABUSE_STREAM_REJECT_WINDOW_SECONDS,
+      detail: { concurrency_cap: config.abuseStreamConcurrencyLimit },
+    });
+  }
+
+  if (distinctIpCount >= 4 || distinctUaCount >= 4) {
+    score += pushRuleHit(ruleHits, {
+      rule: 'ip_ua_churn',
+      score: distinctIpCount >= 6 || distinctUaCount >= 6 ? 35 : 20,
+      value: Math.max(distinctIpCount, distinctUaCount),
+      threshold: 4,
+      windowSeconds: ABUSE_IP_UA_CHURN_WINDOW_SECONDS,
+      detail: {
+        distinct_ip_count: distinctIpCount,
+        distinct_ua_count: distinctUaCount,
+      },
+    });
+  }
+
+  if (sharedIpUsers >= 4) {
+    score += pushRuleHit(ruleHits, {
+      rule: 'multi_account_ip_cluster',
+      score: sharedIpUsers >= 7 ? 40 : 25,
+      value: sharedIpUsers,
+      threshold: 4,
+      windowSeconds: ABUSE_MULTI_ACCOUNT_WINDOW_SECONDS,
+      detail: { ip: params.currentIp },
+    });
+  }
+
+  const errorCount = errorTotals.request_error ?? 0;
+  const errorWindowRequests = errorTotals.request_total ?? 0;
+  const burst429 = errorTotals.request_429 ?? 0;
+  if (burst429 >= 6) {
+    score += pushRuleHit(ruleHits, {
+      rule: '429_burst',
+      score: burst429 >= 12 ? 35 : 20,
+      value: burst429,
+      threshold: 6,
+      windowSeconds: ABUSE_ERROR_WINDOW_SECONDS,
+    });
+  }
+  if (errorCount >= 8 || (errorWindowRequests >= 8 && errorCount / errorWindowRequests >= 0.45)) {
+    score += pushRuleHit(ruleHits, {
+      rule: 'high_error_rate',
+      score:
+        errorCount >= 15 || (errorWindowRequests >= 12 && errorCount / errorWindowRequests >= 0.6)
+          ? 35
+          : 20,
+      value: errorCount,
+      threshold: 8,
+      windowSeconds: ABUSE_ERROR_WINDOW_SECONDS,
+      detail: {
+        request_count: errorWindowRequests,
+      },
+    });
+  }
+
+  await ensureAbuseStateRow(userId, score, ruleHits);
+
+  const activeThrottle = getActiveThrottleFromState(abuseState);
+  let action: AbuseEvaluationResult['action'] = 'none';
+  let banExpiresAt: string | null = params.user.ban_expires_at;
+
+  if (!hasActiveBan(params.user) && score >= config.abuseBanScoreThreshold) {
+    const hasActiveIntermediateThrottle = activeThrottle.source !== 'none';
+    if (hasActiveIntermediateThrottle) {
+      banExpiresAt = await applyAutoTempBan({
+        userId,
+        score,
+        ruleHits,
+      });
+      action = 'ban';
+
+      await writeAuditEvent({
+        eventType: 'abuse.action.temp_ban_auto',
+        request: params.request,
+        userId,
+        metadata: {
+          score,
+          ban_expires_at: banExpiresAt,
+          rule_hits: ruleHits,
+        },
+      });
+
+      await sendAbuseAlert({
+        user_id: userId,
+        email: params.user.email,
+        action: 'temp_ban_auto',
+        score,
+        ban_expires_at: banExpiresAt,
+        ip: params.currentIp,
+        ua: params.currentUa,
+      });
+    }
+  }
+
+  if (action === 'none' && !hasActiveBan(params.user) && score >= config.abuseThrottleScoreThreshold) {
+    const throttleLimits = buildAutoThrottleLimits(baseLimits);
+    const throttleExpiresAt = await applyAutoThrottle({
+      userId,
+      score,
+      ruleHits,
+      rpmLimit: throttleLimits.rpm_limit,
+      tpmLimit: throttleLimits.tpm_limit,
+    });
+    action = 'throttle';
+
+    await writeAuditEvent({
+      eventType: 'abuse.action.throttle_auto',
+      request: params.request,
+      userId,
+      metadata: {
+        score,
+        throttle_expires_at: throttleExpiresAt,
+        rpm_limit: throttleLimits.rpm_limit,
+        tpm_limit: throttleLimits.tpm_limit,
+        rule_hits: ruleHits,
+      },
+    });
+
+    await sendAbuseAlert({
+      user_id: userId,
+      email: params.user.email,
+      action: 'throttle_auto',
+      score,
+      throttle_expires_at: throttleExpiresAt,
+      rpm_limit: throttleLimits.rpm_limit,
+      tpm_limit: throttleLimits.tpm_limit,
+      ip: params.currentIp,
+      ua: params.currentUa,
+    });
+  }
+
+  return {
+    score,
+    ruleHits,
+    action,
+    ban_expires_at: banExpiresAt,
+  };
+}
+
 async function authRateLimit(request: FastifyRequest, reply: FastifyReply): Promise<void> {
   const body = (request.body ?? {}) as { email?: unknown };
-  const email = typeof body.email === 'string' ? body.email.toLowerCase() : 'unknown';
-  const key = `ratelimit:auth:${getClientIp(request)}:${email}`;
-  const allowed = await checkRateLimit(key, config.authRateLimitPerMinute, RATE_LIMIT_WINDOW_SECONDS);
+  const normalizedEmail = typeof body.email === 'string' ? normalizeEmail(body.email) : 'unknown';
+  const clientIp = getClientIp(request);
+  const userAgent = getClientUserAgent(request);
+
+  let limit = config.authRateLimitPerMinute;
+  let matchedUser: DbUser | null = null;
+  if (normalizedEmail !== 'unknown') {
+    const userResult = await pool.query<DbUser>(
+      `SELECT id, email, is_admin, default_model, status, ban_expires_at
+       FROM users
+       WHERE email = $1`,
+      [normalizedEmail],
+    );
+    matchedUser = userResult.rowCount ? userResult.rows[0]! : null;
+  }
+
+  if (matchedUser) {
+    matchedUser = await maybeLiftExpiredBan(matchedUser);
+    if (hasActiveBan(matchedUser)) {
+      reply.code(403).send({
+        error: 'Account banned',
+        ban_expires_at: matchedUser.ban_expires_at,
+      });
+      return;
+    }
+
+    const abuseState = await loadAbuseUserState(matchedUser.id);
+    const throttle = getActiveThrottleFromState(abuseState);
+    if (throttle.source !== 'none') {
+      const throttledAuthLimit = Math.max(
+        2,
+        Math.floor((throttle.rpm_limit ?? config.authRateLimitPerMinute) / 4),
+      );
+      limit = Math.min(limit, throttledAuthLimit);
+    }
+
+    await incrementAbuseCounters(matchedUser.id, [
+      { dimension: 'auth_attempt', value: 1 },
+      { dimension: `seen_ip:${shortHash(clientIp)}`, value: 1 },
+      { dimension: `seen_ua:${shortHash(userAgent ?? 'unknown')}`, value: 1 },
+    ]);
+  }
+
+  const key = `ratelimit:auth:${clientIp}:${normalizedEmail}`;
+  const allowed = await checkRateLimit(key, limit, RATE_LIMIT_WINDOW_SECONDS);
   if (!allowed) {
+    if (matchedUser) {
+      await incrementAbuseCounters(matchedUser.id, [{ dimension: 'request_429', value: 1 }]);
+    }
     reply.code(429).send({ error: 'Too many authentication attempts' });
+    return;
   }
 }
 
@@ -468,8 +1363,40 @@ async function v1RateLimit(request: FastifyRequest, reply: FastifyReply): Promis
     RATE_LIMIT_WINDOW_SECONDS,
   );
   if (!allowed) {
+    await incrementAbuseCounters(request.authUser.id, [{ dimension: 'request_429', value: 1 }]);
+    await evaluateUserAbuseAndMaybeAct({
+      request,
+      user: request.authUser,
+      currentIp: getClientIp(request),
+      currentUa: getClientUserAgent(request),
+    });
     reply.code(429).send({ error: 'Rate limit exceeded (RPM)' });
+    return;
   }
+}
+
+async function recordAuthenticatedActivityAndEvaluateAbuse(
+  request: FastifyRequest,
+  user: DbUser,
+): Promise<AbuseEvaluationResult> {
+  const ip = getClientIp(request);
+  const ua = getClientUserAgent(request);
+
+  await Promise.all([
+    touchUserLastSeen(user.id, ip, ua),
+    incrementAbuseCounters(user.id, [
+      { dimension: 'request_total', value: 1 },
+      { dimension: `seen_ip:${shortHash(ip)}`, value: 1 },
+      { dimension: `seen_ua:${shortHash(ua ?? 'unknown')}`, value: 1 },
+    ]),
+  ]);
+
+  return evaluateUserAbuseAndMaybeAct({
+    request,
+    user,
+    currentIp: ip,
+    currentUa: ua,
+  });
 }
 
 function estimateTokensFromText(value: string): number {
@@ -540,6 +1467,7 @@ async function addTpmUsageEvent(userId: string, tokens: number, nowMs = Date.now
 
   await redis.zadd(key, nowMs, member);
   await redis.expire(key, TPM_COUNTER_TTL_SECONDS);
+  await incrementAbuseCounter(userId, 'tpm_tokens', normalized, nowMs);
 }
 
 async function reserveTpmUsage(params: {
@@ -557,6 +1485,50 @@ async function reserveTpmUsage(params: {
 
   await addTpmUsageEvent(params.userId, normalizedTokens, nowMs);
   return { allowed: true, used };
+}
+
+async function acquireUserStreamLease(
+  userId: string,
+): Promise<{ allowed: true; lease: StreamLease; active: number } | { allowed: false; active: number }> {
+  const key = `abuse:stream:active:${userId}`;
+  const token = crypto.randomUUID();
+  const nowMs = Date.now();
+  const cutoffMs = nowMs - STREAM_SESSION_TTL_SECONDS * 1000;
+
+  const raw = await redis.eval(
+    STREAM_LEASE_ACQUIRE_LUA,
+    1,
+    key,
+    String(config.abuseStreamConcurrencyLimit),
+    String(nowMs),
+    String(cutoffMs),
+    token,
+    String(STREAM_SESSION_TTL_SECONDS),
+  );
+
+  const result = Array.isArray(raw) ? raw : [0, 0];
+  const allowed = toSafeInteger(result[0]) === 1;
+  const active = toSafeInteger(result[1]);
+  if (!allowed) {
+    return { allowed: false, active };
+  }
+
+  return {
+    allowed: true,
+    active,
+    lease: {
+      key,
+      token,
+    },
+  };
+}
+
+async function releaseUserStreamLease(lease: StreamLease | null): Promise<void> {
+  if (!lease) {
+    return;
+  }
+
+  await redis.zrem(lease.key, lease.token);
 }
 
 function parseNumberField(value: unknown): number | null {
@@ -682,20 +1654,27 @@ async function destroySession(request: FastifyRequest, reply: FastifyReply): Pro
   });
 }
 
-async function recordSuccessfulLogin(userId: string, clientIp: string): Promise<void> {
+async function recordSuccessfulLogin(
+  userId: string,
+  clientIp: string,
+  userAgent: string | null,
+): Promise<void> {
   await pool.query(
     `UPDATE users
      SET last_login_at = now(),
          last_login_ip = $2,
+         last_seen_ip = $2,
+         last_seen_ua = $3,
+         last_seen_at = now(),
          updated_at = now()
      WHERE id = $1`,
-    [userId, clientIp],
+    [userId, clientIp, userAgent],
   );
 }
 
 async function getUserById(userId: string): Promise<DbUser | null> {
   const result = await pool.query<DbUser>(
-    'SELECT id, email, is_admin, default_model, status FROM users WHERE id = $1',
+    'SELECT id, email, is_admin, default_model, status, ban_expires_at FROM users WHERE id = $1',
     [userId],
   );
   return result.rowCount ? result.rows[0]! : null;
@@ -800,7 +1779,7 @@ async function syncUserAdminBootstrapFlag(user: DbUser): Promise<DbUser> {
      SET is_admin = true,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, email, is_admin, default_model, status`,
+     RETURNING id, email, is_admin, default_model, status, ban_expires_at`,
     [user.id],
   );
 
@@ -1533,8 +2512,9 @@ async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promis
     return;
   }
 
-  const syncedUser = await syncUserAdminBootstrapFlag(user);
-  if (syncedUser.status !== 'active') {
+  const maybeUnbanned = await maybeLiftExpiredBan(user);
+  const syncedUser = await syncUserAdminBootstrapFlag(maybeUnbanned);
+  if (hasActiveBan(syncedUser)) {
     await redis.del(`session:${sessionId}`);
     reply.clearCookie(config.sessionCookieName, {
       path: '/',
@@ -1549,15 +2529,46 @@ async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promis
       userId: syncedUser.id,
       metadata: {
         reason: 'account_banned',
+        ban_expires_at: syncedUser.ban_expires_at,
       },
     });
 
-    reply.code(403).send({ error: 'Account banned' });
+    reply.code(403).send({
+      error: 'Account banned',
+      ban_expires_at: syncedUser.ban_expires_at,
+    });
     return;
   }
 
   request.sessionId = sessionId;
   request.authUser = syncedUser;
+
+  const evaluation = await recordAuthenticatedActivityAndEvaluateAbuse(request, syncedUser);
+  if (evaluation.action === 'ban') {
+    await redis.del(`session:${sessionId}`);
+    reply.clearCookie(config.sessionCookieName, {
+      path: '/',
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: config.secureCookies,
+    });
+
+    await writeAuditEvent({
+      eventType: 'auth.session_blocked',
+      request,
+      userId: syncedUser.id,
+      metadata: {
+        reason: 'auto_temp_ban',
+        ban_expires_at: evaluation.ban_expires_at,
+      },
+    });
+
+    reply.code(403).send({
+      error: 'Account banned',
+      ban_expires_at: evaluation.ban_expires_at,
+    });
+    return;
+  }
 }
 
 async function requireAdmin(request: FastifyRequest, reply: FastifyReply): Promise<void> {
@@ -1667,6 +2678,7 @@ async function setupServer(): Promise<void> {
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
     const password = typeof body?.password === 'string' ? body.password : '';
     const clientIp = getClientIp(request);
+    const clientUa = getClientUserAgent(request);
 
     if (!email || password.length < 8) {
       await writeAuditEvent({
@@ -1682,10 +2694,19 @@ async function setupServer(): Promise<void> {
     const isAdmin = isConfiguredAdminEmail(email);
     try {
       const created = await pool.query<DbUser>(
-        `INSERT INTO users (email, password_hash, is_admin, last_login_at, last_login_ip)
-         VALUES ($1, $2, $3, now(), $4)
-         RETURNING id, email, is_admin, default_model, status`,
-        [email, passwordHash, isAdmin, clientIp],
+        `INSERT INTO users (
+           email,
+           password_hash,
+           is_admin,
+           last_login_at,
+           last_login_ip,
+           last_seen_ip,
+           last_seen_ua,
+           last_seen_at
+         )
+         VALUES ($1, $2, $3, now(), $4, $4, $5, now())
+         RETURNING id, email, is_admin, default_model, status, ban_expires_at`,
+        [email, passwordHash, isAdmin, clientIp, clientUa],
       );
       const user = created.rows[0]!;
       await createSession(reply, user.id);
@@ -1723,6 +2744,7 @@ async function setupServer(): Promise<void> {
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
     const password = typeof body?.password === 'string' ? body.password : '';
     const clientIp = getClientIp(request);
+    const clientUa = getClientUserAgent(request);
 
     if (!email || !password) {
       reply.code(400).send({ error: 'Email and password are required' });
@@ -1730,7 +2752,7 @@ async function setupServer(): Promise<void> {
     }
 
     const userResult = await pool.query<DbUser & { password_hash: string }>(
-      `SELECT id, email, password_hash, is_admin, default_model, status
+      `SELECT id, email, password_hash, is_admin, default_model, status, ban_expires_at
        FROM users
        WHERE email = $1`,
       [email],
@@ -1749,31 +2771,54 @@ async function setupServer(): Promise<void> {
     const user = userResult.rows[0]!;
     const matches = await bcrypt.compare(password, user.password_hash);
     if (!matches) {
+      await incrementAbuseCounters(user.id, [
+        { dimension: 'auth_login_fail', value: 1 },
+        { dimension: 'request_error', value: 1 },
+        { dimension: `seen_ip:${shortHash(clientIp)}`, value: 1 },
+        { dimension: `seen_ua:${shortHash(clientUa ?? 'unknown')}`, value: 1 },
+      ]);
       await writeAuditEvent({
         eventType: 'auth.login_failed',
         request,
         userId: user.id,
         metadata: { reason: 'invalid_credentials' },
       });
+
+      await evaluateUserAbuseAndMaybeAct({
+        request,
+        user,
+        currentIp: clientIp,
+        currentUa: clientUa,
+      });
       reply.code(401).send({ error: 'Invalid credentials' });
       return;
     }
 
-    const syncedUser = await syncUserAdminBootstrapFlag(user);
-    if (syncedUser.status !== 'active') {
+    const maybeUnbanned = await maybeLiftExpiredBan(user);
+    const syncedUser = await syncUserAdminBootstrapFlag(maybeUnbanned);
+    if (hasActiveBan(syncedUser)) {
       await writeAuditEvent({
         eventType: 'auth.login_blocked',
         request,
         userId: syncedUser.id,
         metadata: {
           reason: 'account_banned',
+          ban_expires_at: syncedUser.ban_expires_at,
         },
       });
-      reply.code(403).send({ error: 'Account banned' });
+      reply.code(403).send({
+        error: 'Account banned',
+        ban_expires_at: syncedUser.ban_expires_at,
+      });
       return;
     }
 
-    await recordSuccessfulLogin(syncedUser.id, clientIp);
+    await recordSuccessfulLogin(syncedUser.id, clientIp, clientUa);
+    await incrementAbuseCounters(syncedUser.id, [
+      { dimension: 'auth_login_success', value: 1 },
+      { dimension: `seen_ip:${shortHash(clientIp)}`, value: 1 },
+      { dimension: `seen_ua:${shortHash(clientUa ?? 'unknown')}`, value: 1 },
+    ]);
     await createSession(reply, syncedUser.id);
 
     await writeAuditEvent({
@@ -2612,28 +3657,56 @@ async function setupServer(): Promise<void> {
     const user = request.authUser!;
     const queryParams = (request.query ?? {}) as { query?: unknown };
     const query = typeof queryParams.query === 'string' ? queryParams.query.trim() : '';
-    const settings = await loadRateLimitSettings();
 
     const users = await pool.query<{
       id: string;
       email: string;
       status: string;
+      ban_expires_at: string | null;
       created_at: string;
       last_login_at: string | null;
       last_login_ip: string | null;
+      last_seen_ip: string | null;
+      last_seen_ua: string | null;
+      last_seen_at: string | null;
       rpm_override: number | null;
       tpm_override: number | null;
+      anomaly_score: number | null;
+      last_rule_hits: unknown;
+      throttle_expires_at: string | null;
+      throttle_rpm_limit: number | null;
+      throttle_tpm_limit: number | null;
+      admin_throttle_expires_at: string | null;
+      admin_throttle_rpm_limit: number | null;
+      admin_throttle_tpm_limit: number | null;
+      last_action: string | null;
+      last_action_at: string | null;
     }>(
       `SELECT u.id,
               u.email,
               u.status,
+              u.ban_expires_at,
               u.created_at,
               u.last_login_at,
               u.last_login_ip,
+              u.last_seen_ip,
+              u.last_seen_ua,
+              u.last_seen_at,
               ul.rpm_limit AS rpm_override,
-              ul.tpm_limit AS tpm_override
+              ul.tpm_limit AS tpm_override,
+              aus.anomaly_score,
+              aus.last_rule_hits,
+              aus.throttle_expires_at,
+              aus.throttle_rpm_limit,
+              aus.throttle_tpm_limit,
+              aus.admin_throttle_expires_at,
+              aus.admin_throttle_rpm_limit,
+              aus.admin_throttle_tpm_limit,
+              aus.last_action,
+              aus.last_action_at
        FROM users u
        LEFT JOIN user_limits ul ON ul.user_id = u.id
+       LEFT JOIN abuse_user_state aus ON aus.user_id = u.id
        WHERE ($1::text = '' OR u.email ILIKE '%' || $1 || '%')
        ORDER BY u.created_at DESC
        LIMIT 200`,
@@ -2650,24 +3723,39 @@ async function setupServer(): Promise<void> {
       },
     });
 
-    return {
-      data: users.rows.map((entry) => {
+    const rows = await Promise.all(
+      users.rows.map(async (entry) => {
         const status = parseUserStatus(entry.status) ?? 'active';
-        const rpmOverride = entry.rpm_override ?? null;
-        const tpmOverride = entry.tpm_override ?? null;
+        const effectiveRateLimits = await loadEffectiveRateLimitsForUser(entry.id);
         return {
           id: entry.id,
           email: entry.email,
           status,
+          ban_expires_at: entry.ban_expires_at,
           created_at: entry.created_at,
           last_login_at: entry.last_login_at,
           last_login_ip: entry.last_login_ip,
-          rpm_override: rpmOverride,
-          tpm_override: tpmOverride,
-          rpm_effective: resolveEffectiveRateLimit(rpmOverride, settings.rpm_limit),
-          tpm_effective: resolveEffectiveRateLimit(tpmOverride, settings.tpm_limit),
+          last_seen_ip: entry.last_seen_ip,
+          last_seen_ua: entry.last_seen_ua,
+          last_seen_at: entry.last_seen_at,
+          rpm_override: effectiveRateLimits.rpm_override,
+          tpm_override: effectiveRateLimits.tpm_override,
+          rpm_effective: effectiveRateLimits.rpm_effective,
+          tpm_effective: effectiveRateLimits.tpm_effective,
+          throttle_source: effectiveRateLimits.throttle_source,
+          throttle_expires_at: effectiveRateLimits.throttle_expires_at,
+          throttle_rpm_limit: effectiveRateLimits.throttle_rpm_limit,
+          throttle_tpm_limit: effectiveRateLimits.throttle_tpm_limit,
+          anomaly_score: entry.anomaly_score ?? 0,
+          last_rule_hits: Array.isArray(entry.last_rule_hits) ? entry.last_rule_hits : [],
+          last_action: entry.last_action,
+          last_action_at: entry.last_action_at,
         };
       }),
+    );
+
+    return {
+      data: rows,
     };
   });
 
@@ -2709,19 +3797,46 @@ async function setupServer(): Promise<void> {
       last_login_at: string | null;
       last_login_ip: string | null;
       banned_at: string | null;
+      ban_expires_at: string | null;
     }>(
       `UPDATE users
        SET status = $2,
            banned_at = CASE WHEN $2 = 'banned' THEN COALESCE(banned_at, now()) ELSE NULL END,
+           ban_expires_at = NULL,
            updated_at = now()
        WHERE id = $1
-       RETURNING id, email, status, created_at, last_login_at, last_login_ip, banned_at`,
+       RETURNING id, email, status, created_at, last_login_at, last_login_ip, banned_at, ban_expires_at`,
       [params.id, status],
     );
 
     if (!updated.rowCount) {
       reply.code(404).send({ error: 'User not found' });
       return;
+    }
+
+    if (status === 'active') {
+      await pool.query(
+        `INSERT INTO abuse_user_state (
+           user_id,
+           last_action,
+           last_action_at,
+           last_action_metadata,
+           updated_at
+         )
+         VALUES ($1, 'admin.users.unbanned', now(), $2::jsonb, now())
+         ON CONFLICT (user_id) DO UPDATE
+           SET last_action = EXCLUDED.last_action,
+               last_action_at = now(),
+               last_action_metadata = EXCLUDED.last_action_metadata,
+               updated_at = now()`,
+        [
+          params.id,
+          JSON.stringify({
+            admin_user_id: admin.id,
+            previous_status: previousStatus,
+          }),
+        ],
+      );
     }
 
     await writeAuditEvent({
@@ -2741,6 +3856,7 @@ async function setupServer(): Promise<void> {
         id: target.id,
         email: target.email,
         status: parseUserStatus(target.status) ?? status,
+        ban_expires_at: target.ban_expires_at,
         created_at: target.created_at,
         last_login_at: target.last_login_at,
         last_login_ip: target.last_login_ip,
@@ -2824,6 +3940,358 @@ async function setupServer(): Promise<void> {
         rpm_effective: rpmEffective,
         tpm_effective: tpmEffective,
       },
+    });
+  });
+
+  app.get('/admin/abuse/suspicious', { preHandler: [requireAuth, requireAdmin] }, async (request) => {
+    const admin = request.authUser!;
+    const queryParams = (request.query ?? {}) as { query?: unknown };
+    const query = typeof queryParams.query === 'string' ? queryParams.query.trim() : '';
+
+    const suspicious = await pool.query<{
+      id: string;
+      email: string;
+      status: string;
+      ban_expires_at: string | null;
+      last_seen_ip: string | null;
+      last_seen_ua: string | null;
+      last_seen_at: string | null;
+      anomaly_score: number | null;
+      last_rule_hits: unknown;
+      throttle_expires_at: string | null;
+      throttle_rpm_limit: number | null;
+      throttle_tpm_limit: number | null;
+      admin_throttle_expires_at: string | null;
+      admin_throttle_rpm_limit: number | null;
+      admin_throttle_tpm_limit: number | null;
+      last_action: string | null;
+      last_action_at: string | null;
+    }>(
+      `SELECT u.id,
+              u.email,
+              u.status,
+              u.ban_expires_at,
+              u.last_seen_ip,
+              u.last_seen_ua,
+              u.last_seen_at,
+              aus.anomaly_score,
+              aus.last_rule_hits,
+              aus.throttle_expires_at,
+              aus.throttle_rpm_limit,
+              aus.throttle_tpm_limit,
+              aus.admin_throttle_expires_at,
+              aus.admin_throttle_rpm_limit,
+              aus.admin_throttle_tpm_limit,
+              aus.last_action,
+              aus.last_action_at
+       FROM users u
+       LEFT JOIN abuse_user_state aus ON aus.user_id = u.id
+       WHERE ($1::text = '' OR u.email ILIKE '%' || $1 || '%')
+         AND (
+           COALESCE(aus.anomaly_score, 0) > 0
+           OR (u.status = 'banned' AND (u.ban_expires_at IS NULL OR u.ban_expires_at > now()))
+           OR (aus.throttle_expires_at IS NOT NULL AND aus.throttle_expires_at > now())
+           OR (aus.admin_throttle_expires_at IS NOT NULL AND aus.admin_throttle_expires_at > now())
+         )
+       ORDER BY COALESCE(aus.anomaly_score, 0) DESC,
+                COALESCE(aus.last_action_at, u.last_seen_at, u.created_at) DESC
+       LIMIT 200`,
+      [query],
+    );
+
+    await writeAuditEvent({
+      eventType: 'admin.abuse.suspicious_listed',
+      request,
+      userId: admin.id,
+      metadata: {
+        query: query || null,
+        result_count: suspicious.rows.length,
+      },
+    });
+
+    const nowMs = Date.now();
+    return {
+      data: suspicious.rows.map((entry) => {
+        let throttleSource: 'none' | 'auto' | 'admin' = 'none';
+        let throttleExpiresAt: string | null = null;
+        let throttleRpmLimit: number | null = null;
+        let throttleTpmLimit: number | null = null;
+
+        if (
+          isFutureTimestamp(entry.admin_throttle_expires_at, nowMs) &&
+          (entry.admin_throttle_rpm_limit !== null || entry.admin_throttle_tpm_limit !== null)
+        ) {
+          throttleSource = 'admin';
+          throttleExpiresAt = entry.admin_throttle_expires_at;
+          throttleRpmLimit = entry.admin_throttle_rpm_limit;
+          throttleTpmLimit = entry.admin_throttle_tpm_limit;
+        } else if (
+          isFutureTimestamp(entry.throttle_expires_at, nowMs) &&
+          (entry.throttle_rpm_limit !== null || entry.throttle_tpm_limit !== null)
+        ) {
+          throttleSource = 'auto';
+          throttleExpiresAt = entry.throttle_expires_at;
+          throttleRpmLimit = entry.throttle_rpm_limit;
+          throttleTpmLimit = entry.throttle_tpm_limit;
+        }
+
+        return {
+          id: entry.id,
+          email: entry.email,
+          status: parseUserStatus(entry.status) ?? 'active',
+          ban_expires_at: entry.ban_expires_at,
+          last_seen_ip: entry.last_seen_ip,
+          last_seen_ua: entry.last_seen_ua,
+          last_seen_at: entry.last_seen_at,
+          anomaly_score: entry.anomaly_score ?? 0,
+          last_rule_hits: Array.isArray(entry.last_rule_hits) ? entry.last_rule_hits : [],
+          throttle_source: throttleSource,
+          throttle_expires_at: throttleExpiresAt,
+          throttle_rpm_limit: throttleRpmLimit,
+          throttle_tpm_limit: throttleTpmLimit,
+          last_action: entry.last_action,
+          last_action_at: entry.last_action_at,
+        };
+      }),
+    };
+  });
+
+  app.put(
+    '/admin/users/:id/throttle-override',
+    { preHandler: [requireAuth, requireAdmin] },
+    async (request, reply) => {
+      const admin = request.authUser!;
+      const params = request.params as { id: string };
+      const body = (request.body ?? {}) as {
+        rpm_limit?: unknown;
+        tpm_limit?: unknown;
+        duration_minutes?: unknown;
+      };
+
+      if (!uuidPattern.test(params.id)) {
+        reply.code(400).send({ error: 'id must be a valid UUID' });
+        return;
+      }
+
+      const rpmLimit = toPositiveInteger(body.rpm_limit);
+      const tpmLimit = toPositiveInteger(body.tpm_limit);
+      const durationMinutes = toPositiveInteger(body.duration_minutes);
+      if (!rpmLimit || !tpmLimit || !durationMinutes) {
+        reply.code(400).send({
+          error: 'rpm_limit, tpm_limit, and duration_minutes must be positive integers',
+        });
+        return;
+      }
+
+      const existingUser = await pool.query<{ id: string }>('SELECT id FROM users WHERE id = $1', [params.id]);
+      if (!existingUser.rowCount) {
+        reply.code(404).send({ error: 'User not found' });
+        return;
+      }
+
+      const updated = await pool.query<{ admin_throttle_expires_at: string }>(
+        `INSERT INTO abuse_user_state (
+           user_id,
+           admin_throttle_expires_at,
+           admin_throttle_rpm_limit,
+           admin_throttle_tpm_limit,
+           last_action,
+           last_action_at,
+           last_action_metadata,
+           updated_at
+         )
+         VALUES (
+           $1,
+           now() + ($2::integer * interval '1 minute'),
+           $3,
+           $4,
+           'admin.users.throttle_override_set',
+           now(),
+           $5::jsonb,
+           now()
+         )
+         ON CONFLICT (user_id) DO UPDATE
+           SET admin_throttle_expires_at = now() + ($2::integer * interval '1 minute'),
+               admin_throttle_rpm_limit = EXCLUDED.admin_throttle_rpm_limit,
+               admin_throttle_tpm_limit = EXCLUDED.admin_throttle_tpm_limit,
+               last_action = EXCLUDED.last_action,
+               last_action_at = now(),
+               last_action_metadata = EXCLUDED.last_action_metadata,
+               updated_at = now()
+         RETURNING admin_throttle_expires_at`,
+        [
+          params.id,
+          durationMinutes,
+          rpmLimit,
+          tpmLimit,
+          JSON.stringify({
+            admin_user_id: admin.id,
+            duration_minutes: durationMinutes,
+            rpm_limit: rpmLimit,
+            tpm_limit: tpmLimit,
+          }),
+        ],
+      );
+
+      const throttleExpiresAt = updated.rows[0]?.admin_throttle_expires_at ?? null;
+      await writeAuditEvent({
+        eventType: 'admin.users.throttle_override_set',
+        request,
+        userId: admin.id,
+        metadata: {
+          target_user_id: params.id,
+          rpm_limit: rpmLimit,
+          tpm_limit: tpmLimit,
+          duration_minutes: durationMinutes,
+          throttle_expires_at: throttleExpiresAt,
+        },
+      });
+
+      reply.send({
+        data: {
+          user_id: params.id,
+          throttle_source: 'admin',
+          throttle_expires_at: throttleExpiresAt,
+          throttle_rpm_limit: rpmLimit,
+          throttle_tpm_limit: tpmLimit,
+        },
+      });
+    },
+  );
+
+  app.delete(
+    '/admin/users/:id/throttle-override',
+    { preHandler: [requireAuth, requireAdmin] },
+    async (request, reply) => {
+      const admin = request.authUser!;
+      const params = request.params as { id: string };
+
+      if (!uuidPattern.test(params.id)) {
+        reply.code(400).send({ error: 'id must be a valid UUID' });
+        return;
+      }
+
+      const existingUser = await pool.query<{ id: string }>('SELECT id FROM users WHERE id = $1', [params.id]);
+      if (!existingUser.rowCount) {
+        reply.code(404).send({ error: 'User not found' });
+        return;
+      }
+
+      await pool.query(
+        `INSERT INTO abuse_user_state (
+           user_id,
+           admin_throttle_expires_at,
+           admin_throttle_rpm_limit,
+           admin_throttle_tpm_limit,
+           last_action,
+           last_action_at,
+           last_action_metadata,
+           updated_at
+         )
+         VALUES (
+           $1,
+           NULL,
+           NULL,
+           NULL,
+           'admin.users.throttle_override_cleared',
+           now(),
+           $2::jsonb,
+           now()
+         )
+         ON CONFLICT (user_id) DO UPDATE
+           SET admin_throttle_expires_at = NULL,
+               admin_throttle_rpm_limit = NULL,
+               admin_throttle_tpm_limit = NULL,
+               last_action = EXCLUDED.last_action,
+               last_action_at = now(),
+               last_action_metadata = EXCLUDED.last_action_metadata,
+               updated_at = now()`,
+        [
+          params.id,
+          JSON.stringify({
+            admin_user_id: admin.id,
+          }),
+        ],
+      );
+
+      await writeAuditEvent({
+        eventType: 'admin.users.throttle_override_cleared',
+        request,
+        userId: admin.id,
+        metadata: {
+          target_user_id: params.id,
+        },
+      });
+
+      reply.send({
+        data: {
+          user_id: params.id,
+          throttle_source: 'none',
+          throttle_expires_at: null,
+        },
+      });
+    },
+  );
+
+  app.get('/admin/users/:id/abuse-events', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+    const admin = request.authUser!;
+    const params = request.params as { id: string };
+    const queryParams = (request.query ?? {}) as { limit?: unknown };
+    const limitCandidate = toPositiveInteger(queryParams.limit);
+    const limit = Math.min(200, Math.max(1, limitCandidate ?? 40));
+
+    if (!uuidPattern.test(params.id)) {
+      reply.code(400).send({ error: 'id must be a valid UUID' });
+      return;
+    }
+
+    const existingUser = await pool.query<{ id: string }>('SELECT id FROM users WHERE id = $1', [params.id]);
+    if (!existingUser.rowCount) {
+      reply.code(404).send({ error: 'User not found' });
+      return;
+    }
+
+    const events = await pool.query<{
+      id: string;
+      event_type: string;
+      ip: string | null;
+      metadata: unknown;
+      created_at: string;
+    }>(
+      `SELECT id::text, event_type, ip, metadata, created_at
+       FROM audit_events
+       WHERE user_id = $1
+         AND (
+           event_type LIKE 'abuse.%'
+           OR event_type LIKE 'auth.%'
+           OR event_type LIKE 'upstream.%'
+           OR event_type = 'security.origin_blocked'
+           OR event_type LIKE 'admin.users.%'
+         )
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [params.id, limit],
+    );
+
+    await writeAuditEvent({
+      eventType: 'admin.users.abuse_events_viewed',
+      request,
+      userId: admin.id,
+      metadata: {
+        target_user_id: params.id,
+        limit,
+        result_count: events.rows.length,
+      },
+    });
+
+    reply.send({
+      data: events.rows.map((event) => ({
+        id: event.id,
+        event_type: event.event_type,
+        ip: event.ip,
+        metadata: event.metadata ?? {},
+        created_at: event.created_at,
+      })),
     });
   });
 
@@ -2961,6 +4429,13 @@ async function setupServer(): Promise<void> {
       limit: effectiveRateLimits.tpm_effective,
     });
     if (!tpmReservation.allowed) {
+      await incrementAbuseCounters(user.id, [{ dimension: 'request_429', value: 1 }]);
+      await evaluateUserAbuseAndMaybeAct({
+        request,
+        user,
+        currentIp: getClientIp(request),
+        currentUa: getClientUserAgent(request),
+      });
       reply.code(429).send({ error: 'Rate limit exceeded (TPM)' });
       return;
     }
@@ -3020,105 +4495,177 @@ async function setupServer(): Promise<void> {
     });
 
     const stream = requestBody.stream === true;
-    const started = Date.now();
-
-    await writeAuditEvent({
-      eventType: 'upstream.request',
-      request,
-      userId: user.id,
-      metadata: {
-        endpoint: '/responses',
-        provider: selectedModel.provider_code,
-        stream,
-        has_model: Boolean(effectiveModel),
-        history_items_used: contextMessagesUsed,
-        history_tokens_estimate: threadContext.tokenEstimate,
-      },
-    });
-
-    const upstream = await fetch(`${selectedModel.provider_base_url}/responses`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    await writeAuditEvent({
-      eventType: 'upstream.response',
-      request,
-      userId: user.id,
-      metadata: {
-        endpoint: '/responses',
-        provider: selectedModel.provider_code,
-        status: upstream.status,
-        duration_ms: Date.now() - started,
-        stream,
-      },
-    });
-
-    if (!upstream.ok) {
-      const upstreamText = await upstream.text();
-      let parsed: unknown = { error: { message: upstreamText } };
-      try {
-        parsed = JSON.parse(upstreamText);
-      } catch {
-        parsed = { error: { message: upstreamText } };
-      }
-
-      reply.code(upstream.status).send(parsed);
-      return;
-    }
-
+    let streamLease: StreamLease | null = null;
     if (stream) {
-      const reader = upstream.body?.getReader();
-      if (!reader) {
-        reply.code(502).send({ error: 'Upstream stream body missing' });
+      const leaseResult = await acquireUserStreamLease(user.id);
+      if (!leaseResult.allowed) {
+        await incrementAbuseCounters(user.id, [
+          { dimension: 'stream_concurrency_rejected', value: 1 },
+          { dimension: 'request_429', value: 1 },
+        ]);
+        await writeAuditEvent({
+          eventType: 'abuse.stream_concurrency_blocked',
+          request,
+          userId: user.id,
+          metadata: {
+            endpoint: '/responses',
+            active_streams: leaseResult.active,
+            stream_limit: config.abuseStreamConcurrencyLimit,
+          },
+        });
+        await evaluateUserAbuseAndMaybeAct({
+          request,
+          user,
+          currentIp: getClientIp(request),
+          currentUa: getClientUserAgent(request),
+        });
+        reply.code(429).send({ error: 'Too many concurrent streams for this user' });
         return;
       }
 
-      reply.hijack();
-      reply.raw.writeHead(200, {
-        'Content-Type': upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-        'X-Thread-Id': targetThreadId,
-        'X-Context-Messages-Used': String(contextMessagesUsed),
+      streamLease = leaseResult.lease;
+      await incrementAbuseCounters(user.id, [{ dimension: 'stream_started', value: 1 }]);
+    }
+
+    try {
+      const started = Date.now();
+
+      await writeAuditEvent({
+        eventType: 'upstream.request',
+        request,
+        userId: user.id,
+        metadata: {
+          endpoint: '/responses',
+          provider: selectedModel.provider_code,
+          stream,
+          has_model: Boolean(effectiveModel),
+          history_items_used: contextMessagesUsed,
+          history_tokens_estimate: threadContext.tokenEstimate,
+        },
       });
 
-      let parserBuffer = '';
-      let assistantText = '';
-      const decoder = new TextDecoder();
+      const upstream = await fetch(`${selectedModel.provider_base_url}/responses`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(requestBody),
+      });
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
+      await writeAuditEvent({
+        eventType: 'upstream.response',
+        request,
+        userId: user.id,
+        metadata: {
+          endpoint: '/responses',
+          provider: selectedModel.provider_code,
+          status: upstream.status,
+          duration_ms: Date.now() - started,
+          stream,
+        },
+      });
+
+      if (!upstream.ok) {
+        const errorCounters =
+          upstream.status === 429
+            ? [
+                { dimension: 'request_error', value: 1 },
+                { dimension: 'request_429', value: 1 },
+              ]
+            : [{ dimension: 'request_error', value: 1 }];
+        await incrementAbuseCounters(user.id, errorCounters);
+        await evaluateUserAbuseAndMaybeAct({
+          request,
+          user,
+          currentIp: getClientIp(request),
+          currentUa: getClientUserAgent(request),
+        });
+
+        const upstreamText = await upstream.text();
+        let parsed: unknown = { error: { message: upstreamText } };
+        try {
+          parsed = JSON.parse(upstreamText);
+        } catch {
+          parsed = { error: { message: upstreamText } };
         }
 
-        const chunk = decoder.decode(value, { stream: true });
-        reply.raw.write(chunk);
-
-        parserBuffer += chunk;
-        const parsed = parseSseAssistantDelta({ streamKind: 'responses', buffer: parserBuffer });
-        parserBuffer = parsed.remaining;
-        assistantText += parsed.assistantDelta;
+        reply.code(upstream.status).send(parsed);
+        return;
       }
 
-      const tail = decoder.decode();
-      if (tail) {
-        parserBuffer += tail;
+      if (stream) {
+        const reader = upstream.body?.getReader();
+        if (!reader) {
+          await incrementAbuseCounters(user.id, [{ dimension: 'request_error', value: 1 }]);
+          reply.code(502).send({ error: 'Upstream stream body missing' });
+          return;
+        }
+
+        reply.hijack();
+        reply.raw.writeHead(200, {
+          'Content-Type': upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          'X-Thread-Id': targetThreadId,
+          'X-Context-Messages-Used': String(contextMessagesUsed),
+        });
+
+        let parserBuffer = '';
+        let assistantText = '';
+        const decoder = new TextDecoder();
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+
+          const chunk = decoder.decode(value, { stream: true });
+          reply.raw.write(chunk);
+
+          parserBuffer += chunk;
+          const parsed = parseSseAssistantDelta({ streamKind: 'responses', buffer: parserBuffer });
+          parserBuffer = parsed.remaining;
+          assistantText += parsed.assistantDelta;
+        }
+
+        const tail = decoder.decode();
+        if (tail) {
+          parserBuffer += tail;
+        }
+
+        const parsedTail = parseSseAssistantDelta({ streamKind: 'responses', buffer: parserBuffer });
+        assistantText += parsedTail.assistantDelta;
+
+        await persistMessage({
+          threadId: targetThreadId,
+          userId: user.id,
+          role: 'assistant',
+          content: assistantText || '[streamed response]',
+        });
+
+        await maybeAutoRenameThread({
+          threadId: targetThreadId,
+          userId: user.id,
+          sourceText: assistantText,
+        });
+
+        await addTpmUsageEvent(user.id, estimateTokensFromText(assistantText));
+
+        reply.raw.end();
+        return;
       }
 
-      const parsedTail = parseSseAssistantDelta({ streamKind: 'responses', buffer: parserBuffer });
-      assistantText += parsedTail.assistantDelta;
+      const payload = (await upstream.json()) as Record<string, unknown>;
+      const assistantText = extractAssistantTextFromResponses(payload);
 
       await persistMessage({
         threadId: targetThreadId,
         userId: user.id,
         role: 'assistant',
-        content: assistantText || '[streamed response]',
+        content: assistantText || '[empty response]',
+        rawContent: payload,
       });
 
       await maybeAutoRenameThread({
@@ -3127,39 +4674,19 @@ async function setupServer(): Promise<void> {
         sourceText: assistantText,
       });
 
-      await addTpmUsageEvent(user.id, estimateTokensFromText(assistantText));
+      const usageTotalTokens = extractUsageTotalTokens(payload);
+      if (usageTotalTokens !== null) {
+        await addTpmUsageEvent(user.id, Math.max(0, usageTotalTokens - inputTokenEstimate));
+      } else {
+        await addTpmUsageEvent(user.id, estimateTokensFromText(assistantText));
+      }
 
-      reply.raw.end();
-      return;
+      reply.header('X-Thread-Id', targetThreadId);
+      reply.header('X-Context-Messages-Used', String(contextMessagesUsed));
+      reply.send(payload);
+    } finally {
+      await releaseUserStreamLease(streamLease);
     }
-
-    const payload = (await upstream.json()) as Record<string, unknown>;
-    const assistantText = extractAssistantTextFromResponses(payload);
-
-    await persistMessage({
-      threadId: targetThreadId,
-      userId: user.id,
-      role: 'assistant',
-      content: assistantText || '[empty response]',
-      rawContent: payload,
-    });
-
-    await maybeAutoRenameThread({
-      threadId: targetThreadId,
-      userId: user.id,
-      sourceText: assistantText,
-    });
-
-    const usageTotalTokens = extractUsageTotalTokens(payload);
-    if (usageTotalTokens !== null) {
-      await addTpmUsageEvent(user.id, Math.max(0, usageTotalTokens - inputTokenEstimate));
-    } else {
-      await addTpmUsageEvent(user.id, estimateTokensFromText(assistantText));
-    }
-
-    reply.header('X-Thread-Id', targetThreadId);
-    reply.header('X-Context-Messages-Used', String(contextMessagesUsed));
-    reply.send(payload);
   });
 
   app.post('/v1/chat/completions', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
@@ -3210,6 +4737,13 @@ async function setupServer(): Promise<void> {
       limit: effectiveRateLimits.tpm_effective,
     });
     if (!tpmReservation.allowed) {
+      await incrementAbuseCounters(user.id, [{ dimension: 'request_429', value: 1 }]);
+      await evaluateUserAbuseAndMaybeAct({
+        request,
+        user,
+        currentIp: getClientIp(request),
+        currentUa: getClientUserAgent(request),
+      });
       reply.code(429).send({ error: 'Rate limit exceeded (TPM)' });
       return;
     }
@@ -3268,105 +4802,177 @@ async function setupServer(): Promise<void> {
     });
 
     const stream = requestBody.stream === true;
-    const started = Date.now();
-
-    await writeAuditEvent({
-      eventType: 'upstream.request',
-      request,
-      userId: user.id,
-      metadata: {
-        endpoint: '/chat/completions',
-        provider: selectedModel.provider_code,
-        stream,
-        has_model: Boolean(effectiveModel),
-        history_items_used: contextMessagesUsed,
-        history_tokens_estimate: threadContext.tokenEstimate,
-      },
-    });
-
-    const upstream = await fetch(`${selectedModel.provider_base_url}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    await writeAuditEvent({
-      eventType: 'upstream.response',
-      request,
-      userId: user.id,
-      metadata: {
-        endpoint: '/chat/completions',
-        provider: selectedModel.provider_code,
-        status: upstream.status,
-        duration_ms: Date.now() - started,
-        stream,
-      },
-    });
-
-    if (!upstream.ok) {
-      const upstreamText = await upstream.text();
-      let parsed: unknown = { error: { message: upstreamText } };
-      try {
-        parsed = JSON.parse(upstreamText);
-      } catch {
-        parsed = { error: { message: upstreamText } };
-      }
-
-      reply.code(upstream.status).send(parsed);
-      return;
-    }
-
+    let streamLease: StreamLease | null = null;
     if (stream) {
-      const reader = upstream.body?.getReader();
-      if (!reader) {
-        reply.code(502).send({ error: 'Upstream stream body missing' });
+      const leaseResult = await acquireUserStreamLease(user.id);
+      if (!leaseResult.allowed) {
+        await incrementAbuseCounters(user.id, [
+          { dimension: 'stream_concurrency_rejected', value: 1 },
+          { dimension: 'request_429', value: 1 },
+        ]);
+        await writeAuditEvent({
+          eventType: 'abuse.stream_concurrency_blocked',
+          request,
+          userId: user.id,
+          metadata: {
+            endpoint: '/chat/completions',
+            active_streams: leaseResult.active,
+            stream_limit: config.abuseStreamConcurrencyLimit,
+          },
+        });
+        await evaluateUserAbuseAndMaybeAct({
+          request,
+          user,
+          currentIp: getClientIp(request),
+          currentUa: getClientUserAgent(request),
+        });
+        reply.code(429).send({ error: 'Too many concurrent streams for this user' });
         return;
       }
 
-      reply.hijack();
-      reply.raw.writeHead(200, {
-        'Content-Type': upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-        'X-Thread-Id': targetThreadId,
-        'X-Context-Messages-Used': String(contextMessagesUsed),
+      streamLease = leaseResult.lease;
+      await incrementAbuseCounters(user.id, [{ dimension: 'stream_started', value: 1 }]);
+    }
+
+    try {
+      const started = Date.now();
+
+      await writeAuditEvent({
+        eventType: 'upstream.request',
+        request,
+        userId: user.id,
+        metadata: {
+          endpoint: '/chat/completions',
+          provider: selectedModel.provider_code,
+          stream,
+          has_model: Boolean(effectiveModel),
+          history_items_used: contextMessagesUsed,
+          history_tokens_estimate: threadContext.tokenEstimate,
+        },
       });
 
-      let parserBuffer = '';
-      let assistantText = '';
-      const decoder = new TextDecoder();
+      const upstream = await fetch(`${selectedModel.provider_base_url}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(requestBody),
+      });
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
+      await writeAuditEvent({
+        eventType: 'upstream.response',
+        request,
+        userId: user.id,
+        metadata: {
+          endpoint: '/chat/completions',
+          provider: selectedModel.provider_code,
+          status: upstream.status,
+          duration_ms: Date.now() - started,
+          stream,
+        },
+      });
+
+      if (!upstream.ok) {
+        const errorCounters =
+          upstream.status === 429
+            ? [
+                { dimension: 'request_error', value: 1 },
+                { dimension: 'request_429', value: 1 },
+              ]
+            : [{ dimension: 'request_error', value: 1 }];
+        await incrementAbuseCounters(user.id, errorCounters);
+        await evaluateUserAbuseAndMaybeAct({
+          request,
+          user,
+          currentIp: getClientIp(request),
+          currentUa: getClientUserAgent(request),
+        });
+
+        const upstreamText = await upstream.text();
+        let parsed: unknown = { error: { message: upstreamText } };
+        try {
+          parsed = JSON.parse(upstreamText);
+        } catch {
+          parsed = { error: { message: upstreamText } };
         }
 
-        const chunk = decoder.decode(value, { stream: true });
-        reply.raw.write(chunk);
-
-        parserBuffer += chunk;
-        const parsed = parseSseAssistantDelta({ streamKind: 'chat', buffer: parserBuffer });
-        parserBuffer = parsed.remaining;
-        assistantText += parsed.assistantDelta;
+        reply.code(upstream.status).send(parsed);
+        return;
       }
 
-      const tail = decoder.decode();
-      if (tail) {
-        parserBuffer += tail;
+      if (stream) {
+        const reader = upstream.body?.getReader();
+        if (!reader) {
+          await incrementAbuseCounters(user.id, [{ dimension: 'request_error', value: 1 }]);
+          reply.code(502).send({ error: 'Upstream stream body missing' });
+          return;
+        }
+
+        reply.hijack();
+        reply.raw.writeHead(200, {
+          'Content-Type': upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          'X-Thread-Id': targetThreadId,
+          'X-Context-Messages-Used': String(contextMessagesUsed),
+        });
+
+        let parserBuffer = '';
+        let assistantText = '';
+        const decoder = new TextDecoder();
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+
+          const chunk = decoder.decode(value, { stream: true });
+          reply.raw.write(chunk);
+
+          parserBuffer += chunk;
+          const parsed = parseSseAssistantDelta({ streamKind: 'chat', buffer: parserBuffer });
+          parserBuffer = parsed.remaining;
+          assistantText += parsed.assistantDelta;
+        }
+
+        const tail = decoder.decode();
+        if (tail) {
+          parserBuffer += tail;
+        }
+
+        const parsedTail = parseSseAssistantDelta({ streamKind: 'chat', buffer: parserBuffer });
+        assistantText += parsedTail.assistantDelta;
+
+        await persistMessage({
+          threadId: targetThreadId,
+          userId: user.id,
+          role: 'assistant',
+          content: assistantText || '[streamed response]',
+        });
+
+        await maybeAutoRenameThread({
+          threadId: targetThreadId,
+          userId: user.id,
+          sourceText: assistantText,
+        });
+
+        await addTpmUsageEvent(user.id, estimateTokensFromText(assistantText));
+
+        reply.raw.end();
+        return;
       }
 
-      const parsedTail = parseSseAssistantDelta({ streamKind: 'chat', buffer: parserBuffer });
-      assistantText += parsedTail.assistantDelta;
+      const payload = (await upstream.json()) as Record<string, unknown>;
+      const assistantText = extractAssistantTextFromChatCompletions(payload);
 
       await persistMessage({
         threadId: targetThreadId,
         userId: user.id,
         role: 'assistant',
-        content: assistantText || '[streamed response]',
+        content: assistantText || '[empty response]',
+        rawContent: payload,
       });
 
       await maybeAutoRenameThread({
@@ -3375,43 +4981,38 @@ async function setupServer(): Promise<void> {
         sourceText: assistantText,
       });
 
-      await addTpmUsageEvent(user.id, estimateTokensFromText(assistantText));
+      const usageTotalTokens = extractUsageTotalTokens(payload);
+      if (usageTotalTokens !== null) {
+        await addTpmUsageEvent(user.id, Math.max(0, usageTotalTokens - inputTokenEstimate));
+      } else {
+        await addTpmUsageEvent(user.id, estimateTokensFromText(assistantText));
+      }
 
-      reply.raw.end();
-      return;
+      reply.header('X-Thread-Id', targetThreadId);
+      reply.header('X-Context-Messages-Used', String(contextMessagesUsed));
+      reply.send(payload);
+    } finally {
+      await releaseUserStreamLease(streamLease);
     }
-
-    const payload = (await upstream.json()) as Record<string, unknown>;
-    const assistantText = extractAssistantTextFromChatCompletions(payload);
-
-    await persistMessage({
-      threadId: targetThreadId,
-      userId: user.id,
-      role: 'assistant',
-      content: assistantText || '[empty response]',
-      rawContent: payload,
-    });
-
-    await maybeAutoRenameThread({
-      threadId: targetThreadId,
-      userId: user.id,
-      sourceText: assistantText,
-    });
-
-    const usageTotalTokens = extractUsageTotalTokens(payload);
-    if (usageTotalTokens !== null) {
-      await addTpmUsageEvent(user.id, Math.max(0, usageTotalTokens - inputTokenEstimate));
-    } else {
-      await addTpmUsageEvent(user.id, estimateTokensFromText(assistantText));
-    }
-
-    reply.header('X-Thread-Id', targetThreadId);
-    reply.header('X-Context-Messages-Used', String(contextMessagesUsed));
-    reply.send(payload);
   });
 
   app.setErrorHandler(async (error, request, reply) => {
     app.log.error({ err: error, url: request.url }, 'Unhandled error');
+
+    if (request.authUser) {
+      try {
+        await incrementAbuseCounters(request.authUser.id, [{ dimension: 'request_error', value: 1 }]);
+        await evaluateUserAbuseAndMaybeAct({
+          request,
+          user: request.authUser,
+          currentIp: getClientIp(request),
+          currentUa: getClientUserAgent(request),
+        });
+      } catch (abuseError) {
+        app.log.warn({ err: abuseError, userId: request.authUser.id }, 'Failed to record abuse error');
+      }
+    }
+
     if (!reply.sent) {
       reply.code(500).send({ error: 'Internal server error' });
     }

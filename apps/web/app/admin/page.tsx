@@ -53,18 +53,70 @@ type AdminUserItem = {
   id: string;
   email: string;
   status: 'active' | 'banned';
+  ban_expires_at: string | null;
   created_at: string;
   last_login_at: string | null;
   last_login_ip: string | null;
+  last_seen_ip: string | null;
+  last_seen_ua: string | null;
+  last_seen_at: string | null;
   rpm_override: number | null;
   tpm_override: number | null;
   rpm_effective: number;
   tpm_effective: number;
+  throttle_source: 'none' | 'auto' | 'admin';
+  throttle_expires_at: string | null;
+  throttle_rpm_limit: number | null;
+  throttle_tpm_limit: number | null;
+  anomaly_score: number;
+  last_rule_hits: AbuseRuleHit[];
+  last_action: string | null;
+  last_action_at: string | null;
 };
 
 type UserLimitDraft = {
   rpm_limit: string;
   tpm_limit: string;
+};
+
+type AbuseRuleHit = {
+  rule: string;
+  score: number;
+  value: number;
+  threshold: number;
+  window_seconds: number;
+};
+
+type SuspiciousUserItem = {
+  id: string;
+  email: string;
+  status: 'active' | 'banned';
+  ban_expires_at: string | null;
+  last_seen_ip: string | null;
+  last_seen_ua: string | null;
+  last_seen_at: string | null;
+  anomaly_score: number;
+  last_rule_hits: AbuseRuleHit[];
+  throttle_source: 'none' | 'auto' | 'admin';
+  throttle_expires_at: string | null;
+  throttle_rpm_limit: number | null;
+  throttle_tpm_limit: number | null;
+  last_action: string | null;
+  last_action_at: string | null;
+};
+
+type ThrottleOverrideDraft = {
+  rpm_limit: string;
+  tpm_limit: string;
+  duration_minutes: string;
+};
+
+type AbuseEventItem = {
+  id: string;
+  event_type: string;
+  ip: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
 };
 
 function parseError(payload: unknown, fallback: string): string {
@@ -95,6 +147,17 @@ function formatDateTime(value: string | null): string {
   return new Date(value).toLocaleString();
 }
 
+function summarizeRuleHits(ruleHits: AbuseRuleHit[]): string {
+  if (!Array.isArray(ruleHits) || ruleHits.length === 0) {
+    return 'No rule hits';
+  }
+
+  return ruleHits
+    .slice(0, 3)
+    .map((hit) => `${hit.rule} (+${hit.score})`)
+    .join(', ');
+}
+
 export default function AdminPage() {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
@@ -118,6 +181,12 @@ export default function AdminPage() {
   const [users, setUsers] = useState<AdminUserItem[]>([]);
   const [usersQuery, setUsersQuery] = useState('');
   const [userLimitDrafts, setUserLimitDrafts] = useState<Record<string, UserLimitDraft>>({});
+  const [suspiciousUsers, setSuspiciousUsers] = useState<SuspiciousUserItem[]>([]);
+  const [throttleOverrideDrafts, setThrottleOverrideDrafts] = useState<
+    Record<string, ThrottleOverrideDraft>
+  >({});
+  const [selectedEventUserId, setSelectedEventUserId] = useState<string | null>(null);
+  const [selectedUserEvents, setSelectedUserEvents] = useState<AbuseEventItem[]>([]);
 
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -228,8 +297,49 @@ export default function AdminPage() {
     );
   };
 
+  const loadSuspiciousUsers = async (query = usersQuery) => {
+    const search = query.trim();
+    const params = new URLSearchParams();
+    if (search) {
+      params.set('query', search);
+    }
+
+    const res = await fetch(
+      `/api/admin/abuse/suspicious${params.size > 0 ? `?${params.toString()}` : ''}`,
+      {
+        credentials: 'include',
+      },
+    );
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as unknown;
+      throw new Error(parseError(body, 'Failed to load suspicious users'));
+    }
+
+    const payload = (await res.json()) as { data: SuspiciousUserItem[] };
+    setSuspiciousUsers(payload.data);
+    setThrottleOverrideDrafts((previous) => {
+      const next = { ...previous };
+      for (const item of payload.data) {
+        if (!next[item.id]) {
+          next[item.id] = {
+            rpm_limit: item.throttle_rpm_limit === null ? '' : String(item.throttle_rpm_limit),
+            tpm_limit: item.throttle_tpm_limit === null ? '' : String(item.throttle_tpm_limit),
+            duration_minutes: '30',
+          };
+        }
+      }
+      return next;
+    });
+  };
+
   const reloadAll = async () => {
-    await Promise.all([loadProviders(), loadModels(), loadRateLimits(), loadUsers(usersQuery)]);
+    await Promise.all([
+      loadProviders(),
+      loadModels(),
+      loadRateLimits(),
+      loadUsers(usersQuery),
+      loadSuspiciousUsers(usersQuery),
+    ]);
   };
 
   useEffect(() => {
@@ -505,7 +615,7 @@ export default function AdminPage() {
     setBusy('users-search');
 
     try {
-      await loadUsers(usersQuery);
+      await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
       setStatus('User list updated');
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Failed to search users');
@@ -534,7 +644,7 @@ export default function AdminPage() {
       }
 
       setStatus(status === 'banned' ? 'User banned' : 'User reactivated');
-      await loadUsers(usersQuery);
+      await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
     } finally {
       setBusy(null);
     }
@@ -582,7 +692,7 @@ export default function AdminPage() {
       }
 
       setStatus('User limits updated');
-      await loadUsers(usersQuery);
+      await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
     } finally {
       setBusy(null);
     }
@@ -611,7 +721,107 @@ export default function AdminPage() {
       }
 
       setStatus('User limit overrides cleared');
-      await loadUsers(usersQuery);
+      await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const setThrottleOverride = async (userId: string) => {
+    const draft = throttleOverrideDrafts[userId] ?? {
+      rpm_limit: '',
+      tpm_limit: '',
+      duration_minutes: '30',
+    };
+    const rpm = Number(draft.rpm_limit);
+    const tpm = Number(draft.tpm_limit);
+    const durationMinutes = Number(draft.duration_minutes);
+
+    if (
+      !Number.isInteger(rpm) ||
+      rpm <= 0 ||
+      !Number.isInteger(tpm) ||
+      tpm <= 0 ||
+      !Number.isInteger(durationMinutes) ||
+      durationMinutes <= 0
+    ) {
+      setError('Throttle override requires positive RPM, TPM, and duration minutes');
+      return;
+    }
+
+    setStatus(null);
+    setError(null);
+    setBusy(`throttle-override-${userId}`);
+
+    try {
+      const res = await fetch(`/api/admin/users/${userId}/throttle-override`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          rpm_limit: rpm,
+          tpm_limit: tpm,
+          duration_minutes: durationMinutes,
+        }),
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `Failed to set throttle override for user ${userId}`));
+        return;
+      }
+
+      setStatus('Throttle override set');
+      await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const clearThrottleOverride = async (userId: string) => {
+    setStatus(null);
+    setError(null);
+    setBusy(`throttle-override-${userId}`);
+
+    try {
+      const res = await fetch(`/api/admin/users/${userId}/throttle-override`, {
+        method: 'DELETE',
+        credentials: 'include',
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `Failed to clear throttle override for user ${userId}`));
+        return;
+      }
+
+      setStatus('Throttle override cleared');
+      await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const viewAbuseEvents = async (userId: string) => {
+    setStatus(null);
+    setError(null);
+    setBusy(`abuse-events-${userId}`);
+
+    try {
+      const res = await fetch(`/api/admin/users/${userId}/abuse-events?limit=40`, {
+        credentials: 'include',
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `Failed to load abuse events for user ${userId}`));
+        return;
+      }
+
+      const payload = body as { data?: AbuseEventItem[] };
+      setSelectedEventUserId(userId);
+      setSelectedUserEvents(Array.isArray(payload.data) ? payload.data : []);
+      setStatus('Loaded abuse events');
     } finally {
       setBusy(null);
     }
@@ -879,6 +1089,224 @@ export default function AdminPage() {
         </div>
 
         <div className="card">
+          <h2>Abuse Monitor</h2>
+          <div className="notice">
+            Suspicious users are scored by rule hits (RPM/TPM spikes, login brute force, stream abuse, IP/UA
+            churn, and high error rates).
+          </div>
+
+          <div className="admin-users-table-wrap">
+            <table className="admin-users-table admin-abuse-table">
+              <thead>
+                <tr>
+                  <th>User</th>
+                  <th>Score</th>
+                  <th>Rules</th>
+                  <th>Last Seen</th>
+                  <th>Action</th>
+                  <th>Controls</th>
+                </tr>
+              </thead>
+              <tbody>
+                {suspiciousUsers.map((user) => {
+                  const draft = throttleOverrideDrafts[user.id] ?? {
+                    rpm_limit: '',
+                    tpm_limit: '',
+                    duration_minutes: '30',
+                  };
+                  const rowBusy =
+                    busy === `user-status-${user.id}` ||
+                    busy === `throttle-override-${user.id}` ||
+                    busy === `abuse-events-${user.id}`;
+
+                  return (
+                    <tr key={`suspicious-${user.id}`}>
+                      <td>
+                        <div>{user.email}</div>
+                        <div className="notice">
+                          <span className={`admin-status-pill ${user.status}`}>
+                            {user.status === 'active' ? 'active' : 'banned'}
+                          </span>
+                          {user.ban_expires_at ? ` until ${formatDateTime(user.ban_expires_at)}` : ''}
+                        </div>
+                      </td>
+                      <td className="mono">{user.anomaly_score}</td>
+                      <td>
+                        <div className="notice">{summarizeRuleHits(user.last_rule_hits)}</div>
+                        <div className="notice">
+                          {user.last_rule_hits.length > 0
+                            ? user.last_rule_hits
+                                .slice(0, 3)
+                                .map((hit) => `${hit.rule}:${hit.value}/${hit.threshold}`)
+                                .join(' | ')
+                            : '-'}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="mono">{user.last_seen_ip ?? '-'}</div>
+                        <div className="notice">{user.last_seen_ua ?? '-'}</div>
+                        <div className="notice">{formatDateTime(user.last_seen_at)}</div>
+                      </td>
+                      <td>
+                        <div>{user.last_action ?? 'none'}</div>
+                        <div className="notice">{formatDateTime(user.last_action_at)}</div>
+                        <div className="notice">
+                          {user.throttle_source === 'none'
+                            ? 'throttle: none'
+                            : `throttle ${user.throttle_source} until ${formatDateTime(user.throttle_expires_at)}`}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="admin-user-actions">
+                          <button
+                            type="button"
+                            className="secondary"
+                            disabled={busy !== null || user.status !== 'banned'}
+                            onClick={() => void saveUserStatus(user.id, 'active')}
+                          >
+                            {rowBusy && busy === `user-status-${user.id}` ? 'Saving...' : 'Unban'}
+                          </button>
+
+                          <div className="admin-throttle-inputs">
+                            <input
+                              type="number"
+                              min={1}
+                              step={1}
+                              placeholder="Throttle RPM"
+                              value={draft.rpm_limit}
+                              onChange={(event) =>
+                                setThrottleOverrideDrafts((previous) => ({
+                                  ...previous,
+                                  [user.id]: {
+                                    ...(previous[user.id] ?? {
+                                      rpm_limit: '',
+                                      tpm_limit: '',
+                                      duration_minutes: '30',
+                                    }),
+                                    rpm_limit: event.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                            <input
+                              type="number"
+                              min={1}
+                              step={1}
+                              placeholder="Throttle TPM"
+                              value={draft.tpm_limit}
+                              onChange={(event) =>
+                                setThrottleOverrideDrafts((previous) => ({
+                                  ...previous,
+                                  [user.id]: {
+                                    ...(previous[user.id] ?? {
+                                      rpm_limit: '',
+                                      tpm_limit: '',
+                                      duration_minutes: '30',
+                                    }),
+                                    tpm_limit: event.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                            <input
+                              type="number"
+                              min={1}
+                              step={1}
+                              placeholder="Duration (min)"
+                              value={draft.duration_minutes}
+                              onChange={(event) =>
+                                setThrottleOverrideDrafts((previous) => ({
+                                  ...previous,
+                                  [user.id]: {
+                                    ...(previous[user.id] ?? {
+                                      rpm_limit: '',
+                                      tpm_limit: '',
+                                      duration_minutes: '30',
+                                    }),
+                                    duration_minutes: event.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                          </div>
+
+                          <div className="button-row">
+                            <button
+                              type="button"
+                              className="secondary"
+                              disabled={busy !== null}
+                              onClick={() => void setThrottleOverride(user.id)}
+                            >
+                              {rowBusy && busy === `throttle-override-${user.id}` ? 'Saving...' : 'Set throttle'}
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost"
+                              disabled={busy !== null}
+                              onClick={() => void clearThrottleOverride(user.id)}
+                            >
+                              Clear throttle
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost"
+                              disabled={busy !== null}
+                              onClick={() => void viewAbuseEvents(user.id)}
+                            >
+                              {rowBusy && busy === `abuse-events-${user.id}` ? 'Loading...' : 'View events'}
+                            </button>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {suspiciousUsers.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="notice">
+                      No suspicious users right now
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+
+          {selectedEventUserId ? (
+            <div className="admin-events-panel">
+              <div className="card-title-row">
+                <strong>Recent Events for {selectedEventUserId}</strong>
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={busy !== null}
+                  onClick={() => {
+                    setSelectedEventUserId(null);
+                    setSelectedUserEvents([]);
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+              <div className="allowlist-preview">
+                {selectedUserEvents.map((event) => (
+                  <div key={event.id} className="admin-event-item">
+                    <div className="mono">
+                      {event.event_type} @ {formatDateTime(event.created_at)}
+                    </div>
+                    <div className="notice">IP: {event.ip ?? '-'}</div>
+                    <pre className="admin-event-metadata">
+                      {JSON.stringify(event.metadata ?? {}, null, 2)}
+                    </pre>
+                  </div>
+                ))}
+                {selectedUserEvents.length === 0 ? <div className="notice">No events found</div> : null}
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="card">
           <h2>Users</h2>
 
           <form
@@ -908,7 +1336,7 @@ export default function AdminPage() {
                 setStatus(null);
                 setError(null);
                 setBusy('users-search');
-                void loadUsers('')
+                void Promise.all([loadUsers(''), loadSuspiciousUsers('')])
                   .then(() => {
                     setStatus('User list updated');
                   })
@@ -952,6 +1380,9 @@ export default function AdminPage() {
                         <span className={`admin-status-pill ${user.status}`}>
                           {user.status === 'active' ? 'active' : 'banned'}
                         </span>
+                        {user.ban_expires_at ? (
+                          <div className="notice">until {formatDateTime(user.ban_expires_at)}</div>
+                        ) : null}
                       </td>
                       <td>{formatDateTime(user.created_at)}</td>
                       <td>{formatDateTime(user.last_login_at)}</td>
