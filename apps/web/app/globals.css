@@ -101,6 +101,12 @@ button.ghost {
   color: var(--text);
 }
 
+button.danger {
+  background: #b42318;
+  border-color: #b42318;
+  color: #ffffff;
+}
+
 button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
@@ -629,6 +635,82 @@ code {
 
 .admin-item-title {
   font-size: 0.86rem;
+}
+
+.admin-user-search {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.6rem;
+}
+
+.admin-user-search label {
+  min-width: 240px;
+  flex: 1;
+}
+
+.admin-users-table-wrap {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: auto;
+  background: #ffffff;
+}
+
+.admin-users-table {
+  width: 100%;
+  min-width: 1180px;
+  border-collapse: collapse;
+}
+
+.admin-users-table th,
+.admin-users-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.65rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.admin-users-table th {
+  background: #f8f9fb;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.admin-users-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.admin-status-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.12rem 0.52rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: lowercase;
+}
+
+.admin-status-pill.active {
+  background: #ecfdf3;
+  color: #067647;
+}
+
+.admin-status-pill.banned {
+  background: #fef3f2;
+  color: #b42318;
+}
+
+.admin-user-actions {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.admin-limit-inputs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.4rem;
 }
 
 .chat-page {

@@ -14,6 +14,7 @@ type DbUser = {
   email: string;
   is_admin: boolean;
   default_model: string | null;
+  status: string;
 };
 
 type ProviderRow = {
@@ -64,6 +65,18 @@ type RateLimitSettings = {
   updated_at: string;
 };
 
+type UserLimitRow = {
+  rpm_limit: number | null;
+  tpm_limit: number | null;
+};
+
+type EffectiveUserRateLimits = {
+  rpm_override: number | null;
+  tpm_override: number | null;
+  rpm_effective: number;
+  tpm_effective: number;
+};
+
 type UpstreamModelItem = {
   id: string;
   owned_by?: string;
@@ -74,6 +87,7 @@ declare module 'fastify' {
   interface FastifyRequest {
     authUser?: DbUser;
     sessionId?: string;
+    effectiveRateLimits?: EffectiveUserRateLimits;
   }
 }
 
@@ -392,6 +406,36 @@ async function loadRateLimitSettings(options?: { force?: boolean }): Promise<Rat
   return row;
 }
 
+function resolveEffectiveRateLimit(overrideLimit: number | null, fallbackLimit: number): number {
+  if (typeof overrideLimit === 'number' && Number.isInteger(overrideLimit) && overrideLimit > 0) {
+    return overrideLimit;
+  }
+  return fallbackLimit;
+}
+
+async function loadEffectiveRateLimitsForUser(userId: string): Promise<EffectiveUserRateLimits> {
+  const [settings, overrideResult] = await Promise.all([
+    loadRateLimitSettings(),
+    pool.query<UserLimitRow>(
+      `SELECT rpm_limit, tpm_limit
+       FROM user_limits
+       WHERE user_id = $1`,
+      [userId],
+    ),
+  ]);
+
+  const override = overrideResult.rowCount ? overrideResult.rows[0]! : null;
+  const rpmOverride = override?.rpm_limit ?? null;
+  const tpmOverride = override?.tpm_limit ?? null;
+
+  return {
+    rpm_override: rpmOverride,
+    tpm_override: tpmOverride,
+    rpm_effective: resolveEffectiveRateLimit(rpmOverride, settings.rpm_limit),
+    tpm_effective: resolveEffectiveRateLimit(tpmOverride, settings.tpm_limit),
+  };
+}
+
 async function authRateLimit(request: FastifyRequest, reply: FastifyReply): Promise<void> {
   const body = (request.body ?? {}) as { email?: unknown };
   const email = typeof body.email === 'string' ? body.email.toLowerCase() : 'unknown';
@@ -408,9 +452,14 @@ async function v1RateLimit(request: FastifyRequest, reply: FastifyReply): Promis
     return;
   }
 
-  const settings = await loadRateLimitSettings();
+  const effectiveRateLimits = await loadEffectiveRateLimitsForUser(request.authUser.id);
+  request.effectiveRateLimits = effectiveRateLimits;
   const key = `ratelimit:v1:rpm:${request.authUser.id}`;
-  const allowed = await checkRateLimit(key, settings.rpm_limit, RATE_LIMIT_WINDOW_SECONDS);
+  const allowed = await checkRateLimit(
+    key,
+    effectiveRateLimits.rpm_effective,
+    RATE_LIMIT_WINDOW_SECONDS,
+  );
   if (!allowed) {
     reply.code(429).send({ error: 'Rate limit exceeded (RPM)' });
   }
@@ -626,9 +675,20 @@ async function destroySession(request: FastifyRequest, reply: FastifyReply): Pro
   });
 }
 
+async function recordSuccessfulLogin(userId: string, clientIp: string): Promise<void> {
+  await pool.query(
+    `UPDATE users
+     SET last_login_at = now(),
+         last_login_ip = $2,
+         updated_at = now()
+     WHERE id = $1`,
+    [userId, clientIp],
+  );
+}
+
 async function getUserById(userId: string): Promise<DbUser | null> {
   const result = await pool.query<DbUser>(
-    'SELECT id, email, is_admin, default_model FROM users WHERE id = $1',
+    'SELECT id, email, is_admin, default_model, status FROM users WHERE id = $1',
     [userId],
   );
   return result.rowCount ? result.rows[0]! : null;
@@ -733,7 +793,7 @@ async function syncUserAdminBootstrapFlag(user: DbUser): Promise<DbUser> {
      SET is_admin = true,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, email, is_admin, default_model`,
+     RETURNING id, email, is_admin, default_model, status`,
     [user.id],
   );
 
@@ -763,6 +823,26 @@ function toPositiveInteger(value: unknown): number | null {
     return null;
   }
   return parsed;
+}
+
+function parseUserStatus(value: unknown): 'active' | 'banned' | null {
+  if (value === 'active' || value === 'banned') {
+    return value;
+  }
+  return null;
+}
+
+function parseNullablePositiveInteger(value: unknown): number | null | 'invalid' {
+  if (value === null) {
+    return null;
+  }
+
+  const positiveInteger = toPositiveInteger(value);
+  if (positiveInteger === null) {
+    return 'invalid';
+  }
+
+  return positiveInteger;
 }
 
 const threadTitleSentenceBoundary = /[.!?]\s/;
@@ -1325,6 +1405,27 @@ async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promis
   }
 
   const syncedUser = await syncUserAdminBootstrapFlag(user);
+  if (syncedUser.status !== 'active') {
+    await redis.del(`session:${sessionId}`);
+    reply.clearCookie(config.sessionCookieName, {
+      path: '/',
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: config.secureCookies,
+    });
+
+    await writeAuditEvent({
+      eventType: 'auth.session_blocked',
+      request,
+      userId: syncedUser.id,
+      metadata: {
+        reason: 'account_banned',
+      },
+    });
+
+    reply.code(403).send({ error: 'Account banned' });
+    return;
+  }
 
   request.sessionId = sessionId;
   request.authUser = syncedUser;
@@ -1436,6 +1537,7 @@ async function setupServer(): Promise<void> {
     const body = request.body as { email?: unknown; password?: unknown };
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
     const password = typeof body?.password === 'string' ? body.password : '';
+    const clientIp = getClientIp(request);
 
     if (!email || password.length < 8) {
       await writeAuditEvent({
@@ -1451,10 +1553,10 @@ async function setupServer(): Promise<void> {
     const isAdmin = isConfiguredAdminEmail(email);
     try {
       const created = await pool.query<DbUser>(
-        `INSERT INTO users (email, password_hash, is_admin)
-         VALUES ($1, $2, $3)
-         RETURNING id, email, is_admin, default_model`,
-        [email, passwordHash, isAdmin],
+        `INSERT INTO users (email, password_hash, is_admin, last_login_at, last_login_ip)
+         VALUES ($1, $2, $3, now(), $4)
+         RETURNING id, email, is_admin, default_model, status`,
+        [email, passwordHash, isAdmin, clientIp],
       );
       const user = created.rows[0]!;
       await createSession(reply, user.id);
@@ -1491,6 +1593,7 @@ async function setupServer(): Promise<void> {
     const body = request.body as { email?: unknown; password?: unknown };
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
     const password = typeof body?.password === 'string' ? body.password : '';
+    const clientIp = getClientIp(request);
 
     if (!email || !password) {
       reply.code(400).send({ error: 'Email and password are required' });
@@ -1498,7 +1601,7 @@ async function setupServer(): Promise<void> {
     }
 
     const userResult = await pool.query<DbUser & { password_hash: string }>(
-      `SELECT id, email, password_hash, is_admin, default_model
+      `SELECT id, email, password_hash, is_admin, default_model, status
        FROM users
        WHERE email = $1`,
       [email],
@@ -1528,6 +1631,20 @@ async function setupServer(): Promise<void> {
     }
 
     const syncedUser = await syncUserAdminBootstrapFlag(user);
+    if (syncedUser.status !== 'active') {
+      await writeAuditEvent({
+        eventType: 'auth.login_blocked',
+        request,
+        userId: syncedUser.id,
+        metadata: {
+          reason: 'account_banned',
+        },
+      });
+      reply.code(403).send({ error: 'Account banned' });
+      return;
+    }
+
+    await recordSuccessfulLogin(syncedUser.id, clientIp);
     await createSession(reply, syncedUser.id);
 
     await writeAuditEvent({
@@ -2362,6 +2479,225 @@ async function setupServer(): Promise<void> {
     });
   });
 
+  app.get('/admin/users', { preHandler: [requireAuth, requireAdmin] }, async (request) => {
+    const user = request.authUser!;
+    const queryParams = (request.query ?? {}) as { query?: unknown };
+    const query = typeof queryParams.query === 'string' ? queryParams.query.trim() : '';
+    const settings = await loadRateLimitSettings();
+
+    const users = await pool.query<{
+      id: string;
+      email: string;
+      status: string;
+      created_at: string;
+      last_login_at: string | null;
+      last_login_ip: string | null;
+      rpm_override: number | null;
+      tpm_override: number | null;
+    }>(
+      `SELECT u.id,
+              u.email,
+              u.status,
+              u.created_at,
+              u.last_login_at,
+              u.last_login_ip,
+              ul.rpm_limit AS rpm_override,
+              ul.tpm_limit AS tpm_override
+       FROM users u
+       LEFT JOIN user_limits ul ON ul.user_id = u.id
+       WHERE ($1::text = '' OR u.email ILIKE '%' || $1 || '%')
+       ORDER BY u.created_at DESC
+       LIMIT 200`,
+      [query],
+    );
+
+    await writeAuditEvent({
+      eventType: 'admin.users.listed',
+      request,
+      userId: user.id,
+      metadata: {
+        query: query || null,
+        result_count: users.rows.length,
+      },
+    });
+
+    return {
+      data: users.rows.map((entry) => {
+        const status = parseUserStatus(entry.status) ?? 'active';
+        const rpmOverride = entry.rpm_override ?? null;
+        const tpmOverride = entry.tpm_override ?? null;
+        return {
+          id: entry.id,
+          email: entry.email,
+          status,
+          created_at: entry.created_at,
+          last_login_at: entry.last_login_at,
+          last_login_ip: entry.last_login_ip,
+          rpm_override: rpmOverride,
+          tpm_override: tpmOverride,
+          rpm_effective: resolveEffectiveRateLimit(rpmOverride, settings.rpm_limit),
+          tpm_effective: resolveEffectiveRateLimit(tpmOverride, settings.tpm_limit),
+        };
+      }),
+    };
+  });
+
+  app.patch('/admin/users/:id', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+    const admin = request.authUser!;
+    const params = request.params as { id: string };
+    const body = (request.body ?? {}) as { status?: unknown };
+
+    if (!uuidPattern.test(params.id)) {
+      reply.code(400).send({ error: 'id must be a valid UUID' });
+      return;
+    }
+
+    const status = parseUserStatus(body.status);
+    if (!status) {
+      reply.code(400).send({ error: 'status must be one of: active, banned' });
+      return;
+    }
+
+    const existingUser = await pool.query<{ id: string; status: string }>(
+      `SELECT id, status
+       FROM users
+       WHERE id = $1`,
+      [params.id],
+    );
+
+    if (!existingUser.rowCount) {
+      reply.code(404).send({ error: 'User not found' });
+      return;
+    }
+
+    const previousStatus = parseUserStatus(existingUser.rows[0]!.status) ?? existingUser.rows[0]!.status;
+
+    const updated = await pool.query<{
+      id: string;
+      email: string;
+      status: string;
+      created_at: string;
+      last_login_at: string | null;
+      last_login_ip: string | null;
+      banned_at: string | null;
+    }>(
+      `UPDATE users
+       SET status = $2,
+           banned_at = CASE WHEN $2 = 'banned' THEN COALESCE(banned_at, now()) ELSE NULL END,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, email, status, created_at, last_login_at, last_login_ip, banned_at`,
+      [params.id, status],
+    );
+
+    if (!updated.rowCount) {
+      reply.code(404).send({ error: 'User not found' });
+      return;
+    }
+
+    await writeAuditEvent({
+      eventType: 'admin.users.status_updated',
+      request,
+      userId: admin.id,
+      metadata: {
+        target_user_id: params.id,
+        previous_status: previousStatus,
+        status,
+      },
+    });
+
+    const target = updated.rows[0]!;
+    reply.send({
+      data: {
+        id: target.id,
+        email: target.email,
+        status: parseUserStatus(target.status) ?? status,
+        created_at: target.created_at,
+        last_login_at: target.last_login_at,
+        last_login_ip: target.last_login_ip,
+      },
+    });
+  });
+
+  app.put('/admin/users/:id/limits', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+    const admin = request.authUser!;
+    const params = request.params as { id: string };
+    const body = (request.body ?? {}) as { rpm_limit?: unknown; tpm_limit?: unknown };
+
+    if (!uuidPattern.test(params.id)) {
+      reply.code(400).send({ error: 'id must be a valid UUID' });
+      return;
+    }
+
+    const hasRpmLimit = Object.prototype.hasOwnProperty.call(body, 'rpm_limit');
+    const hasTpmLimit = Object.prototype.hasOwnProperty.call(body, 'tpm_limit');
+    if (!hasRpmLimit || !hasTpmLimit) {
+      reply.code(400).send({ error: 'rpm_limit and tpm_limit are both required (number or null)' });
+      return;
+    }
+
+    const rpmLimit = parseNullablePositiveInteger(body.rpm_limit);
+    const tpmLimit = parseNullablePositiveInteger(body.tpm_limit);
+    if (rpmLimit === 'invalid' || tpmLimit === 'invalid') {
+      reply.code(400).send({ error: 'rpm_limit and tpm_limit must be positive integers or null' });
+      return;
+    }
+
+    const existingUser = await pool.query<{ id: string }>(
+      `SELECT id
+       FROM users
+       WHERE id = $1`,
+      [params.id],
+    );
+    if (!existingUser.rowCount) {
+      reply.code(404).send({ error: 'User not found' });
+      return;
+    }
+
+    if (rpmLimit === null && tpmLimit === null) {
+      await pool.query('DELETE FROM user_limits WHERE user_id = $1', [params.id]);
+    } else {
+      await pool.query(
+        `INSERT INTO user_limits (user_id, rpm_limit, tpm_limit, updated_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (user_id) DO UPDATE
+           SET rpm_limit = EXCLUDED.rpm_limit,
+               tpm_limit = EXCLUDED.tpm_limit,
+               updated_at = now()`,
+        [params.id, rpmLimit, tpmLimit],
+      );
+    }
+
+    const settings = await loadRateLimitSettings();
+    const rpmOverride = rpmLimit;
+    const tpmOverride = tpmLimit;
+    const rpmEffective = resolveEffectiveRateLimit(rpmOverride, settings.rpm_limit);
+    const tpmEffective = resolveEffectiveRateLimit(tpmOverride, settings.tpm_limit);
+
+    await writeAuditEvent({
+      eventType: 'admin.users.limits_updated',
+      request,
+      userId: admin.id,
+      metadata: {
+        target_user_id: params.id,
+        rpm_limit: rpmOverride,
+        tpm_limit: tpmOverride,
+        rpm_effective: rpmEffective,
+        tpm_effective: tpmEffective,
+      },
+    });
+
+    reply.send({
+      data: {
+        user_id: params.id,
+        rpm_override: rpmOverride,
+        tpm_override: tpmOverride,
+        rpm_effective: rpmEffective,
+        tpm_effective: tpmEffective,
+      },
+    });
+  });
+
   app.get('/v1/models', { preHandler: [requireAuth, v1RateLimit] }, async (_request, reply) => {
     const models = await listCatalogModels({ includeDisabled: false });
     reply.send({
@@ -2487,11 +2823,12 @@ async function setupServer(): Promise<void> {
     }
 
     const inputTokenEstimate = estimateTokensFromUnknown(requestBody.input);
-    const settings = await loadRateLimitSettings();
+    const effectiveRateLimits =
+      request.effectiveRateLimits ?? (await loadEffectiveRateLimitsForUser(user.id));
     const tpmReservation = await reserveTpmUsage({
       userId: user.id,
       tokens: inputTokenEstimate,
-      limit: settings.tpm_limit,
+      limit: effectiveRateLimits.tpm_effective,
     });
     if (!tpmReservation.allowed) {
       reply.code(429).send({ error: 'Rate limit exceeded (TPM)' });
@@ -2703,11 +3040,12 @@ async function setupServer(): Promise<void> {
     }
 
     const inputTokenEstimate = estimateTokensFromUnknown(requestBody.messages);
-    const settings = await loadRateLimitSettings();
+    const effectiveRateLimits =
+      request.effectiveRateLimits ?? (await loadEffectiveRateLimitsForUser(user.id));
     const tpmReservation = await reserveTpmUsage({
       userId: user.id,
       tokens: inputTokenEstimate,
-      limit: settings.tpm_limit,
+      limit: effectiveRateLimits.tpm_effective,
     });
     if (!tpmReservation.allowed) {
       reply.code(429).send({ error: 'Rate limit exceeded (TPM)' });

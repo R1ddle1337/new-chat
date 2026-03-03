@@ -49,6 +49,24 @@ type RateLimitsPayload = {
   updated_at: string;
 };
 
+type AdminUserItem = {
+  id: string;
+  email: string;
+  status: 'active' | 'banned';
+  created_at: string;
+  last_login_at: string | null;
+  last_login_ip: string | null;
+  rpm_override: number | null;
+  tpm_override: number | null;
+  rpm_effective: number;
+  tpm_effective: number;
+};
+
+type UserLimitDraft = {
+  rpm_limit: string;
+  tpm_limit: string;
+};
+
 function parseError(payload: unknown, fallback: string): string {
   if (!payload || typeof payload !== 'object') {
     return fallback;
@@ -67,6 +85,14 @@ function parseError(payload: unknown, fallback: string): string {
   }
 
   return fallback;
+}
+
+function formatDateTime(value: string | null): string {
+  if (!value) {
+    return 'Never';
+  }
+
+  return new Date(value).toLocaleString();
 }
 
 export default function AdminPage() {
@@ -89,6 +115,9 @@ export default function AdminPage() {
   const [rpmLimit, setRpmLimit] = useState('120');
   const [tpmLimit, setTpmLimit] = useState('120000');
   const [rateLimitsUpdatedAt, setRateLimitsUpdatedAt] = useState<string | null>(null);
+  const [users, setUsers] = useState<AdminUserItem[]>([]);
+  const [usersQuery, setUsersQuery] = useState('');
+  const [userLimitDrafts, setUserLimitDrafts] = useState<Record<string, UserLimitDraft>>({});
 
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -169,8 +198,38 @@ export default function AdminPage() {
     setRateLimitsUpdatedAt(payload.data.updated_at);
   };
 
+  const loadUsers = async (query = usersQuery) => {
+    const search = query.trim();
+    const params = new URLSearchParams();
+    if (search) {
+      params.set('query', search);
+    }
+
+    const res = await fetch(`/api/admin/users${params.size > 0 ? `?${params.toString()}` : ''}`, {
+      credentials: 'include',
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as unknown;
+      throw new Error(parseError(body, 'Failed to load users'));
+    }
+
+    const payload = (await res.json()) as { data: AdminUserItem[] };
+    setUsers(payload.data);
+    setUserLimitDrafts(
+      Object.fromEntries(
+        payload.data.map((item) => [
+          item.id,
+          {
+            rpm_limit: item.rpm_override === null ? '' : String(item.rpm_override),
+            tpm_limit: item.tpm_override === null ? '' : String(item.tpm_override),
+          },
+        ]),
+      ),
+    );
+  };
+
   const reloadAll = async () => {
-    await Promise.all([loadProviders(), loadModels(), loadRateLimits()]);
+    await Promise.all([loadProviders(), loadModels(), loadRateLimits(), loadUsers(usersQuery)]);
   };
 
   useEffect(() => {
@@ -440,6 +499,124 @@ export default function AdminPage() {
     }
   };
 
+  const searchUsers = async () => {
+    setStatus(null);
+    setError(null);
+    setBusy('users-search');
+
+    try {
+      await loadUsers(usersQuery);
+      setStatus('User list updated');
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Failed to search users');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const saveUserStatus = async (userId: string, status: 'active' | 'banned') => {
+    setStatus(null);
+    setError(null);
+    setBusy(`user-status-${userId}`);
+
+    try {
+      const res = await fetch(`/api/admin/users/${userId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ status }),
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `Failed to update user ${userId}`));
+        return;
+      }
+
+      setStatus(status === 'banned' ? 'User banned' : 'User reactivated');
+      await loadUsers(usersQuery);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const saveUserLimits = async (userId: string) => {
+    const draft = userLimitDrafts[userId];
+    if (!draft) {
+      return;
+    }
+
+    const rpmRaw = draft.rpm_limit.trim();
+    const tpmRaw = draft.tpm_limit.trim();
+
+    const rpm = rpmRaw === '' ? null : Number(rpmRaw);
+    const tpm = tpmRaw === '' ? null : Number(tpmRaw);
+
+    if (
+      (rpm !== null && (!Number.isInteger(rpm) || rpm <= 0)) ||
+      (tpm !== null && (!Number.isInteger(tpm) || tpm <= 0))
+    ) {
+      setError('User override limits must be positive integers or blank');
+      return;
+    }
+
+    setStatus(null);
+    setError(null);
+    setBusy(`user-limits-${userId}`);
+
+    try {
+      const res = await fetch(`/api/admin/users/${userId}/limits`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          rpm_limit: rpm,
+          tpm_limit: tpm,
+        }),
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `Failed to update limits for user ${userId}`));
+        return;
+      }
+
+      setStatus('User limits updated');
+      await loadUsers(usersQuery);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const clearUserLimits = async (userId: string) => {
+    setStatus(null);
+    setError(null);
+    setBusy(`user-limits-${userId}`);
+
+    try {
+      const res = await fetch(`/api/admin/users/${userId}/limits`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          rpm_limit: null,
+          tpm_limit: null,
+        }),
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `Failed to clear limits for user ${userId}`));
+        return;
+      }
+
+      setStatus('User limit overrides cleared');
+      await loadUsers(usersQuery);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   if (loading) {
     return <section className="panel page-loading">Loading admin console...</section>;
   }
@@ -459,7 +636,10 @@ export default function AdminPage() {
 
   return (
     <section className="admin-page app-page">
-      <MainHeader title="Admin" subtitle="Platform providers, model catalog, and rate limits" />
+      <MainHeader
+        title="Admin"
+        subtitle="Users, providers, model catalog, and global rate limits"
+      />
 
       <div className="page-stack">
         <div className="card">
@@ -696,6 +876,183 @@ export default function AdminPage() {
           {rateLimitsUpdatedAt ? (
             <div className="notice">Last updated: {new Date(rateLimitsUpdatedAt).toLocaleString()}</div>
           ) : null}
+        </div>
+
+        <div className="card">
+          <h2>Users</h2>
+
+          <form
+            className="admin-user-search"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void searchUsers();
+            }}
+          >
+            <label>
+              Search users
+              <input
+                value={usersQuery}
+                onChange={(event) => setUsersQuery(event.target.value)}
+                placeholder="Search by email"
+              />
+            </label>
+            <button type="submit" className="secondary" disabled={busy !== null}>
+              {busy === 'users-search' ? 'Searching...' : 'Search'}
+            </button>
+            <button
+              type="button"
+              className="ghost"
+              disabled={busy !== null}
+              onClick={() => {
+                setUsersQuery('');
+                setStatus(null);
+                setError(null);
+                setBusy('users-search');
+                void loadUsers('')
+                  .then(() => {
+                    setStatus('User list updated');
+                  })
+                  .catch((requestError: unknown) => {
+                    setError(
+                      requestError instanceof Error ? requestError.message : 'Failed to load users',
+                    );
+                  })
+                  .finally(() => {
+                    setBusy(null);
+                  });
+              }}
+            >
+              Clear
+            </button>
+          </form>
+
+          <div className="admin-users-table-wrap">
+            <table className="admin-users-table">
+              <thead>
+                <tr>
+                  <th>Email</th>
+                  <th>Status</th>
+                  <th>Created</th>
+                  <th>Last Login</th>
+                  <th>Last Login IP</th>
+                  <th>RPM</th>
+                  <th>TPM</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {users.map((user) => {
+                  const draft = userLimitDrafts[user.id] ?? { rpm_limit: '', tpm_limit: '' };
+                  const rowBusy = busy === `user-status-${user.id}` || busy === `user-limits-${user.id}`;
+
+                  return (
+                    <tr key={user.id}>
+                      <td>{user.email}</td>
+                      <td>
+                        <span className={`admin-status-pill ${user.status}`}>
+                          {user.status === 'active' ? 'active' : 'banned'}
+                        </span>
+                      </td>
+                      <td>{formatDateTime(user.created_at)}</td>
+                      <td>{formatDateTime(user.last_login_at)}</td>
+                      <td className="mono">{user.last_login_ip ?? '-'}</td>
+                      <td className="mono">
+                        {user.rpm_effective}
+                        <div className="notice">
+                          {user.rpm_override === null ? 'default' : `override ${user.rpm_override}`}
+                        </div>
+                      </td>
+                      <td className="mono">
+                        {user.tpm_effective}
+                        <div className="notice">
+                          {user.tpm_override === null ? 'default' : `override ${user.tpm_override}`}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="admin-user-actions">
+                          <button
+                            type="button"
+                            className={user.status === 'banned' ? 'secondary' : 'danger'}
+                            disabled={busy !== null}
+                            onClick={() =>
+                              void saveUserStatus(user.id, user.status === 'banned' ? 'active' : 'banned')
+                            }
+                          >
+                            {rowBusy && busy === `user-status-${user.id}`
+                              ? 'Saving...'
+                              : user.status === 'banned'
+                                ? 'Unban'
+                                : 'Ban'}
+                          </button>
+
+                          <div className="admin-limit-inputs">
+                            <input
+                              type="number"
+                              min={1}
+                              step={1}
+                              placeholder="RPM override"
+                              value={draft.rpm_limit}
+                              onChange={(event) =>
+                                setUserLimitDrafts((previous) => ({
+                                  ...previous,
+                                  [user.id]: {
+                                    ...(previous[user.id] ?? { rpm_limit: '', tpm_limit: '' }),
+                                    rpm_limit: event.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                            <input
+                              type="number"
+                              min={1}
+                              step={1}
+                              placeholder="TPM override"
+                              value={draft.tpm_limit}
+                              onChange={(event) =>
+                                setUserLimitDrafts((previous) => ({
+                                  ...previous,
+                                  [user.id]: {
+                                    ...(previous[user.id] ?? { rpm_limit: '', tpm_limit: '' }),
+                                    tpm_limit: event.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                          </div>
+
+                          <div className="button-row">
+                            <button
+                              type="button"
+                              className="secondary"
+                              disabled={busy !== null}
+                              onClick={() => void saveUserLimits(user.id)}
+                            >
+                              {rowBusy && busy === `user-limits-${user.id}` ? 'Saving...' : 'Save'}
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost"
+                              disabled={busy !== null}
+                              onClick={() => void clearUserLimits(user.id)}
+                            >
+                              Clear override
+                            </button>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {users.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} className="notice">
+                      No users found
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
         </div>
 
         {status ? <div className="notice">{status}</div> : null}
