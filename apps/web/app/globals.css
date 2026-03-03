@@ -731,6 +731,7 @@ code {
   margin: 0 auto;
   padding: 0.2rem 1.2rem;
   display: flex;
+  justify-content: flex-start;
 }
 
 .chat-message-row.assistant {
@@ -742,22 +743,28 @@ code {
 }
 
 .chat-message-inner {
-  width: fit-content;
+  display: inline-block;
+  width: auto;
   max-width: min(100%, 680px);
   border-radius: 16px;
   border: 1px solid #e4e6eb;
   background: #ffffff;
   box-shadow: 0 8px 24px rgba(16, 24, 40, 0.05);
   padding: 0.9rem 1rem;
-  display: grid;
-  gap: 0.55rem;
+  vertical-align: top;
+}
+
+.chat-message-inner > * + * {
+  margin-top: 0.55rem;
 }
 
 .chat-message-row.assistant .chat-message-inner {
+  margin-right: auto;
   border-bottom-left-radius: 6px;
 }
 
 .chat-message-row.user .chat-message-inner {
+  margin-left: auto;
   border-bottom-right-radius: 6px;
   border-color: #111111;
   background: #111111;

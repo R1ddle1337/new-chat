@@ -7,9 +7,13 @@ import {
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
-  type ReactNode,
+  type ComponentPropsWithoutRef,
 } from 'react';
 import { useRouter } from 'next/navigation';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 import MainHeader from '../components/main-header';
 import { useChatShell } from '../components/chat-shell-context';
 
@@ -53,7 +57,15 @@ type Toast = {
 
 const autoScrollThresholdPx = 120;
 
-function sanitizeLinkHref(rawHref: string): string | null {
+type MarkdownCodeProps = ComponentPropsWithoutRef<'code'> & {
+  inline?: boolean;
+};
+
+function sanitizeLinkHref(rawHref: string | undefined): string | null {
+  if (!rawHref) {
+    return null;
+  }
+
   const href = rawHref.trim();
   if (!href) {
     return null;
@@ -76,117 +88,81 @@ function sanitizeLinkHref(rawHref: string): string | null {
   return null;
 }
 
-function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
-  if (!text) {
-    return [''];
-  }
-
-  const nodes: ReactNode[] = [];
-  const tokenPattern = /(`[^`\n]+`)|(\[([^\]]+)\]\(([^)\s]+)\))/g;
-  let cursor = 0;
-  let tokenIndex = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = tokenPattern.exec(text)) !== null) {
-    if (match.index > cursor) {
-      nodes.push(text.slice(cursor, match.index));
+const markdownComponents = {
+  a({
+    href,
+    className,
+    children,
+    ...props
+  }: ComponentPropsWithoutRef<'a'>) {
+    const safeHref = sanitizeLinkHref(href);
+    if (!safeHref) {
+      return <span>{children}</span>;
     }
 
-    if (match[1]) {
-      nodes.push(
-        <code key={`${keyPrefix}-code-${tokenIndex}`} className="chat-inline-code">
-          {match[1].slice(1, -1)}
-        </code>,
-      );
-    } else if (match[2] && match[3] && match[4]) {
-      const safeHref = sanitizeLinkHref(match[4]);
-      if (safeHref) {
-        nodes.push(
-          <a
-            key={`${keyPrefix}-link-${tokenIndex}`}
-            className="chat-markdown-link"
-            href={safeHref}
-            target="_blank"
-            rel="noreferrer"
-          >
-            {match[3]}
-          </a>,
-        );
-      } else {
-        nodes.push(match[2]);
-      }
-    }
+    const mergedClassName = className
+      ? `chat-markdown-link ${className}`
+      : 'chat-markdown-link';
 
-    cursor = tokenPattern.lastIndex;
-    tokenIndex += 1;
-  }
-
-  if (cursor < text.length) {
-    nodes.push(text.slice(cursor));
-  }
-
-  return nodes;
-}
-
-function renderTextParagraphs(text: string, keyPrefix: string): ReactNode[] {
-  const normalized = text.replace(/\r\n/g, '\n');
-  if (!normalized.trim()) {
-    return [];
-  }
-
-  const paragraphs = normalized.split(/\n{2,}/).filter((paragraph) => paragraph.trim());
-  return paragraphs.map((paragraph, paragraphIndex) => {
-    const lines = paragraph.split('\n');
-    const lineNodes: ReactNode[] = [];
-
-    lines.forEach((line, lineIndex) => {
-      lineNodes.push(
-        ...renderInlineMarkdown(line, `${keyPrefix}-paragraph-${paragraphIndex}-line-${lineIndex}`),
-      );
-
-      if (lineIndex < lines.length - 1) {
-        lineNodes.push(
-          <br key={`${keyPrefix}-paragraph-${paragraphIndex}-linebreak-${lineIndex}`} />,
-        );
-      }
-    });
-
-    return <p key={`${keyPrefix}-paragraph-${paragraphIndex}`}>{lineNodes}</p>;
-  });
-}
-
-function renderSimpleMarkdown(content: string): ReactNode[] {
-  const normalized = content.replace(/\r\n/g, '\n');
-  const blocks: ReactNode[] = [];
-  const codeBlockPattern = /```([^\n`]*)\n([\s\S]*?)```/g;
-  let cursor = 0;
-  let sectionIndex = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = codeBlockPattern.exec(normalized)) !== null) {
-    const textBeforeCodeBlock = normalized.slice(cursor, match.index);
-    blocks.push(...renderTextParagraphs(textBeforeCodeBlock, `section-${sectionIndex}-text`));
-
-    const language = match[1].trim();
-    const code = match[2].replace(/\n$/, '');
-    blocks.push(
-      <pre key={`section-${sectionIndex}-code`} className="chat-code-block">
-        <code className={language ? `language-${language}` : undefined}>{code}</code>
-      </pre>,
+    return (
+      <a
+        {...props}
+        href={safeHref}
+        className={mergedClassName}
+        target="_blank"
+        rel="noreferrer"
+      >
+        {children}
+      </a>
     );
+  },
+  pre({
+    className,
+    children,
+    ...props
+  }: ComponentPropsWithoutRef<'pre'>) {
+    const mergedClassName = className ? `chat-code-block ${className}` : 'chat-code-block';
+    return (
+      <pre {...props} className={mergedClassName}>
+        {children}
+      </pre>
+    );
+  },
+  code({
+    inline,
+    className,
+    children,
+    ...props
+  }: MarkdownCodeProps) {
+    if (inline) {
+      const mergedClassName = className
+        ? `chat-inline-code ${className}`
+        : 'chat-inline-code';
+      return (
+        <code {...props} className={mergedClassName}>
+          {children}
+        </code>
+      );
+    }
 
-    cursor = codeBlockPattern.lastIndex;
-    sectionIndex += 1;
-  }
-
-  const trailingText = normalized.slice(cursor);
-  blocks.push(...renderTextParagraphs(trailingText, `section-${sectionIndex}-tail`));
-
-  return blocks;
-}
+    return (
+      <code {...props} className={className}>
+        {children}
+      </code>
+    );
+  },
+};
 
 function MessageMarkdown({ content }: { content: string }) {
-  return <>{renderSimpleMarkdown(content)}</>;
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeKatex]}
+      components={markdownComponents}
+    >
+      {content}
+    </ReactMarkdown>
+  );
 }
 
 function findSseBoundary(input: string): { index: number; length: number } | null {
