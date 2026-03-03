@@ -57,6 +57,12 @@ type AllowedModelRow = {
   created_at: string;
 };
 
+type UpstreamModelItem = {
+  id: string;
+  owned_by?: string;
+  raw?: Record<string, unknown>;
+};
+
 declare module 'fastify' {
   interface FastifyRequest {
     authUser?: DbUser;
@@ -1154,6 +1160,67 @@ async function requireAdmin(request: FastifyRequest, reply: FastifyReply): Promi
   }
 }
 
+function extractErrorMessage(payload: unknown, fallback: string): string {
+  if (!payload || typeof payload !== 'object') {
+    return fallback;
+  }
+
+  const record = payload as Record<string, unknown>;
+  if (typeof record.error === 'string' && record.error.trim()) {
+    return record.error;
+  }
+
+  if (record.error && typeof record.error === 'object') {
+    const nested = record.error as Record<string, unknown>;
+    if (typeof nested.message === 'string' && nested.message.trim()) {
+      return nested.message;
+    }
+  }
+
+  if (typeof record.message === 'string' && record.message.trim()) {
+    return record.message;
+  }
+
+  return fallback;
+}
+
+function normalizeUpstreamModels(payload: unknown): UpstreamModelItem[] {
+  let source: unknown[] = [];
+  if (Array.isArray(payload)) {
+    source = payload;
+  } else if (payload && typeof payload === 'object') {
+    const data = (payload as Record<string, unknown>).data;
+    if (Array.isArray(data)) {
+      source = data;
+    }
+  }
+
+  const models: UpstreamModelItem[] = [];
+  const seen = new Set<string>();
+
+  for (const entry of source) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const record = entry as Record<string, unknown>;
+    const id = typeof record.id === 'string' ? record.id.trim() : '';
+    if (!id || seen.has(id)) {
+      continue;
+    }
+
+    const normalized: UpstreamModelItem = { id, raw: record };
+    if (typeof record.owned_by === 'string' && record.owned_by.trim()) {
+      normalized.owned_by = record.owned_by.trim();
+    }
+
+    models.push(normalized);
+    seen.add(id);
+  }
+
+  return models;
+}
+
 async function setupServer(): Promise<void> {
   await app.register(cookie);
   await app.register(multipart, {
@@ -1786,6 +1853,83 @@ async function setupServer(): Promise<void> {
     },
   );
 
+  app.get(
+    '/admin/providers/:providerCode/upstream-models',
+    { preHandler: [requireAuth, requireAdmin] },
+    async (request, reply) => {
+      const user = request.authUser!;
+      const params = request.params as { providerCode: string };
+      const providerCode = params.providerCode.trim();
+
+      if (!providerCode) {
+        reply.code(400).send({ error: 'providerCode is required' });
+        return;
+      }
+
+      const provider = await getProviderByCode(providerCode);
+      if (!provider) {
+        reply.code(404).send({ error: `Unknown provider "${providerCode}"` });
+        return;
+      }
+
+      const apiKey = await getUserProviderKey(user.id, provider.id);
+      if (!apiKey) {
+        reply.code(400).send({
+          error: `No API key configured for provider "${provider.code}" on admin account. Set it in Settings first.`,
+        });
+        return;
+      }
+
+      let upstreamResponse: Response;
+      try {
+        upstreamResponse = await fetch(`${provider.base_url}/models`, {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+          },
+        });
+      } catch (error) {
+        reply.code(502).send({
+          error: `Failed to reach upstream /models for "${provider.code}": ${
+            error instanceof Error ? error.message : 'Unknown network error'
+          }`,
+        });
+        return;
+      }
+
+      const upstreamText = await upstreamResponse.text();
+      let upstreamPayload: unknown = null;
+      if (upstreamText) {
+        try {
+          upstreamPayload = JSON.parse(upstreamText);
+        } catch {
+          upstreamPayload = null;
+        }
+      }
+
+      if (!upstreamResponse.ok) {
+        const fallback = `Upstream /models request failed with status ${upstreamResponse.status}`;
+        const message = extractErrorMessage(upstreamPayload, fallback);
+        reply.code(502).send({
+          error: `Provider "${provider.code}" returned ${upstreamResponse.status}: ${message}`,
+        });
+        return;
+      }
+
+      if (!upstreamPayload) {
+        reply.code(502).send({
+          error: `Provider "${provider.code}" returned a non-JSON /models response.`,
+        });
+        return;
+      }
+
+      const models = normalizeUpstreamModels(upstreamPayload);
+      reply.send({
+        data: models,
+      });
+    },
+  );
+
   app.get('/admin/models', { preHandler: [requireAuth, requireAdmin] }, async () => {
     const models = await listAllowedModels({ includeDisabled: true });
     return {
@@ -1874,6 +2018,79 @@ async function setupServer(): Promise<void> {
       }
       throw error;
     }
+  });
+
+  app.post('/admin/models/bulk', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+    const user = request.authUser!;
+    const body = (request.body ?? {}) as {
+      provider?: unknown;
+      model_ids?: unknown;
+      enabled?: unknown;
+    };
+
+    const providerCode = typeof body.provider === 'string' ? body.provider.trim() : '';
+    if (!providerCode) {
+      reply.code(400).send({ error: 'provider is required' });
+      return;
+    }
+
+    if (!Array.isArray(body.model_ids)) {
+      reply.code(400).send({ error: 'model_ids must be an array of strings' });
+      return;
+    }
+
+    if (body.model_ids.some((modelId) => typeof modelId !== 'string')) {
+      reply.code(400).send({ error: 'model_ids must contain only strings' });
+      return;
+    }
+
+    const modelIds = Array.from(
+      new Set(
+        body.model_ids
+          .map((modelId) => (modelId as string).trim())
+          .filter((modelId) => modelId.length > 0),
+      ),
+    );
+
+    if (modelIds.length === 0) {
+      reply.code(400).send({ error: 'model_ids must include at least one non-empty model id' });
+      return;
+    }
+
+    const enabled = typeof body.enabled === 'boolean' ? body.enabled : true;
+    const provider = await getProviderByCode(providerCode);
+    if (!provider) {
+      reply.code(400).send({ error: `Unknown provider "${providerCode}"` });
+      return;
+    }
+
+    const created = await pool.query<{ id: number; model_id: string }>(
+      `INSERT INTO allowed_models (provider_id, model_id, enabled)
+       SELECT $1, incoming.model_id, $3
+       FROM unnest($2::text[]) AS incoming(model_id)
+       ON CONFLICT (provider_id, model_id) DO NOTHING
+       RETURNING id, model_id`,
+      [provider.id, modelIds, enabled],
+    );
+
+    await writeAuditEvent({
+      eventType: 'admin.models.bulk_created',
+      request,
+      userId: user.id,
+      metadata: {
+        provider: provider.code,
+        requested_count: modelIds.length,
+        created_count: created.rowCount,
+        enabled,
+      },
+    });
+
+    reply.send({
+      provider: provider.code,
+      requested_count: modelIds.length,
+      created_count: created.rowCount,
+      created_model_ids: created.rows.map((row) => row.model_id),
+    });
   });
 
   app.patch('/admin/models/:id', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {

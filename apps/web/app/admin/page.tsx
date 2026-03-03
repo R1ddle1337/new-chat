@@ -37,6 +37,12 @@ type ModelDraft = {
   enabled: boolean;
 };
 
+type UpstreamModelItem = {
+  id: string;
+  owned_by?: string;
+  raw?: unknown;
+};
+
 function parseError(payload: unknown, fallback: string): string {
   if (!payload || typeof payload !== 'object') {
     return fallback;
@@ -45,6 +51,13 @@ function parseError(payload: unknown, fallback: string): string {
   const record = payload as Record<string, unknown>;
   if (typeof record.error === 'string') {
     return record.error;
+  }
+
+  if (record.error && typeof record.error === 'object') {
+    const nested = record.error as Record<string, unknown>;
+    if (typeof nested.message === 'string') {
+      return nested.message;
+    }
   }
 
   return fallback;
@@ -62,10 +75,41 @@ export default function AdminPage() {
   const [newModelId, setNewModelId] = useState('');
   const [newDisplayName, setNewDisplayName] = useState('');
   const [newEnabled, setNewEnabled] = useState(true);
+  const [importProvider, setImportProvider] = useState('');
+  const [upstreamModels, setUpstreamModels] = useState<UpstreamModelItem[]>([]);
+  const [upstreamSearch, setUpstreamSearch] = useState('');
+  const [upstreamSelection, setUpstreamSelection] = useState<Record<string, boolean>>({});
+  const [fetchingUpstreamModels, setFetchingUpstreamModels] = useState(false);
+  const [addingUpstreamModels, setAddingUpstreamModels] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const providerCodes = useMemo(() => providers.map((provider) => provider.code), [providers]);
+  const filteredUpstreamModels = useMemo(() => {
+    const query = upstreamSearch.trim().toLowerCase();
+    if (!query) {
+      return upstreamModels;
+    }
+    return upstreamModels.filter((modelItem) => {
+      const idMatch = modelItem.id.toLowerCase().includes(query);
+      const ownerMatch = (modelItem.owned_by ?? '').toLowerCase().includes(query);
+      return idMatch || ownerMatch;
+    });
+  }, [upstreamModels, upstreamSearch]);
+  const selectedUpstreamModelIds = useMemo(
+    () => Object.entries(upstreamSelection).filter((entry) => entry[1]).map((entry) => entry[0]),
+    [upstreamSelection],
+  );
+  const selectedFilteredCount = useMemo(
+    () =>
+      filteredUpstreamModels.reduce(
+        (count, modelItem) => count + (upstreamSelection[modelItem.id] ? 1 : 0),
+        0,
+      ),
+    [filteredUpstreamModels, upstreamSelection],
+  );
+  const allFilteredSelected =
+    filteredUpstreamModels.length > 0 && selectedFilteredCount === filteredUpstreamModels.length;
 
   const loadProviders = async () => {
     const res = await fetch('/api/admin/providers', { credentials: 'include' });
@@ -162,6 +206,12 @@ export default function AdminPage() {
     }
   }, [newProvider, providerCodes]);
 
+  useEffect(() => {
+    if (!importProvider && providerCodes.length > 0) {
+      setImportProvider(providerCodes[0]!);
+    }
+  }, [importProvider, providerCodes]);
+
   const saveProvider = async (providerCode: string) => {
     const draft = providerDrafts[providerCode];
     if (!draft) {
@@ -225,6 +275,115 @@ export default function AdminPage() {
     setNewEnabled(true);
     setStatus('Allowed model created');
     await reloadAll();
+  };
+
+  const fetchUpstreamModels = async () => {
+    const provider = importProvider.trim();
+    if (!provider) {
+      setError('provider is required');
+      return;
+    }
+
+    setStatus(null);
+    setError(null);
+    setFetchingUpstreamModels(true);
+
+    try {
+      const res = await fetch(`/api/admin/providers/${provider}/upstream-models`, {
+        credentials: 'include',
+      });
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `Failed to fetch upstream models for ${provider}`));
+        return;
+      }
+
+      const payload = body as { data?: UpstreamModelItem[] };
+      const items = Array.isArray(payload.data) ? payload.data : [];
+      setUpstreamModels(items);
+      setUpstreamSelection({});
+      setUpstreamSearch('');
+      setStatus(`Fetched ${items.length} upstream models for ${provider}`);
+    } finally {
+      setFetchingUpstreamModels(false);
+    }
+  };
+
+  const toggleUpstreamModel = (modelId: string, checked: boolean) => {
+    setUpstreamSelection((previous) => {
+      if (checked) {
+        return { ...previous, [modelId]: true };
+      }
+      const next = { ...previous };
+      delete next[modelId];
+      return next;
+    });
+  };
+
+  const toggleAllFilteredUpstream = (checked: boolean) => {
+    setUpstreamSelection((previous) => {
+      const next = { ...previous };
+      for (const modelItem of filteredUpstreamModels) {
+        if (checked) {
+          next[modelItem.id] = true;
+        } else {
+          delete next[modelItem.id];
+        }
+      }
+      return next;
+    });
+  };
+
+  const addSelectedUpstreamModels = async () => {
+    const provider = importProvider.trim();
+    if (!provider) {
+      setError('provider is required');
+      return;
+    }
+
+    if (selectedUpstreamModelIds.length === 0) {
+      setError('Select at least one upstream model');
+      return;
+    }
+
+    setStatus(null);
+    setError(null);
+    setAddingUpstreamModels(true);
+
+    try {
+      const res = await fetch('/api/admin/models/bulk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          provider,
+          model_ids: selectedUpstreamModelIds,
+          enabled: true,
+        }),
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, 'Failed to bulk add allowed models'));
+        return;
+      }
+
+      const payload = body as { created_count?: unknown; requested_count?: unknown };
+      const createdCount =
+        typeof payload.created_count === 'number' && Number.isFinite(payload.created_count)
+          ? payload.created_count
+          : 0;
+      const requestedCount =
+        typeof payload.requested_count === 'number' && Number.isFinite(payload.requested_count)
+          ? payload.requested_count
+          : selectedUpstreamModelIds.length;
+
+      setStatus(`Added ${createdCount} new allowlist entries (${requestedCount} selected)`);
+      setUpstreamSelection({});
+      await reloadAll();
+    } finally {
+      setAddingUpstreamModels(false);
+    }
   };
 
   const saveModel = async (modelId: number) => {
@@ -358,6 +517,77 @@ export default function AdminPage() {
                 </div>
               );
             })}
+          </div>
+        </div>
+
+        <div className="card">
+          <h2>Upstream Model Import</h2>
+
+          <label>
+            Provider
+            <select value={importProvider} onChange={(event) => setImportProvider(event.target.value)}>
+              {providerCodes.map((code) => (
+                <option key={code} value={code}>
+                  {code}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <div className="button-row">
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => void fetchUpstreamModels()}
+              disabled={fetchingUpstreamModels || !importProvider.trim()}
+            >
+              {fetchingUpstreamModels ? 'Fetching...' : 'Fetch upstream models'}
+            </button>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => void addSelectedUpstreamModels()}
+              disabled={addingUpstreamModels || selectedUpstreamModelIds.length === 0}
+            >
+              {addingUpstreamModels ? 'Adding...' : 'Add selected to allowlist'}
+            </button>
+          </div>
+
+          <label>
+            Search models
+            <input
+              value={upstreamSearch}
+              onChange={(event) => setUpstreamSearch(event.target.value)}
+              placeholder="Filter by model ID or owner"
+            />
+          </label>
+
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={allFilteredSelected}
+              onChange={(event) => toggleAllFilteredUpstream(event.target.checked)}
+              disabled={filteredUpstreamModels.length === 0}
+            />
+            Select all filtered ({selectedFilteredCount}/{filteredUpstreamModels.length})
+          </label>
+
+          <div className="allowlist-preview">
+            {filteredUpstreamModels.length === 0 ? (
+              <div className="notice">No upstream models loaded</div>
+            ) : (
+              filteredUpstreamModels.map((modelItem) => (
+                <label key={modelItem.id} className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(upstreamSelection[modelItem.id])}
+                    onChange={(event) => toggleUpstreamModel(modelItem.id, event.target.checked)}
+                  />
+                  <span className="mono">{modelItem.id}</span>
+                  {modelItem.owned_by ? <span className="notice">({modelItem.owned_by})</span> : null}
+                </label>
+              ))
+            )}
           </div>
         </div>
 
