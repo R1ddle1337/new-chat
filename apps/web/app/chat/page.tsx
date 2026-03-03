@@ -59,6 +59,13 @@ type MarkdownCodeProps = ComponentPropsWithoutRef<'code'> & {
   inline?: boolean;
 };
 
+function resolveMarkdownPlugin<T>(plugin: T): T {
+  return (plugin as unknown as { default?: T }).default ?? plugin;
+}
+
+const remarkMathPlugin = resolveMarkdownPlugin(remarkMath);
+const rehypeKatexPlugin = resolveMarkdownPlugin(rehypeKatex);
+
 const emojiOnlyTokenPattern =
   /(?:\p{Regional_Indicator}{2}|[#*0-9]\uFE0F?\u20E3|\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?(?:\p{Emoji_Modifier})?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?(?:\p{Emoji_Modifier})?)*)/gu;
 
@@ -157,8 +164,8 @@ const markdownComponents = {
 function MessageMarkdown({ content }: { content: string }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath]}
-      rehypePlugins={[rehypeKatex]}
+      remarkPlugins={[remarkGfm, remarkMathPlugin]}
+      rehypePlugins={[rehypeKatexPlugin]}
       components={markdownComponents}
     >
       {content}
@@ -1076,7 +1083,7 @@ export default function ChatPage() {
               Generating response
             </span>
           ) : (
-            'Enter to send, Shift+Enter for newline'
+            'Enter to send, Shift+Enter for newline. Math: $...$ inline, $$...$$ block.'
           )}
         </div>
 

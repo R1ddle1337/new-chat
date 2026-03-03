@@ -826,6 +826,17 @@ code {
   margin-top: 0.36rem;
 }
 
+.chat-message-content .katex {
+  color: inherit;
+}
+
+.chat-message-content .katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
 .chat-markdown-link {
   color: #0f766e;
   text-decoration: underline;
