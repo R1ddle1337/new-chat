@@ -843,6 +843,8 @@ code {
   padding: 0.2rem 1.2rem;
   display: flex;
   justify-content: flex-start;
+  content-visibility: auto;
+  contain-intrinsic-size: 200px;
 }
 
 .chat-message-row.assistant {

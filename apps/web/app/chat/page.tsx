@@ -77,6 +77,15 @@ type MarkdownFenceState = {
 
 type InlineMathState = 'none' | 'inline-dollar' | 'block-dollar' | 'inline-paren' | 'block-bracket';
 
+type SafeMarkdownScannerState = {
+  index: number;
+  safeBoundary: number;
+  atLineStart: boolean;
+  activeFence: { markerChar: '`' | '~'; markerLength: number } | null;
+  inlineCodeTickCount: number;
+  inlineMathState: InlineMathState;
+};
+
 const markdownFenceOpenPattern = /^( {0,3})(`{3,}|~{3,})([^\r\n]*)$/;
 
 const emojiOnlyTokenPattern =
@@ -250,13 +259,24 @@ function looksLikeInlineMathStart(input: string, index: number): boolean {
   return true;
 }
 
-function findLastSafeMarkdownBoundary(input: string): number {
-  let safeBoundary = 0;
-  let index = 0;
-  let atLineStart = true;
-  let activeFence: { markerChar: '`' | '~'; markerLength: number } | null = null;
-  let inlineCodeTickCount = 0;
-  let inlineMathState: InlineMathState = 'none';
+function createSafeMarkdownScannerState(): SafeMarkdownScannerState {
+  return {
+    index: 0,
+    safeBoundary: 0,
+    atLineStart: true,
+    activeFence: null,
+    inlineCodeTickCount: 0,
+    inlineMathState: 'none',
+  };
+}
+
+function scanMarkdownSafeBoundaryIncremental(input: string, state: SafeMarkdownScannerState): number {
+  let index = state.index;
+  let safeBoundary = state.safeBoundary;
+  let atLineStart = state.atLineStart;
+  let activeFence = state.activeFence;
+  let inlineCodeTickCount = state.inlineCodeTickCount;
+  let inlineMathState = state.inlineMathState;
 
   while (index < input.length) {
     if (atLineStart) {
@@ -417,6 +437,13 @@ function findLastSafeMarkdownBoundary(input: string): number {
     }
   }
 
+  state.index = index;
+  state.safeBoundary = safeBoundary;
+  state.atLineStart = atLineStart;
+  state.activeFence = activeFence;
+  state.inlineCodeTickCount = inlineCodeTickCount;
+  state.inlineMathState = inlineMathState;
+
   return safeBoundary;
 }
 
@@ -529,22 +556,68 @@ const ParsedMessageMarkdown = memo(function ParsedMessageMarkdown({ content }: {
 });
 
 function MessageMarkdown({ content, streaming = false }: { content: string; streaming?: boolean }) {
-  const normalizedContent = useMemo(() => normalizeMarkdownMath(content), [content]);
-  const normalizedContentRef = useRef(normalizedContent);
+  const normalizedContent = useMemo(
+    () => (streaming ? '' : normalizeMarkdownMath(content)),
+    [content, streaming],
+  );
+  const streamingSourceRef = useRef(content);
+  const scannerStateRef = useRef<SafeMarkdownScannerState>(createSafeMarkdownScannerState());
+  const normalizedPrefixCacheRef = useRef<{ rawPrefixLength: number; normalizedPrefix: string }>({
+    rawPrefixLength: 0,
+    normalizedPrefix: '',
+  });
   const splitFrameRef = useRef<number | null>(null);
   const lastSplitAtRef = useRef(0);
   const [renderablePrefix, setRenderablePrefix] = useState(() => normalizedContent);
   const [pendingSuffix, setPendingSuffix] = useState('');
 
+  const resetStreamingSplitState = useCallback(() => {
+    scannerStateRef.current = createSafeMarkdownScannerState();
+    normalizedPrefixCacheRef.current = {
+      rawPrefixLength: 0,
+      normalizedPrefix: '',
+    };
+  }, []);
+
   const runStreamingSplit = useCallback(() => {
-    const source = normalizedContentRef.current;
-    const boundary = findLastSafeMarkdownBoundary(source);
-    const nextPrefix = source.slice(0, boundary);
+    const source = streamingSourceRef.current;
+    if (source.length < scannerStateRef.current.index) {
+      resetStreamingSplitState();
+    }
+
+    const boundary = scanMarkdownSafeBoundaryIncremental(source, scannerStateRef.current);
+    const prefixCache = normalizedPrefixCacheRef.current;
+    let nextPrefix = prefixCache.normalizedPrefix;
+
+    if (boundary === 0) {
+      if (prefixCache.rawPrefixLength !== 0 || prefixCache.normalizedPrefix.length > 0) {
+        nextPrefix = '';
+        normalizedPrefixCacheRef.current = {
+          rawPrefixLength: 0,
+          normalizedPrefix: '',
+        };
+      }
+    } else if (boundary < prefixCache.rawPrefixLength) {
+      const safeRawPrefix = source.slice(0, boundary);
+      nextPrefix = normalizeMarkdownMath(safeRawPrefix);
+      normalizedPrefixCacheRef.current = {
+        rawPrefixLength: boundary,
+        normalizedPrefix: nextPrefix,
+      };
+    } else if (boundary > prefixCache.rawPrefixLength) {
+      const safeRawDelta = source.slice(prefixCache.rawPrefixLength, boundary);
+      nextPrefix = prefixCache.normalizedPrefix + normalizeMarkdownMath(safeRawDelta);
+      normalizedPrefixCacheRef.current = {
+        rawPrefixLength: boundary,
+        normalizedPrefix: nextPrefix,
+      };
+    }
+
     const nextSuffix = source.slice(boundary);
 
     setRenderablePrefix((previous) => (previous === nextPrefix ? previous : nextPrefix));
     setPendingSuffix((previous) => (previous === nextSuffix ? previous : nextSuffix));
-  }, []);
+  }, [resetStreamingSplitState]);
 
   const scheduleStreamingSplit = useCallback(() => {
     if (splitFrameRef.current !== null) {
@@ -567,14 +640,14 @@ function MessageMarkdown({ content, streaming = false }: { content: string; stre
   }, [runStreamingSplit]);
 
   useEffect(() => {
-    normalizedContentRef.current = normalizedContent;
+    streamingSourceRef.current = content;
     if (!streaming) {
       setRenderablePrefix((previous) => (previous === normalizedContent ? previous : normalizedContent));
       setPendingSuffix((previous) => (previous ? '' : previous));
       return;
     }
     scheduleStreamingSplit();
-  }, [normalizedContent, scheduleStreamingSplit, streaming]);
+  }, [content, normalizedContent, scheduleStreamingSplit, streaming]);
 
   useEffect(() => {
     if (!streaming) {
@@ -582,13 +655,15 @@ function MessageMarkdown({ content, streaming = false }: { content: string; stre
         window.cancelAnimationFrame(splitFrameRef.current);
         splitFrameRef.current = null;
       }
+      resetStreamingSplitState();
       return;
     }
 
+    resetStreamingSplitState();
     lastSplitAtRef.current = 0;
     runStreamingSplit();
     scheduleStreamingSplit();
-  }, [runStreamingSplit, scheduleStreamingSplit, streaming]);
+  }, [resetStreamingSplitState, runStreamingSplit, scheduleStreamingSplit, streaming]);
 
   useEffect(() => {
     return () => {
@@ -615,7 +690,8 @@ type ChatMessageRowProps = {
   message: MessageItem;
   isEntering: boolean;
   isStreaming: boolean;
-  onCopyAssistantMessage: (message: MessageItem) => void;
+  streamingContent: string | null;
+  onCopyAssistantMessage: (message: MessageItem, content: string) => void;
 };
 
 const ChatMessageRow = memo(
@@ -623,11 +699,14 @@ const ChatMessageRow = memo(
     message,
     isEntering,
     isStreaming,
+    streamingContent,
     onCopyAssistantMessage,
   }: ChatMessageRowProps) {
     const assistantMessage = message.role === 'assistant';
-    const showGenerating = assistantMessage && isStreaming && !message.content.trim();
-    const emojiOnly = !showGenerating && isEmojiOnlyMessage(message.content);
+    const renderedContent =
+      assistantMessage && isStreaming && streamingContent !== null ? streamingContent : message.content;
+    const showGenerating = assistantMessage && isStreaming && !renderedContent.trim();
+    const emojiOnly = !showGenerating && isEmojiOnlyMessage(renderedContent);
 
     return (
       <article
@@ -667,15 +746,15 @@ const ChatMessageRow = memo(
                 Generating...
               </div>
             ) : (
-              <MessageMarkdown content={message.content} streaming={isStreaming} />
+              <MessageMarkdown content={renderedContent} streaming={isStreaming} />
             )}
           </div>
 
-          {assistantMessage && message.content.trim() ? (
+          {assistantMessage && renderedContent.trim() ? (
             <button
               type="button"
               className="chat-copy-button"
-              onClick={() => onCopyAssistantMessage(message)}
+              onClick={() => onCopyAssistantMessage(message, renderedContent)}
             >
               Copy
             </button>
@@ -687,7 +766,9 @@ const ChatMessageRow = memo(
   (previous, next) =>
     previous.message === next.message &&
     previous.isEntering === next.isEntering &&
-    previous.isStreaming === next.isStreaming,
+    previous.isStreaming === next.isStreaming &&
+    previous.streamingContent === next.streamingContent &&
+    previous.onCopyAssistantMessage === next.onCopyAssistantMessage,
 );
 
 function findSseBoundary(input: string): { index: number; length: number } | null {
@@ -930,6 +1011,7 @@ export default function ChatPage() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [streamingAssistantId, setStreamingAssistantId] = useState<string | null>(null);
+  const [streamingAssistantContent, setStreamingAssistantContent] = useState('');
 
   const modelSelectionOptions = useMemo(() => {
     return allowedModels.map((entry) => ({
@@ -950,7 +1032,7 @@ export default function ChatPage() {
     !sending && Boolean(model.trim()) && (input.trim().length > 0 || Boolean(image));
   const composerActive = composerFocused || Boolean(input.trim()) || Boolean(image);
 
-  const pushToast = (kind: ToastKind, message: string) => {
+  const pushToast = useCallback((kind: ToastKind, message: string) => {
     const id = toastCounterRef.current + 1;
     toastCounterRef.current = id;
 
@@ -958,7 +1040,7 @@ export default function ChatPage() {
     setTimeout(() => {
       setToasts((previous) => previous.filter((toast) => toast.id !== id));
     }, 4500);
-  };
+  }, []);
 
   const setAttachedImage = useCallback((nextImage: File | null) => {
     setImage(nextImage);
@@ -1144,6 +1226,8 @@ export default function ChatPage() {
     seenMessageIdsRef.current = new Set();
     seededMessageIdsRef.current = false;
     setAnimatingMessageIds([]);
+    setStreamingAssistantId(null);
+    setStreamingAssistantContent('');
 
     if (!selectedThreadId) {
       setMessages([]);
@@ -1208,6 +1292,8 @@ export default function ChatPage() {
     return () => window.clearTimeout(timeoutId);
   }, [messages]);
 
+  const animatingMessageIdSet = useMemo(() => new Set(animatingMessageIds), [animatingMessageIds]);
+
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       if (shouldAutoScrollRef.current) {
@@ -1219,7 +1305,7 @@ export default function ChatPage() {
     });
 
     return () => window.cancelAnimationFrame(frame);
-  }, [messages, scrollToLatest, updateAutoScrollState]);
+  }, [messages, scrollToLatest, streamingAssistantContent, updateAutoScrollState]);
 
   useEffect(() => {
     adjustComposerHeight();
@@ -1233,14 +1319,24 @@ export default function ChatPage() {
     };
   }, [imagePreviewUrl]);
 
-  const copyAssistantMessage = async (message: MessageItem) => {
-    try {
-      await copyTextToClipboard(message.content);
-      pushToast('success', 'Copied response');
-    } catch {
-      pushToast('error', 'Failed to copy response');
-    }
-  };
+  const copyAssistantMessage = useCallback(
+    async (_message: MessageItem, content: string) => {
+      try {
+        await copyTextToClipboard(content);
+        pushToast('success', 'Copied response');
+      } catch {
+        pushToast('error', 'Failed to copy response');
+      }
+    },
+    [pushToast],
+  );
+
+  const handleCopyAssistantMessage = useCallback(
+    (message: MessageItem, content: string) => {
+      void copyAssistantMessage(message, content);
+    },
+    [copyAssistantMessage],
+  );
 
   const stopStreaming = () => {
     if (!activeAbortController) {
@@ -1344,6 +1440,7 @@ export default function ChatPage() {
       const optimisticAssistantId = makeLocalMessageId('local-assistant');
       optimisticMessageIds.push(optimisticUserId, optimisticAssistantId);
       setStreamingAssistantId(optimisticAssistantId);
+      setStreamingAssistantContent('');
 
       const optimisticAttachments: MessageAttachment[] = fileId
         ? [
@@ -1418,7 +1515,9 @@ export default function ChatPage() {
           }
           renderedAssistantText = assistantText;
           lastStreamFlushAt = Date.now();
-          updateMessageContent(optimisticAssistantId, renderedAssistantText);
+          setStreamingAssistantContent((previous) =>
+            previous === renderedAssistantText ? previous : renderedAssistantText,
+          );
         };
 
         const scheduleAssistantFlush = () => {
@@ -1466,7 +1565,9 @@ export default function ChatPage() {
           }
 
           flushAssistantContent(true);
-          updateMessageContent(optimisticAssistantId, assistantText || '[stream ended without text]');
+          const finalizedAssistantText = assistantText || '[stream ended without text]';
+          setStreamingAssistantContent(finalizedAssistantText);
+          updateMessageContent(optimisticAssistantId, finalizedAssistantText);
         } finally {
           if (streamFlushFrameId !== null) {
             window.cancelAnimationFrame(streamFlushFrameId);
@@ -1508,6 +1609,7 @@ export default function ChatPage() {
       setSending(false);
       setActiveAbortController(null);
       setStreamingAssistantId(null);
+      setStreamingAssistantContent('');
     }
   };
 
@@ -1698,8 +1800,9 @@ export default function ChatPage() {
               ) : null}
 
               {messages.map((message) => {
-                const isEntering = animatingMessageIds.includes(message.id);
+                const isEntering = animatingMessageIdSet.has(message.id);
                 const isStreaming = sending && message.id === streamingAssistantId;
+                const rowStreamingContent = isStreaming && streamResponses ? streamingAssistantContent : null;
 
                 return (
                   <ChatMessageRow
@@ -1707,9 +1810,8 @@ export default function ChatPage() {
                     message={message}
                     isEntering={isEntering}
                     isStreaming={isStreaming}
-                    onCopyAssistantMessage={(targetMessage) => {
-                      void copyAssistantMessage(targetMessage);
-                    }}
+                    streamingContent={rowStreamingContent}
+                    onCopyAssistantMessage={handleCopyAssistantMessage}
                   />
                 );
               })}
