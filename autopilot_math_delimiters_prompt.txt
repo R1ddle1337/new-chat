@@ -1,0 +1,20 @@
+You are Codex in /opt/new-chat. Improve math rendering robustness in chat.
+
+Problem:
+- Even after KaTeX plugin fix, models sometimes output LaTeX using \( \) and \[ \] delimiters (ChatGPT-style) or in ```math / ```latex fenced blocks; these are not rendered by current remark-math setup (which expects $ / $$).
+
+Tasks:
+1) In apps/web/app/chat/page.tsx, before passing content to ReactMarkdown, normalize math delimiters:
+   - Convert \( ... \) to $ ... $
+   - Convert \[ ... \] to $$ ... $$
+   - Do NOT touch content inside fenced code blocks (``` ... ```).
+   - Keep normal markdown behavior.
+
+2) Optional but helpful:
+   - If a fenced block is ```math or ```latex (or ```tex), render it as a KaTeX display block instead of code (or convert it to $$...$$), again without breaking other code blocks.
+
+3) Add a tiny note in composer status or settings about supported math delimiters: $...$, $$...$$, and also \(\), \[\] supported.
+
+Validation:
+- pnpm -r build
+- commit + push.

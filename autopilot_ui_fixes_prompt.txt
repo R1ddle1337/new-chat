@@ -1,0 +1,32 @@
+You are Codex in /opt/new-chat. Fix 3 UX issues:
+
+1) Desktop: Ctrl+V paste image into chat composer should attach image
+- In /chat composer, support pasting an image from clipboard (screenshots).
+- Implement onPaste handler on the textarea (and/or global paste listener when focused).
+- If clipboard contains image/* item, convert to File, set as current attachment, generate preview, do NOT break normal text paste.
+- Show the same preview UI as file picker; allow remove.
+
+2) Desktop animations missing
+- Add smooth transitions/animations (style B: 220–320ms, ease) for:
+  - sidebar collapse/expand
+  - mobile overlay fade
+  - thread menu popover open/close
+  - message entry (new messages) subtle fade/translate
+  - composer focus/active state
+- Respect prefers-reduced-motion: reduce.
+
+3) Mobile UI adaptation poor
+- Improve responsive layout:
+  - sidebar should be off-canvas overlay on small screens; main content full width.
+  - composer should stick to bottom with safe-area padding.
+  - message list should have correct height and scroll.
+  - ensure buttons/touch targets are comfortable.
+
+Constraints:
+- No heavy UI libraries.
+- Keep existing features working: streaming, stop, attachments, admin allowlist model selectors.
+
+Validation:
+- pnpm -r build
+- commit with clear messages
+- push to origin/main

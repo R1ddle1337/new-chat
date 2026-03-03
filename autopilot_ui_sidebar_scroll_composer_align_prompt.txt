@@ -1,0 +1,27 @@
+You are Codex in /opt/new-chat. Fix two UI issues:
+
+1) Desktop: when scrolling chat messages, the left sidebar (conversation list) also scrolls/moves.
+Goal: ChatGPT-like behavior:
+- Sidebar should remain fixed in place (no page-level scroll causing it to move).
+- Chat message list should be the scroll container.
+
+Implementation:
+- Ensure the overall app shell uses full viewport height (100dvh) and prevents body/document scroll.
+  - Set html, body { height: 100%; overflow: hidden; }
+  - Set .app-shell { height: 100dvh; } (not just min-height)
+  - Ensure .app-sidebar and .app-main use min-height:0 and internal scroll containers.
+- Ensure sidebar thread list remains independently scrollable.
+- Ensure settings/admin pages still scroll inside main area (page-stack) without moving sidebar.
+
+2) Composer: plus/attach button and placeholder not aligned
+- On desktop, the attach button (plus) vertical alignment looks off relative to textarea placeholder.
+- Adjust CSS so attach button aligns with the first line baseline of the textarea in idle state.
+- Keep multi-line expansion and send/stop buttons aligned properly.
+
+Constraints:
+- Keep mobile behavior intact.
+- No heavy dependencies.
+
+Validation:
+- pnpm -r build
+- commit + push.

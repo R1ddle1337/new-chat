@@ -1,0 +1,47 @@
+You are Codex in /opt/new-chat. Goal: make the web UI layout look and feel as close as possible to ChatGPT web (layout/spacing/components), while keeping the existing features working (admin allowlist, streaming chat, attachments, threads CRUD).
+
+Constraints:
+- No heavy UI frameworks. Pure CSS + small reusable components.
+- Do not copy proprietary assets. Just mimic layout patterns.
+- Keep security model unchanged.
+- Run pnpm -r build, commit, push.
+
+Target UX (ChatGPT-like):
+1) App shell
+- Remove the current topbar look; replace with a two-column app layout:
+  - Left sidebar: conversations list, New chat button, settings/admin links bottom.
+  - Main panel: chat header at top (thread title + model selector), message list center, composer fixed bottom.
+- Responsive: on small screens, sidebar collapsible (hamburger button). Preserve usability.
+
+2) Sidebar
+- ChatGPT-like: New chat at top, conversation rows with title + kebab actions (rename/delete).
+- Selected conversation highlighted.
+- Add collapse button.
+
+3) Main chat area
+- Messages: full-width rows, centered content with max width (e.g. 720-800px). Similar spacing.
+- Assistant/user: subtle background alternation, role label hidden or minimal.
+- Markdown rendering for assistant (already added in earlier polish? ensure it remains) with code block styling.
+- Attachments render as thumbnail row within message.
+
+4) Composer
+- ChatGPT-like rounded composer bar.
+- Left: attachment button, center: textarea autosize-ish (simple), right: send button.
+- Enter to send, Shift+Enter newline (keep).
+- During streaming: show generating indicator + Stop button.
+
+5) Settings/Admin pages
+- Keep as separate routes but make them fit the same shell layout (sidebar still visible).
+- Admin link only visible for admin.
+
+Implementation notes:
+- Create web components under apps/web/app/components:
+  - AppShell (layout), Sidebar, MainHeader, etc.
+- Refactor pages to use AppShell.
+- Update globals.css (and maybe split into module CSS if needed).
+
+Acceptance:
+- /chat works: create thread, select, stream response, stop, attachments, rename/delete.
+- /settings works with model allowlist selector.
+- /admin works and is hidden for non-admin.
+- No layout regressions.

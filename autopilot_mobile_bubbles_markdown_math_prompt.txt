@@ -1,0 +1,28 @@
+You are Codex in /opt/new-chat. Fix two UX issues:
+
+1) Mobile: assistant-left / user-right bubbles not working reliably
+- On some mobile browsers, the user bubble still appears left-aligned.
+- Make the alignment robust across mobile Safari/Android WebView:
+  - Ensure .chat-message-row uses flex and keeps justify-content.
+  - Ensure .chat-message-inner is inline-block/auto width (avoid fit-content quirks).
+  - Add explicit margin auto rules:
+      .chat-message-row.user .chat-message-inner { margin-left: auto; }
+      .chat-message-row.assistant .chat-message-inner { margin-right: auto; }
+  - Verify in CSS @media blocks you do not override alignment.
+
+2) Add real Markdown + formula support
+- Replace the current custom markdown renderer in apps/web/app/chat/page.tsx with a robust markdown pipeline:
+  - react-markdown
+  - remark-gfm
+  - remark-math
+  - rehype-katex
+  - katex CSS included globally (import in apps/web/app/layout.tsx or globals).
+- Support inline $...$ and block $$...$$ formulas.
+- Ensure code blocks still render nicely and do not break user/assistant bubble colors.
+- Ensure links open safely (target _blank, rel=noreferrer).
+- Keep dependencies minimal and stable.
+
+Validation:
+- pnpm --filter @new-chat/web add needed deps
+- pnpm -r build
+- Commit + push origin/main

@@ -1,0 +1,28 @@
+You are Codex in /opt/new-chat. Implement performance improvements (in this order) while preserving current ChatGPT-like behavior: incremental streaming markdown+math rendering.
+
+GOALS
+- Keep incremental markdown/math rendering during streaming (formulas render when complete).
+- Reduce lag during streaming and scrolling.
+
+PHASE 1: Make safe-prefix scanning incremental (high impact)
+Current approach likely scans the whole string each tick to find safe boundary. Replace with an incremental scanner:
+- Maintain a small state machine in refs: insideFence (```), insideInlineCode (`), insideMathInline ($), insideMathBlock ($$), etc.
+- When new delta arrives, scan ONLY the appended substring to update state and advance lastSafeIndex.
+- Keep delimiter normalization (\(\)/\[\] etc) consistent: do normalization on the delta before scanning, or incorporate into scanner.
+- Ensure escaped delimiters (\\$) do not toggle math.
+
+PHASE 2: Memoize message list; only streaming message updates
+- Ensure only the last/streaming assistant message re-renders frequently.
+- Wrap message row components with React.memo and pass stable props.
+- Avoid rebuilding the entire messages array on each delta; keep streaming content in separate state.
+
+PHASE 3: Long chat scroll optimization
+- Add CSS: content-visibility and contain-intrinsic-size for message rows.
+  Example:
+    .chat-message-row { content-visibility: auto; contain-intrinsic-size: 200px; }
+- Ensure this does not break 'jump to latest' button logic.
+
+VALIDATION
+- pnpm -r build
+- Commit with message like: "perf(web): incremental streaming render + memoized messages + content-visibility"
+- Push to origin/main (if push fails due to env DNS, stop after commit).

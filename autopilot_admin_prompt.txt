@@ -1,0 +1,39 @@
+You are Codex in /opt/new-chat. Implement two new requirements:
+
+REQ1) API request URL should be customizable
+- Interpret this as: Admin can configure upstream provider base_url(s) (OpenAI official, grok2api, etc.) via an admin UI.
+- Store provider base_url in DB (providers table already has base_url). Add admin endpoints/UI to update it safely.
+- Ensure the gateway uses DB base_url at request time.
+
+REQ2) Admin page + users can only use models provided by admin
+- Add admin concept: users table gets is_admin boolean.
+- Bootstrap admin securely: require env ADMIN_EMAIL. Only that email can access admin; if unset, admin endpoints return 403 and web hides admin nav.
+- Add DB table allowed_models (or admin_models) with fields: id, provider_id, model_id, display_name(optional), enabled, created_at.
+- Gateway:
+  - /v1/models must return only enabled allowed_models (OpenAI list shape), include provider in each entry.
+  - /v1/responses and /v1/chat/completions must validate requested provider+model against allowed_models. If model not allowed -> 400 with clear error.
+  - /me/provider (set defaults) must also validate defaults.
+- Add admin endpoints (auth+admin required):
+  - GET /admin/providers
+  - PATCH /admin/providers/:providerCode { base_url, enabled }
+  - GET /admin/models
+  - POST /admin/models { provider, model_id, display_name?, enabled }
+  - PATCH /admin/models/:id { display_name?, enabled }
+  - DELETE /admin/models/:id
+- Web:
+  - Add /admin page (server component ok, or client) to manage providers and allowed models.
+  - Update /settings and /chat to use select dropdowns populated from allowed models (no free-text model input for normal users).
+  - Add navigation link to /admin only when current user is admin.
+
+Migrations:
+- Add migration SQL files in apps/gateway/migrations:
+  - add users.is_admin boolean default false
+  - create allowed_models table
+  - (optional) add providers.enabled boolean default true if not present
+  - seed: insert default providers if missing (openai, grok2api)
+
+Guardrails:
+- Keep cookie session model and strict Origin check.
+- Keep dependencies minimal.
+- Run pnpm -r build.
+- Commit logically and push to origin/main.

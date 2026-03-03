@@ -1,0 +1,51 @@
+You are Codex in /opt/new-chat. Task: polish the web UI to feel closer to OpenAI web (UX + visual), while keeping dependencies light and not breaking existing functionality.
+
+Current state:
+- apps/web/app/chat/page.tsx implements streaming SSE parsing, thread rename, image attachment preview.
+- Gateway already supports thread APIs and file content endpoint.
+
+Deliverables (implement in order):
+
+A) Chat UX polish (most important)
+1) Message rendering
+- Render assistant/user messages with better layout: bubbles, spacing, readable typography.
+- Replace plain text rendering with basic Markdown support (GFM tables not required). Support:
+  - paragraphs/line breaks
+  - inline code and fenced code blocks
+  - links
+- Add a Copy button for assistant messages (copies raw text content).
+
+2) Auto-scroll behavior
+- Only auto-scroll when user is already near bottom.
+- When user scrolls up, stop auto-scroll and show a floating "Jump to latest" button.
+- During streaming, keep updating content but do not force scroll if user scrolled away.
+
+3) Composer behavior
+- Enter to send, Shift+Enter for newline.
+- Disable send when empty; keep Stop working.
+- Show a small streaming indicator while generating.
+
+B) Threads sidebar polish
+4) New chat should create a thread explicitly
+- Add gateway endpoint: POST /me/threads -> creates a thread with title "New chat" and returns it.
+- Update UI New chat button to call this, select the new thread immediately.
+
+5) Thread management
+- Add delete thread:
+  - Gateway: DELETE /me/threads/:threadId (soft delete ok)
+  - UI: trash icon/button per thread with confirm.
+
+C) Attachment polish
+6) Attachments display
+- In message bubbles, display attachments as a small grid of thumbnails with hover.
+- Keep preview before send.
+
+Constraints / guardrails
+- Keep security model: cookie session, same-origin.
+- Keep existing routes compatible.
+- Keep deps minimal; if you add markdown libs, choose a small, common combo (e.g. react-markdown + remark-gfm) and ensure build passes.
+
+Validation
+- Run pnpm -r build.
+- Commit logically with clear messages.
+- Attempt to push to origin/main. If push fails due to environment restrictions, stop after committing and report that push failed.

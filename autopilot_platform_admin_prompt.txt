@@ -1,0 +1,48 @@
+You are Codex in /opt/new-chat. Major product change: switch from BYOK-per-user to platform-hosted providers + model catalog.
+
+Requirements:
+- Providers: support BOTH OpenAI and grok2api.
+- Ordinary users must NOT see or set API keys, provider endpoints, or admin backend.
+- Ordinary users can only choose among models published by admin (display_name). They can switch between them.
+- Chat history remains per-user isolated.
+- Rate limiting must be per-user, and BOTH RPM and TPM must be configurable by admin only.
+
+Design/Implementation:
+A) Data model changes (migrations)
+- Keep providers table (code, base_url, enabled).
+- Add provider_secrets table (provider_id, encrypted_api_key, iv, tag, key_version, updated_at).
+- Add models table (provider_id, model_id, public_id unique, display_name, enabled, created_at).
+- Add settings table for rate limits (key/value or explicit columns): rpm_limit, tpm_limit. Admin-editable.
+- Deprecate/disable user_provider_keys for normal users (can keep table but routes/UI must not expose).
+
+B) Auth/admin
+- Admin gating should rely on users.is_admin (allow multiple admins). ADMIN_EMAIL env is bootstrap only (optional): on login/register, if email matches ADMIN_EMAIL, set is_admin=true.
+- For non-admin hitting /admin routes: return 404.
+
+C) Gateway behavior
+- /v1/models returns only enabled models (public_id + display_name). Do NOT reveal provider/base_url/model_id.
+- /v1/responses and /v1/chat/completions accept model=public_id ONLY.
+  - Validate model exists+enabled.
+  - Resolve provider/base_url/secret server-side.
+- Admin endpoints:
+  - PUT /admin/providers/:id/base_url
+  - PUT /admin/providers/:id/secret (write-only)
+  - POST /admin/models/import (fetch upstream /models using provider secret)
+  - POST /admin/models/bulk (add selected models with display_name defaults)
+  - PATCH /admin/models/:id enable/disable/display_name
+  - PUT /admin/rate-limits (set rpm/tpm)
+- Rate limiting:
+  - Implement per-user RPM from admin setting.
+  - Implement per-user TPM: estimate tokens by (a) request input length heuristic + (b) response usage if returned; maintain rolling window counters in Redis.
+  - Admin can change limits without redeploy (stored in DB, cache briefly).
+
+D) Web UI
+- Remove /settings key management for ordinary users.
+- /settings for users: choose default model among allowed models.
+- /admin for admins: manage providers base_url + set secrets + import models + manage model catalog + rate limits.
+- Ensure /admin link not visible to non-admin.
+
+Validation:
+- pnpm -r build
+- docker compose build passes
+- commit and push.

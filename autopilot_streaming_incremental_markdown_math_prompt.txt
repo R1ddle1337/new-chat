@@ -1,0 +1,36 @@
+You are Codex in /opt/new-chat. Improve streaming render to match ChatGPT behavior: during streaming, completed Markdown and completed math formulas should render immediately, without waiting for full message completion, while keeping UI smooth.
+
+Current issue:
+- Rendering feels laggy because we re-render and re-parse full Markdown+KaTeX on every tiny delta.
+
+Target behavior:
+- As soon as a math block is syntactically complete (e.g. closing $...$, $$...$$, \(\), \[\]), it should render.
+- Same for Markdown constructs like completed code fences and paragraphs.
+- Incomplete trailing content can remain plain text until it becomes 'safe' to render.
+
+Implementation approach (recommended): Progressive split
+1) Keep full streaming text in a ref.
+2) On a throttled schedule (e.g. rAF + min interval 50-80ms), compute a split:
+   - renderablePrefix: longest prefix that is 'safe' (not inside an open code fence, not inside inline code, not inside unclosed math delimiter).
+   - pendingSuffix: the rest (possibly incomplete).
+3) Render:
+   - renderablePrefix with ReactMarkdown + remark-gfm + remark-math + rehype-katex (and our delimiter normalization step).
+   - pendingSuffix as a simple <span> with white-space: pre-wrap (no markdown parse), appended after prefix.
+4) Only re-run ReactMarkdown when renderablePrefix changes. pendingSuffix can update frequently.
+
+Details:
+- Reuse/extend existing normalizeMarkdownMath() but ensure it runs before splitting.
+- Implement a small scanner to find the last safe boundary:
+  - handle ``` fenced code blocks
+  - handle inline code `...`
+  - handle $$...$$ blocks and $...$ inline math (avoid confusing $$ with $)
+  - treat escaped delimiters \$ as not opening/closing
+- Keep existing emoji-only detection and other markdown components.
+
+Other performance fixes:
+- Throttle state updates for streaming (avoid setState per chunk).
+- Ensure only the last streaming message component re-renders; wrap message rows with React.memo where appropriate.
+
+Validation:
+- pnpm -r build
+- commit and push.

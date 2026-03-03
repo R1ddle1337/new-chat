@@ -1,0 +1,54 @@
+You are Codex in /opt/new-chat. Implement two urgent items to make the project stable and "out of the box" usable.
+
+ITEM 1 (BUGFIX - must fix): /v1/responses sometimes returns 500 due to Postgres JSON error
+- Observed error: DatabaseError "invalid input syntax for type json" in persistMessage when writing messages.raw_content.
+- Root cause: raw_content column is json/jsonb; code sometimes passes an invalid JSON string (double-encoded or unescaped quotes).
+
+Fix requirements:
+- Ensure persistMessage ALWAYS stores valid JSON in raw_content, or NULL.
+- Do NOT allow raw_content insertion to crash the request.
+- Approach recommendation:
+  - Normalize raw_content before DB insert:
+    - if value is undefined -> null
+    - if value is a string:
+        - try JSON.parse; if parses, store parsed object; else store { type:'string', value:<string> }
+    - else store the object as-is
+    - JSON.stringify with bigint-safe replacer; if stringify fails, store { type:'unserializable', note:'...'}
+  - In SQL, pass a JSON string and cast: $5::jsonb (or use to_jsonb)
+  - Keep size guard (e.g. if JSON string > 200KB, store {type:'truncated', ...} or null).
+- Add a small unit-ish smoke test (or at least run pnpm -r build) to ensure no TS errors.
+
+ITEM 2 (FEATURE): Admin can import upstream models + one-click add to allowlist
+Goal: Admin can configure provider base_url + then fetch upstream /models and add selected ones into allowed_models.
+
+Backend (gateway):
+- Add admin-only endpoint:
+  GET /admin/providers/:providerCode/upstream-models
+  - Requires admin
+  - Uses provider base_url from DB.
+  - Uses the ADMIN user's BYOK key for that provider (from user_provider_keys). If missing -> 400 with clear message.
+  - Calls `${base_url}/models` (base_url already includes /v1 typically).
+  - Returns normalized list: [{ id, owned_by?, raw? }]
+  - Handle errors from upstream gracefully.
+
+- Add admin-only bulk add endpoint (optional but recommended):
+  POST /admin/models/bulk
+  body: { provider: string, model_ids: string[], enabled?: boolean }
+  - inserts any missing (ignore conflicts) and returns created count.
+
+Frontend (web /admin):
+- In /admin page add a section:
+  - select provider
+  - button "Fetch upstream models"
+  - show list with search/filter + checkboxes
+  - button "Add selected to allowlist" (calls bulk endpoint)
+  - show status/error
+
+Other:
+- Keep current restriction: normal users can only select allowlisted models.
+- Ensure /settings and /chat remain functional.
+
+Finish:
+- Run pnpm -r build.
+- Commit with clear messages (1 for bugfix, 1 for feature ok).
+- Push to origin/main (if push fails due environment restrictions, stop after commit and report).

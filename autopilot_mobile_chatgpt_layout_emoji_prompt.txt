@@ -1,0 +1,27 @@
+You are Codex in /opt/new-chat. Improve mobile UI to match ChatGPT web mobile feel and ensure emoji rendering is excellent.
+
+Issues:
+1) Mobile UI layout currently looks off (see screenshots). Goal: as close as possible to ChatGPT mobile web.
+2) Output should display emojis correctly and pleasantly (no tofu, color emoji fonts, good sizing).
+
+Tasks:
+A) Mobile layout (<=980px / <=760px)
+- Make main header compact like ChatGPT: hamburger on left, title centered/left, controls not wrapping awkwardly.
+- Ensure chat area uses full width with comfortable padding; avoid oversized centered max-width padding that wastes space.
+- Ensure message list and composer do not overlap; proper bottom safe-area padding.
+- Ensure home state (center composer card) looks good on mobile: not too tall, aligned near top like ChatGPT.
+- Ensure sidebar behaves like ChatGPT: hidden by default on mobile, opens as drawer with overlay; close on navigation.
+- Remove any horizontal overflow.
+
+B) Emoji rendering
+- Update global font stack to include emoji fonts early: Apple Color Emoji, Segoe UI Emoji, Segoe UI Symbol, Noto Color Emoji, Twemoji Mozilla.
+- Ensure markdown rendering does not break emoji.
+- Add small UX polish: if a message is emoji-only (e.g. consists of only emoji + whitespace), render it slightly larger like ChatGPT.
+
+Constraints:
+- Keep existing features: streaming, stop, attachments, admin console, markdown+math.
+- No heavy UI libs.
+
+Validation:
+- pnpm -r build
+- commit and push.

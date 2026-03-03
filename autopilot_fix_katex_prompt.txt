@@ -1,0 +1,23 @@
+You are Codex in /opt/new-chat. Fix broken math formula rendering in chat for both desktop and mobile.
+
+Symptoms:
+- $...$ and $$...$$ are shown as raw text; KaTeX not rendering.
+- Occurs on desktop and Android Chrome.
+
+Likely cause:
+- remark-math and rehype-katex are ESM default exports; current imports may yield objects with {default} and ReactMarkdown plugins are not executed.
+
+Tasks:
+1) In apps/web/app/chat/page.tsx, ensure remarkPlugins/rehypePlugins receive actual functions:
+   - Use something like:
+     const remarkMathPlugin = (remarkMath as any).default ?? remarkMath;
+     const rehypeKatexPlugin = (rehypeKatex as any).default ?? rehypeKatex;
+     then pass those.
+2) Add minimal CSS so KaTeX output is readable in both assistant and user bubbles:
+   - Ensure .katex inherits color in user bubble (no invisible text).
+   - Ensure block math doesn't overflow on mobile (overflow-x auto).
+3) Add a short note in UI/help tooltip or README about supported delimiters: $...$ and $$...$$.
+
+Validation:
+- pnpm -r build
+- commit + push.

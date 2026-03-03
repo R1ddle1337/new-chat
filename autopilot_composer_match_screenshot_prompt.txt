@@ -1,0 +1,28 @@
+Goal: Update new-chat (nchat) chat composer / input box UI to match the provided reference screenshot style, consistently on BOTH desktop and mobile.
+
+Context:
+- Reference screenshot is available at /root/.openclaw/media/inbound/file_35---ee682d27-f443-4a5e-a310-ce54ffeb8834.jpg (you may not be able to view it; implement based on description).
+
+Requirements / acceptance criteria:
+1) Visual style
+- The composer container is a rounded pill / rounded-rectangle with a light gray background (not plain white textarea with border).
+- Multiline textarea inside with comfortable padding (iOS/ChatGPT-like spacing).
+- Placeholder text EXACTLY: "ask anything" (lowercase).
+- Typography: placeholder and input text should use the same font stack as the rest of the UI; size/line-height/weight should match the screenshot feel; placeholder is lighter gray.
+- Attach / send / stop buttons align cleanly inside the same pill; no vertical jitter between desktop & mobile.
+- Focus/hover states polished (subtle border/shadow ok) and MUST NOT cause layout shifts.
+
+2) Behavior
+- Preserve existing functionality: paste image, attachments, send/stop, streaming, keyboard shortcuts, mobile safe-area, etc.
+- Only change structure/styles as needed.
+
+Implementation steps
+- Locate the composer component(s) used by both desktop and mobile layouts.
+- Adjust component structure if needed so the pill background wraps textarea + buttons.
+- Update CSS/Tailwind/CSS module styles accordingly.
+
+Validation
+- Run the project’s usual frontend build (and lint if available) and report results.
+
+Deliverable
+- Provide a concise summary: files changed + what changed + commands run.

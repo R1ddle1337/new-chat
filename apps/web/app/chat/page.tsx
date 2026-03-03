@@ -1702,7 +1702,11 @@ export default function ChatPage() {
           aria-label="Attach image"
           title="Attach image"
         >
-          +
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 5v14" />
+            <path d="M5 12h14" />
+          </svg>
+          <span className="sr-only">Attach image</span>
         </button>
 
         <textarea
@@ -1720,24 +1724,39 @@ export default function ChatPage() {
               }
             }
           }}
-          placeholder="Message new-chat"
+          placeholder="ask anything"
           disabled={sending}
         />
 
-        {sending ? (
-          <button
-            className="chat-stop-button"
-            type="button"
-            disabled={!activeAbortController}
-            onClick={stopStreaming}
-          >
-            Stop
-          </button>
-        ) : (
-          <button className="chat-send-button" type="submit" disabled={!canSend}>
-            Send
-          </button>
-        )}
+        <div className="chat-composer-action-group">
+          {sending ? (
+            <button
+              className="chat-stop-button"
+              type="button"
+              disabled={!activeAbortController}
+              onClick={stopStreaming}
+              aria-label="Stop generation"
+              title="Stop generation"
+            >
+              <span className="chat-stop-icon" aria-hidden="true" />
+              <span className="sr-only">Stop generation</span>
+            </button>
+          ) : (
+            <button
+              className="chat-send-button"
+              type="submit"
+              disabled={!canSend}
+              aria-label="Send message"
+              title="Send message"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 17V7" />
+                <path d="m7 12 5-5 5 5" />
+              </svg>
+              <span className="sr-only">Send message</span>
+            </button>
+          )}
+        </div>
       </form>
 
       <div className="chat-composer-status">

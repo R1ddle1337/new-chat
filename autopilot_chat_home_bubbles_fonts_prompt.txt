@@ -1,0 +1,23 @@
+You are Codex in /opt/new-chat. Implement 3 UI improvements (ChatGPT-like) while keeping sidebar visible (option A).
+
+1) Chat home state with centered composer
+- On /chat, when there is no selected thread OR selected thread has 0 messages, show a home/welcome layout:
+  - keep sidebar visible
+  - main area shows centered composer card (like ChatGPT home)
+  - after sending first message, transition to conversation view.
+
+2) Message alignment
+- Render assistant messages left-aligned.
+- Render user messages right-aligned with distinct bubble styling.
+- Keep max width container.
+
+3) Fonts
+- Replace current font experience with a robust system font stack suitable for Chinese/English:
+  - include Microsoft YaHei, PingFang SC, Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Micro Hei, Segoe UI, etc.
+- Avoid relying on remote Google fonts for core readability; ensure no tofu squares.
+
+Also:
+- Keep animations from previous work.
+- Update CSS accordingly.
+- Validate: pnpm -r build
+- Commit and push.

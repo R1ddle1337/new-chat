@@ -1,0 +1,42 @@
+You are Codex in /opt/new-chat. Add admin user management features.
+
+Requirements:
+- Admin console should include user management: list users, search, permanently ban/unban, and per-user rate limit overrides.
+- Columns needed in UI: email, status(active/banned), created_at, last_login_at, last_login_ip, effective rpm/tpm (default vs override).
+- Non-admins must not see admin UI and /admin routes must still return 404.
+
+Backend (apps/gateway):
+1) DB migrations:
+- Add users.status text not null default 'active' (or boolean banned) and optional banned_at.
+- Add users.last_login_at timestamptz null, users.last_login_ip inet/text null.
+- Create user_limits table: user_id PK/FK -> users(id), rpm_limit int null, tpm_limit int null, updated_at.
+
+2) Auth changes:
+- On successful login/register, update users.last_login_at and users.last_login_ip from getClientIp(request).
+- If user.status != 'active' then:
+  - deny login (403 'Account banned') OR allow login but block API. Prefer: block all authenticated routes with 403 and force logout.
+
+3) Rate limiting:
+- Current global settings in settings(id=1) rpm_limit/tpm_limit.
+- Implement per-user override: when enforcing RPM/TPM, load user_limits for user_id; if value is not null use it else use global.
+- Expose in /admin/users list the effective limits.
+
+4) Admin endpoints (admin-only):
+- GET /admin/users?query=...
+  Returns list with: id,email,status,created_at,last_login_at,last_login_ip, rpm_override,tpm_override, rpm_effective,tpm_effective
+- PATCH /admin/users/:id
+  Body: { status: 'active'|'banned' }
+- PUT /admin/users/:id/limits
+  Body: { rpm_limit: number|null, tpm_limit: number|null }
+- Ensure audit events are written for admin actions.
+
+Frontend (apps/web):
+- Extend /admin page with a new 'Users' section:
+  - search input
+  - table with the columns above
+  - actions: Ban/Unban, Set limits (inline inputs) + Save, Clear override.
+  - show effective vs override.
+
+Validation:
+- pnpm -r build
+- commit + push origin/main.
