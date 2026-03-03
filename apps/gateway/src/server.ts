@@ -83,6 +83,11 @@ type UpstreamModelItem = {
   raw?: Record<string, unknown>;
 };
 
+type ThreadContextMessage = {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+};
+
 declare module 'fastify' {
   interface FastifyRequest {
     authUser?: DbUser;
@@ -162,6 +167,8 @@ const RATE_LIMIT_WINDOW_SECONDS = 60;
 const TPM_WINDOW_MS = RATE_LIMIT_WINDOW_SECONDS * 1000;
 const TPM_COUNTER_TTL_SECONDS = RATE_LIMIT_WINDOW_SECONDS * 3;
 const RATE_LIMIT_SETTINGS_CACHE_TTL_MS = 5000;
+const THREAD_CONTEXT_MAX_MESSAGES = 30;
+const THREAD_CONTEXT_MAX_TOKENS = 8000;
 
 let rateLimitSettingsCache:
   | {
@@ -1327,6 +1334,127 @@ async function getOrCreateThread(params: {
     [params.userId, 'New chat', params.providerId, params.model ?? null],
   );
   return result.rows[0]!.id;
+}
+
+function normalizeStoredThreadRole(value: string): ThreadContextMessage['role'] | null {
+  if (value === 'user' || value === 'assistant' || value === 'system') {
+    return value;
+  }
+  return null;
+}
+
+async function loadRecentThreadContextMessages(params: {
+  threadId: string;
+  userId: string;
+  maxMessages?: number;
+  maxTokens?: number;
+}): Promise<{ messages: ThreadContextMessage[]; tokenEstimate: number }> {
+  const maxMessages = params.maxMessages ?? THREAD_CONTEXT_MAX_MESSAGES;
+  const maxTokens = params.maxTokens ?? THREAD_CONTEXT_MAX_TOKENS;
+
+  if (maxMessages <= 0 || maxTokens <= 0) {
+    return { messages: [], tokenEstimate: 0 };
+  }
+
+  const result = await pool.query<{
+    id: string;
+    role: string;
+    content: string;
+    created_at: string;
+  }>(
+    `SELECT id, role, content, created_at
+     FROM messages
+     WHERE thread_id = $1
+       AND user_id = $2
+     ORDER BY created_at DESC, id DESC
+     LIMIT $3`,
+    [params.threadId, params.userId, maxMessages],
+  );
+
+  const selectedDescending: ThreadContextMessage[] = [];
+  let tokenEstimate = 0;
+
+  for (const row of result.rows) {
+    const normalizedRole = normalizeStoredThreadRole(row.role);
+    if (!normalizedRole) {
+      continue;
+    }
+
+    if (!row.content.trim()) {
+      continue;
+    }
+
+    const rowTokens = estimateTokensFromText(row.content);
+    if (rowTokens <= 0) {
+      continue;
+    }
+
+    if (tokenEstimate + rowTokens > maxTokens) {
+      break;
+    }
+
+    selectedDescending.push({
+      role: normalizedRole,
+      content: row.content,
+    });
+    tokenEstimate += rowTokens;
+  }
+
+  return {
+    messages: selectedDescending.reverse(),
+    tokenEstimate,
+  };
+}
+
+function buildResponsesHistoryInputFromThreadMessages(messages: ThreadContextMessage[]): unknown[] {
+  const input: unknown[] = [];
+
+  for (const message of messages) {
+    if (message.role !== 'user' && message.role !== 'assistant') {
+      continue;
+    }
+
+    input.push({
+      role: message.role,
+      content: [{ type: 'input_text', text: message.content }],
+    });
+  }
+
+  return input;
+}
+
+function buildChatHistoryMessagesFromThreadMessages(messages: ThreadContextMessage[]): unknown[] {
+  const historyMessages: unknown[] = [];
+
+  for (const message of messages) {
+    historyMessages.push({
+      role: message.role,
+      content: message.content,
+    });
+  }
+
+  return historyMessages;
+}
+
+function normalizeResponsesInputForPrepend(input: unknown): unknown[] {
+  if (Array.isArray(input)) {
+    return [...input];
+  }
+
+  if (typeof input === 'string') {
+    return [
+      {
+        role: 'user',
+        content: [{ type: 'input_text', text: input }],
+      },
+    ];
+  }
+
+  if (typeof input === 'undefined' || input === null) {
+    return [];
+  }
+
+  return [input];
 }
 
 async function persistMessage(params: {
@@ -2822,7 +2950,8 @@ async function setupServer(): Promise<void> {
       return;
     }
 
-    const inputTokenEstimate = estimateTokensFromUnknown(requestBody.input);
+    const currentInput = requestBody.input;
+    const inputTokenEstimate = estimateTokensFromUnknown(currentInput);
     const effectiveRateLimits =
       request.effectiveRateLimits ?? (await loadEffectiveRateLimitsForUser(user.id));
     const tpmReservation = await reserveTpmUsage({
@@ -2837,9 +2966,8 @@ async function setupServer(): Promise<void> {
 
     requestBody.model = selectedModel.model_id;
 
-    requestBody.input = await hydrateResponsesInput(requestBody.input, user.id);
-
-    const userPrompt = extractTextFromResponsesInput(requestBody.input);
+    const hydratedCurrentInput = await hydrateResponsesInput(currentInput, user.id);
+    const userPrompt = extractTextFromResponsesInput(hydratedCurrentInput);
     const effectiveModel = selectedModel.public_id;
 
     const targetThreadId = await getOrCreateThread({
@@ -2849,12 +2977,36 @@ async function setupServer(): Promise<void> {
       model: effectiveModel,
     });
 
+    const threadContext = await loadRecentThreadContextMessages({
+      threadId: targetThreadId,
+      userId: user.id,
+    });
+    const responseHistoryInput = buildResponsesHistoryInputFromThreadMessages(threadContext.messages);
+    const contextMessagesUsed = responseHistoryInput.length;
+
+    requestBody.input =
+      contextMessagesUsed > 0
+        ? [...responseHistoryInput, ...normalizeResponsesInputForPrepend(hydratedCurrentInput)]
+        : hydratedCurrentInput;
+    reply.header('X-Context-Messages-Used', String(contextMessagesUsed));
+
+    app.log.debug(
+      {
+        endpoint: '/responses',
+        userId: user.id,
+        threadId: targetThreadId,
+        historyItemsUsed: contextMessagesUsed,
+        historyTokensEstimate: threadContext.tokenEstimate,
+      },
+      'Injected thread context into upstream request',
+    );
+
     await persistMessage({
       threadId: targetThreadId,
       userId: user.id,
       role: 'user',
       content: userPrompt || '[non-text input]',
-      rawContent: requestBody.input,
+      rawContent: hydratedCurrentInput,
     });
 
     await maybeAutoRenameThread({
@@ -2875,6 +3027,8 @@ async function setupServer(): Promise<void> {
         provider: selectedModel.provider_code,
         stream,
         has_model: Boolean(effectiveModel),
+        history_items_used: contextMessagesUsed,
+        history_tokens_estimate: threadContext.tokenEstimate,
       },
     });
 
@@ -2926,6 +3080,7 @@ async function setupServer(): Promise<void> {
         'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
         'X-Thread-Id': targetThreadId,
+        'X-Context-Messages-Used': String(contextMessagesUsed),
       });
 
       let parserBuffer = '';
@@ -2998,7 +3153,9 @@ async function setupServer(): Promise<void> {
       await addTpmUsageEvent(user.id, estimateTokensFromText(assistantText));
     }
 
-    reply.header('X-Thread-Id', targetThreadId).send(payload);
+    reply.header('X-Thread-Id', targetThreadId);
+    reply.header('X-Context-Messages-Used', String(contextMessagesUsed));
+    reply.send(payload);
   });
 
   app.post('/v1/chat/completions', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
@@ -3039,7 +3196,8 @@ async function setupServer(): Promise<void> {
       return;
     }
 
-    const inputTokenEstimate = estimateTokensFromUnknown(requestBody.messages);
+    const currentMessages = requestBody.messages;
+    const inputTokenEstimate = estimateTokensFromUnknown(currentMessages);
     const effectiveRateLimits =
       request.effectiveRateLimits ?? (await loadEffectiveRateLimitsForUser(user.id));
     const tpmReservation = await reserveTpmUsage({
@@ -3054,9 +3212,8 @@ async function setupServer(): Promise<void> {
 
     requestBody.model = selectedModel.model_id;
 
-    requestBody.messages = await hydrateChatMessages(requestBody.messages, user.id);
-
-    const userPrompt = extractTextFromChatMessages(requestBody.messages);
+    const hydratedCurrentMessages = await hydrateChatMessages(currentMessages, user.id);
+    const userPrompt = extractTextFromChatMessages(hydratedCurrentMessages);
     const effectiveModel = selectedModel.public_id;
 
     const targetThreadId = await getOrCreateThread({
@@ -3066,12 +3223,38 @@ async function setupServer(): Promise<void> {
       model: effectiveModel,
     });
 
+    const threadContext = await loadRecentThreadContextMessages({
+      threadId: targetThreadId,
+      userId: user.id,
+    });
+    const chatHistoryMessages = buildChatHistoryMessagesFromThreadMessages(threadContext.messages);
+    const canPrependContext = Array.isArray(hydratedCurrentMessages);
+    const contextMessagesUsed = canPrependContext ? chatHistoryMessages.length : 0;
+
+    if (canPrependContext && contextMessagesUsed > 0) {
+      requestBody.messages = [...chatHistoryMessages, ...hydratedCurrentMessages];
+    } else {
+      requestBody.messages = hydratedCurrentMessages;
+    }
+    reply.header('X-Context-Messages-Used', String(contextMessagesUsed));
+
+    app.log.debug(
+      {
+        endpoint: '/chat/completions',
+        userId: user.id,
+        threadId: targetThreadId,
+        historyItemsUsed: contextMessagesUsed,
+        historyTokensEstimate: threadContext.tokenEstimate,
+      },
+      'Injected thread context into upstream request',
+    );
+
     await persistMessage({
       threadId: targetThreadId,
       userId: user.id,
       role: 'user',
       content: userPrompt || '[non-text input]',
-      rawContent: requestBody.messages,
+      rawContent: hydratedCurrentMessages,
     });
 
     await maybeAutoRenameThread({
@@ -3092,6 +3275,8 @@ async function setupServer(): Promise<void> {
         provider: selectedModel.provider_code,
         stream,
         has_model: Boolean(effectiveModel),
+        history_items_used: contextMessagesUsed,
+        history_tokens_estimate: threadContext.tokenEstimate,
       },
     });
 
@@ -3143,6 +3328,7 @@ async function setupServer(): Promise<void> {
         'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
         'X-Thread-Id': targetThreadId,
+        'X-Context-Messages-Used': String(contextMessagesUsed),
       });
 
       let parserBuffer = '';
@@ -3215,7 +3401,9 @@ async function setupServer(): Promise<void> {
       await addTpmUsageEvent(user.id, estimateTokensFromText(assistantText));
     }
 
-    reply.header('X-Thread-Id', targetThreadId).send(payload);
+    reply.header('X-Thread-Id', targetThreadId);
+    reply.header('X-Context-Messages-Used', String(contextMessagesUsed));
+    reply.send(payload);
   });
 
   app.setErrorHandler(async (error, request, reply) => {
