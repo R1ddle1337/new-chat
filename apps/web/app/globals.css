@@ -760,6 +760,134 @@ code {
   font-size: 0.72rem;
 }
 
+.admin-chat-viewer {
+  display: grid;
+  gap: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0.75rem;
+  background: #fbfbfd;
+}
+
+.admin-chat-layout {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 0.7rem;
+}
+
+.admin-chat-threads {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #ffffff;
+  max-height: 460px;
+  overflow: auto;
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.55rem;
+  align-content: start;
+}
+
+.admin-chat-thread-button {
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--text);
+  padding: 0.55rem;
+  display: grid;
+  gap: 0.24rem;
+  font-weight: 600;
+}
+
+.admin-chat-thread-button:hover,
+.admin-chat-thread-button:focus-visible {
+  border-color: var(--border-strong);
+  background: #f8f9fb;
+}
+
+.admin-chat-thread-button.active {
+  border-color: #d0d5dd;
+  background: #f3f5f8;
+}
+
+.admin-chat-messages {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #ffffff;
+  max-height: 460px;
+  overflow: hidden;
+  padding: 0.55rem;
+  display: grid;
+  gap: 0.55rem;
+}
+
+.admin-chat-message-list {
+  display: grid;
+  gap: 0.55rem;
+  overflow: auto;
+  min-height: 0;
+  padding-right: 0.2rem;
+}
+
+.admin-chat-message {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fbfbfd;
+  padding: 0.55rem;
+  display: grid;
+  gap: 0.38rem;
+}
+
+.admin-chat-message-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.admin-chat-message-content {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.88rem;
+  line-height: 1.45;
+  font-family: var(--font-sans);
+}
+
+.admin-chat-attachments {
+  display: grid;
+  gap: 0.28rem;
+}
+
+.admin-chat-attachment {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.28rem 0.45rem;
+  background: #ffffff;
+  color: var(--text);
+  font-size: 0.84rem;
+}
+
+.admin-chat-attachment:hover,
+.admin-chat-attachment:focus-visible {
+  border-color: var(--border-strong);
+  background: #f9fafb;
+}
+
+.admin-chat-empty {
+  padding: 0.4rem;
+}
+
+@media (max-width: 980px) {
+  .admin-chat-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
 .chat-page {
   position: relative;
   overflow: hidden;

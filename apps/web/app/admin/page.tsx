@@ -61,6 +61,8 @@ type AdminUserItem = {
   email: string;
   status: 'active' | 'banned';
   ban_expires_at: string | null;
+  deleted_at: string | null;
+  deleted_reason: string | null;
   created_at: string;
   last_login_at: string | null;
   last_login_ip: string | null;
@@ -124,6 +126,31 @@ type AbuseEventItem = {
   ip: string | null;
   metadata: Record<string, unknown>;
   created_at: string;
+};
+
+type AdminThreadItem = {
+  id: string;
+  title: string;
+  model: string | null;
+  created_at: string;
+  updated_at: string;
+  msg_count: number;
+};
+
+type AdminMessageAttachment = {
+  file_id: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  content_url: string;
+};
+
+type AdminThreadMessageItem = {
+  id: string;
+  role: string;
+  content: string;
+  created_at: string;
+  attachments: AdminMessageAttachment[];
 };
 
 function parseError(payload: unknown, fallback: string): string {
@@ -230,6 +257,11 @@ export default function AdminPage() {
   >({});
   const [selectedEventUserId, setSelectedEventUserId] = useState<string | null>(null);
   const [selectedUserEvents, setSelectedUserEvents] = useState<AbuseEventItem[]>([]);
+  const [selectedChatUser, setSelectedChatUser] = useState<{ id: string; email: string } | null>(null);
+  const [chatThreads, setChatThreads] = useState<AdminThreadItem[]>([]);
+  const [selectedChatThreadId, setSelectedChatThreadId] = useState<string | null>(null);
+  const [chatMessages, setChatMessages] = useState<AdminThreadMessageItem[]>([]);
+  const [chatMessagesNextCursor, setChatMessagesNextCursor] = useState<string | null>(null);
 
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -991,6 +1023,200 @@ export default function AdminPage() {
     }
   };
 
+  const loadUserThreads = async (userId: string) => {
+    const res = await fetch(`/api/admin/users/${userId}/threads`, {
+      credentials: 'include',
+    });
+
+    const body = (await res.json().catch(() => null)) as unknown;
+    if (!res.ok) {
+      throw new Error(parseError(body, `Failed to load threads for user ${userId}`));
+    }
+
+    const payload = body as { data?: AdminThreadItem[] };
+    setChatThreads(Array.isArray(payload.data) ? payload.data : []);
+  };
+
+  const loadThreadMessages = async (params: {
+    userId: string;
+    threadId: string;
+    cursor?: string | null;
+    append?: boolean;
+  }) => {
+    const search = new URLSearchParams();
+    search.set('limit', '100');
+    if (params.cursor) {
+      search.set('cursor', params.cursor);
+    }
+
+    const res = await fetch(
+      `/api/admin/users/${params.userId}/threads/${params.threadId}/messages?${search.toString()}`,
+      {
+        credentials: 'include',
+      },
+    );
+
+    const body = (await res.json().catch(() => null)) as unknown;
+    if (!res.ok) {
+      throw new Error(parseError(body, `Failed to load messages for thread ${params.threadId}`));
+    }
+
+    const payload = body as {
+      data?: AdminThreadMessageItem[];
+      paging?: { next_cursor?: string | null };
+    };
+    const messages = Array.isArray(payload.data) ? payload.data : [];
+    const nextCursor =
+      payload.paging && typeof payload.paging.next_cursor === 'string'
+        ? payload.paging.next_cursor
+        : null;
+
+    setChatMessages((previous) => (params.append ? [...previous, ...messages] : messages));
+    setChatMessagesNextCursor(nextCursor);
+  };
+
+  const openUserChats = async (user: AdminUserItem) => {
+    setStatus(null);
+    setError(null);
+    setBusy(`chat-threads-${user.id}`);
+    setSelectedChatUser({ id: user.id, email: user.email });
+    setSelectedChatThreadId(null);
+    setChatMessages([]);
+    setChatMessagesNextCursor(null);
+
+    try {
+      await loadUserThreads(user.id);
+      setStatus(`Loaded chat threads for ${user.email}`);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Failed to load user chats');
+      setSelectedChatUser(null);
+      setChatThreads([]);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const openThreadMessages = async (userId: string, threadId: string) => {
+    setStatus(null);
+    setError(null);
+    setBusy(`chat-messages-${threadId}`);
+    setSelectedChatThreadId(threadId);
+    setChatMessages([]);
+    setChatMessagesNextCursor(null);
+
+    try {
+      await loadThreadMessages({ userId, threadId, append: false });
+      setStatus('Loaded thread messages');
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Failed to load thread messages');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const loadMoreThreadMessages = async () => {
+    if (!selectedChatUser || !selectedChatThreadId || !chatMessagesNextCursor) {
+      return;
+    }
+
+    setStatus(null);
+    setError(null);
+    setBusy(`chat-messages-more-${selectedChatThreadId}`);
+
+    try {
+      await loadThreadMessages({
+        userId: selectedChatUser.id,
+        threadId: selectedChatThreadId,
+        cursor: chatMessagesNextCursor,
+        append: true,
+      });
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Failed to load more messages');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const deleteUser = async (user: AdminUserItem) => {
+    const confirmation = window.prompt(
+      `Type "${user.email}" or "${user.id}" to confirm deleting this account`,
+      '',
+    );
+    if (confirmation === null) {
+      return;
+    }
+
+    const typed = confirmation.trim().toLowerCase();
+    if (typed !== user.email.toLowerCase() && typed !== user.id.toLowerCase()) {
+      setError('Confirmation mismatch. Deletion canceled.');
+      return;
+    }
+
+    setStatus(null);
+    setError(null);
+    setBusy(`user-delete-${user.id}`);
+
+    try {
+      const res = await fetch(`/api/admin/users/${user.id}/delete`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `Failed to delete user ${user.id}`));
+        return;
+      }
+
+      const payload = body as { data?: { revoked_session_count?: unknown } };
+      const revokedSessionCount =
+        typeof payload.data?.revoked_session_count === 'number' ? payload.data.revoked_session_count : 0;
+
+      setStatus(`User soft-deleted. Revoked ${revokedSessionCount} active sessions.`);
+      await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
+
+      if (selectedChatUser?.id === user.id) {
+        await loadUserThreads(user.id);
+        if (selectedChatThreadId) {
+          await loadThreadMessages({ userId: user.id, threadId: selectedChatThreadId, append: false });
+        }
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const restoreUser = async (user: AdminUserItem) => {
+    setStatus(null);
+    setError(null);
+    setBusy(`user-restore-${user.id}`);
+
+    try {
+      const res = await fetch(`/api/admin/users/${user.id}/restore`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `Failed to restore user ${user.id}`));
+        return;
+      }
+
+      setStatus('User restored');
+      await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
+
+      if (selectedChatUser?.id === user.id) {
+        await loadUserThreads(user.id);
+        if (selectedChatThreadId) {
+          await loadThreadMessages({ userId: user.id, threadId: selectedChatThreadId, append: false });
+        }
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
   if (loading) {
     return <section className="panel page-loading">Loading admin console...</section>;
   }
@@ -1688,7 +1914,12 @@ export default function AdminPage() {
               <tbody>
                 {users.map((user) => {
                   const draft = userLimitDrafts[user.id] ?? { rpm_limit: '', tpm_limit: '' };
-                  const rowBusy = busy === `user-status-${user.id}` || busy === `user-limits-${user.id}`;
+                  const rowBusy =
+                    busy === `user-status-${user.id}` ||
+                    busy === `user-limits-${user.id}` ||
+                    busy === `user-delete-${user.id}` ||
+                    busy === `user-restore-${user.id}` ||
+                    busy === `chat-threads-${user.id}`;
 
                   return (
                     <tr key={user.id}>
@@ -1699,6 +1930,11 @@ export default function AdminPage() {
                         </span>
                         {user.ban_expires_at ? (
                           <div className="notice">until {formatDateTime(user.ban_expires_at)}</div>
+                        ) : null}
+                        {user.deleted_at ? (
+                          <div className="notice">
+                            soft-deleted {formatDateTime(user.deleted_at)} ({user.deleted_reason ?? 'admin_delete'})
+                          </div>
                         ) : null}
                       </td>
                       <td>{formatDateTime(user.created_at)}</td>
@@ -1718,20 +1954,46 @@ export default function AdminPage() {
                       </td>
                       <td>
                         <div className="admin-user-actions">
-                          <button
-                            type="button"
-                            className={user.status === 'banned' ? 'secondary' : 'danger'}
-                            disabled={busy !== null}
-                            onClick={() =>
-                              void saveUserStatus(user.id, user.status === 'banned' ? 'active' : 'banned')
-                            }
-                          >
-                            {rowBusy && busy === `user-status-${user.id}`
-                              ? 'Saving...'
-                              : user.status === 'banned'
-                                ? 'Unban'
-                                : 'Ban'}
-                          </button>
+                          <div className="button-row">
+                            <button
+                              type="button"
+                              className={user.status === 'banned' ? 'secondary' : 'danger'}
+                              disabled={busy !== null}
+                              onClick={() =>
+                                void saveUserStatus(user.id, user.status === 'banned' ? 'active' : 'banned')
+                              }
+                            >
+                              {rowBusy && busy === `user-status-${user.id}`
+                                ? 'Saving...'
+                                : user.status === 'banned'
+                                  ? 'Unban'
+                                  : 'Ban'}
+                            </button>
+                            <button
+                              type="button"
+                              className="danger"
+                              disabled={busy !== null || user.deleted_at !== null}
+                              onClick={() => void deleteUser(user)}
+                            >
+                              {rowBusy && busy === `user-delete-${user.id}` ? 'Deleting...' : 'Delete'}
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary"
+                              disabled={busy !== null || user.deleted_at === null}
+                              onClick={() => void restoreUser(user)}
+                            >
+                              {rowBusy && busy === `user-restore-${user.id}` ? 'Restoring...' : 'Restore'}
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost"
+                              disabled={busy !== null}
+                              onClick={() => void openUserChats(user)}
+                            >
+                              {rowBusy && busy === `chat-threads-${user.id}` ? 'Loading...' : 'View chats'}
+                            </button>
+                          </div>
 
                           <div className="admin-limit-inputs">
                             <input
@@ -1801,6 +2063,98 @@ export default function AdminPage() {
               </tbody>
             </table>
           </div>
+
+          {selectedChatUser ? (
+            <div className="admin-chat-viewer">
+              <div className="card-title-row">
+                <strong>Chat Records for {selectedChatUser.email}</strong>
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={busy !== null}
+                  onClick={() => {
+                    setSelectedChatUser(null);
+                    setChatThreads([]);
+                    setSelectedChatThreadId(null);
+                    setChatMessages([]);
+                    setChatMessagesNextCursor(null);
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="admin-chat-layout">
+                <div className="admin-chat-threads">
+                  {chatThreads.map((thread) => (
+                    <button
+                      key={thread.id}
+                      type="button"
+                      className={`admin-chat-thread-button ${selectedChatThreadId === thread.id ? 'active' : ''}`}
+                      disabled={busy !== null}
+                      onClick={() => void openThreadMessages(selectedChatUser.id, thread.id)}
+                    >
+                      <span>{thread.title}</span>
+                      <span className="notice">messages: {thread.msg_count}</span>
+                      <span className="notice">updated: {formatDateTime(thread.updated_at)}</span>
+                    </button>
+                  ))}
+                  {chatThreads.length === 0 ? (
+                    <div className="notice admin-chat-empty">No threads found for this user.</div>
+                  ) : null}
+                </div>
+
+                <div className="admin-chat-messages">
+                  {!selectedChatThreadId ? (
+                    <div className="notice admin-chat-empty">Select a thread to view messages.</div>
+                  ) : (
+                    <>
+                      <div className="admin-chat-message-list">
+                        {chatMessages.map((message) => (
+                          <div key={message.id} className="admin-chat-message">
+                            <div className="admin-chat-message-header">
+                              <span className="mono">{message.role}</span>
+                              <span className="notice">{formatDateTime(message.created_at)}</span>
+                            </div>
+                            <pre className="admin-chat-message-content">{message.content}</pre>
+                            {message.attachments.length > 0 ? (
+                              <div className="admin-chat-attachments">
+                                {message.attachments.map((attachment) => (
+                                  <a
+                                    key={`${message.id}-${attachment.file_id}`}
+                                    className="admin-chat-attachment"
+                                    href={attachment.content_url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                  >
+                                    {attachment.filename} ({attachment.mime_type})
+                                  </a>
+                                ))}
+                              </div>
+                            ) : null}
+                          </div>
+                        ))}
+                        {chatMessages.length === 0 ? (
+                          <div className="notice admin-chat-empty">No messages found for this thread.</div>
+                        ) : null}
+                      </div>
+
+                      {chatMessagesNextCursor ? (
+                        <button
+                          type="button"
+                          className="secondary"
+                          disabled={busy !== null}
+                          onClick={() => void loadMoreThreadMessages()}
+                        >
+                          {busy === `chat-messages-more-${selectedChatThreadId}` ? 'Loading...' : 'Load more'}
+                        </button>
+                      ) : null}
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
 
         {status ? <div className="notice">{status}</div> : null}

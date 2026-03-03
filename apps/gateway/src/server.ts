@@ -48,6 +48,13 @@ type StoredFileRow = {
   mime_type: string;
 };
 
+type AttachmentFileRow = {
+  id: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+};
+
 type ModelCatalogRow = {
   id: number;
   provider_id: number;
@@ -142,6 +149,11 @@ type UpstreamModelItem = {
 type ThreadContextMessage = {
   role: 'user' | 'assistant' | 'system';
   content: string;
+};
+
+type MessageCursor = {
+  createdAt: string;
+  id: string;
 };
 
 declare module 'fastify' {
@@ -1692,6 +1704,35 @@ async function destroySession(request: FastifyRequest, reply: FastifyReply): Pro
   });
 }
 
+async function revokeUserSessions(userId: string): Promise<number> {
+  let cursor = '0';
+  let revoked = 0;
+
+  do {
+    const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', 'session:*', 'COUNT', 200);
+    cursor = nextCursor;
+
+    if (!keys.length) {
+      continue;
+    }
+
+    const values = await redis.mget(...keys);
+    const toDelete: string[] = [];
+
+    for (let index = 0; index < keys.length; index += 1) {
+      if (values[index] === userId) {
+        toDelete.push(keys[index]!);
+      }
+    }
+
+    if (toDelete.length) {
+      revoked += await redis.del(...toDelete);
+    }
+  } while (cursor !== '0');
+
+  return revoked;
+}
+
 async function recordSuccessfulLogin(
   userId: string,
   clientIp: string,
@@ -1871,6 +1912,43 @@ function parseNullablePositiveInteger(value: unknown): number | null | 'invalid'
 
 const threadTitleSentenceBoundary = /[.!?]\s/;
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function parseMessageCursor(value: unknown): MessageCursor | null | 'invalid' {
+  if (typeof value === 'undefined') {
+    return null;
+  }
+
+  if (typeof value !== 'string') {
+    return 'invalid';
+  }
+
+  const cursor = value.trim();
+  if (!cursor) {
+    return 'invalid';
+  }
+
+  const separatorIndex = cursor.indexOf('|');
+  if (separatorIndex <= 0) {
+    return 'invalid';
+  }
+
+  const createdAt = cursor.slice(0, separatorIndex);
+  const id = cursor.slice(separatorIndex + 1);
+  if (!createdAt || !uuidPattern.test(id)) {
+    return 'invalid';
+  }
+
+  const createdAtMs = Date.parse(createdAt);
+  if (!Number.isFinite(createdAtMs)) {
+    return 'invalid';
+  }
+
+  return { createdAt: new Date(createdAtMs).toISOString(), id };
+}
+
+function buildMessageCursor(value: MessageCursor): string {
+  return `${value.createdAt}|${value.id}`;
+}
 
 function deriveThreadTitleFromText(text: string): string | null {
   const cleaned = text.replace(/\s+/g, ' ').trim();
@@ -3848,6 +3926,8 @@ async function setupServer(): Promise<void> {
       email: string;
       status: string;
       ban_expires_at: string | null;
+      deleted_at: string | null;
+      deleted_reason: string | null;
       created_at: string;
       last_login_at: string | null;
       last_login_ip: string | null;
@@ -3871,6 +3951,8 @@ async function setupServer(): Promise<void> {
               u.email,
               u.status,
               u.ban_expires_at,
+              u.deleted_at,
+              u.deleted_reason,
               u.created_at,
               u.last_login_at,
               u.last_login_ip,
@@ -3917,6 +3999,8 @@ async function setupServer(): Promise<void> {
           email: entry.email,
           status,
           ban_expires_at: entry.ban_expires_at,
+          deleted_at: entry.deleted_at,
+          deleted_reason: entry.deleted_reason,
           created_at: entry.created_at,
           last_login_at: entry.last_login_at,
           last_login_ip: entry.last_login_ip,
@@ -3988,6 +4072,8 @@ async function setupServer(): Promise<void> {
        SET status = $2,
            banned_at = CASE WHEN $2 = 'banned' THEN COALESCE(banned_at, now()) ELSE NULL END,
            ban_expires_at = NULL,
+           deleted_at = CASE WHEN $2 = 'active' THEN NULL ELSE deleted_at END,
+           deleted_reason = CASE WHEN $2 = 'active' THEN NULL ELSE deleted_reason END,
            updated_at = now()
        WHERE id = $1
        RETURNING id, email, status, created_at, last_login_at, last_login_ip, banned_at, ban_expires_at`,
@@ -4048,6 +4134,469 @@ async function setupServer(): Promise<void> {
       },
     });
   });
+
+  app.post('/admin/users/:userId/delete', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+    const admin = request.authUser!;
+    const params = request.params as { userId: string };
+
+    if (!uuidPattern.test(params.userId)) {
+      reply.code(400).send({ error: 'userId must be a valid UUID' });
+      return;
+    }
+
+    if (params.userId === admin.id) {
+      reply.code(400).send({ error: 'Cannot delete your own account' });
+      return;
+    }
+
+    const existingUser = await pool.query<{
+      id: string;
+      email: string;
+      status: string;
+      deleted_at: string | null;
+      deleted_reason: string | null;
+    }>(
+      `SELECT id, email, status, deleted_at, deleted_reason
+       FROM users
+       WHERE id = $1`,
+      [params.userId],
+    );
+
+    if (!existingUser.rowCount) {
+      reply.code(404).send({ error: 'User not found' });
+      return;
+    }
+
+    const previous = existingUser.rows[0]!;
+    const previousStatus = parseUserStatus(previous.status) ?? previous.status;
+    const updated = await pool.query<{
+      id: string;
+      email: string;
+      status: string;
+      deleted_at: string | null;
+      deleted_reason: string | null;
+      ban_expires_at: string | null;
+    }>(
+      `UPDATE users
+       SET status = 'banned',
+           banned_at = COALESCE(banned_at, now()),
+           ban_expires_at = NULL,
+           deleted_at = now(),
+           deleted_reason = 'admin_delete',
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, email, status, deleted_at, deleted_reason, ban_expires_at`,
+      [params.userId],
+    );
+
+    if (!updated.rowCount) {
+      reply.code(404).send({ error: 'User not found' });
+      return;
+    }
+
+    const revokedSessionCount = await revokeUserSessions(params.userId);
+    await pool.query(
+      `INSERT INTO abuse_user_state (
+         user_id,
+         last_action,
+         last_action_at,
+         last_action_metadata,
+         updated_at
+       )
+       VALUES ($1, 'admin.users.deleted', now(), $2::jsonb, now())
+       ON CONFLICT (user_id) DO UPDATE
+         SET last_action = EXCLUDED.last_action,
+             last_action_at = now(),
+             last_action_metadata = EXCLUDED.last_action_metadata,
+             updated_at = now()`,
+      [
+        params.userId,
+        JSON.stringify({
+          admin_user_id: admin.id,
+          previous_status: previousStatus,
+          revoked_session_count: revokedSessionCount,
+        }),
+      ],
+    );
+
+    await writeAuditEvent({
+      eventType: 'admin.users.deleted',
+      request,
+      userId: admin.id,
+      metadata: {
+        target_user_id: params.userId,
+        previous_status: previousStatus,
+        previous_deleted_at: previous.deleted_at,
+        revoked_session_count: revokedSessionCount,
+      },
+    });
+
+    const target = updated.rows[0]!;
+    reply.send({
+      data: {
+        id: target.id,
+        email: target.email,
+        status: parseUserStatus(target.status) ?? 'banned',
+        deleted_at: target.deleted_at,
+        deleted_reason: target.deleted_reason,
+        revoked_session_count: revokedSessionCount,
+      },
+    });
+  });
+
+  app.post('/admin/users/:userId/restore', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+    const admin = request.authUser!;
+    const params = request.params as { userId: string };
+
+    if (!uuidPattern.test(params.userId)) {
+      reply.code(400).send({ error: 'userId must be a valid UUID' });
+      return;
+    }
+
+    const existingUser = await pool.query<{
+      id: string;
+      email: string;
+      status: string;
+      deleted_at: string | null;
+    }>(
+      `SELECT id, email, status, deleted_at
+       FROM users
+       WHERE id = $1`,
+      [params.userId],
+    );
+
+    if (!existingUser.rowCount) {
+      reply.code(404).send({ error: 'User not found' });
+      return;
+    }
+
+    const previous = existingUser.rows[0]!;
+    const previousStatus = parseUserStatus(previous.status) ?? previous.status;
+    const updated = await pool.query<{
+      id: string;
+      email: string;
+      status: string;
+      deleted_at: string | null;
+      deleted_reason: string | null;
+      ban_expires_at: string | null;
+    }>(
+      `UPDATE users
+       SET status = 'active',
+           banned_at = NULL,
+           ban_expires_at = NULL,
+           deleted_at = NULL,
+           deleted_reason = NULL,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, email, status, deleted_at, deleted_reason, ban_expires_at`,
+      [params.userId],
+    );
+
+    if (!updated.rowCount) {
+      reply.code(404).send({ error: 'User not found' });
+      return;
+    }
+
+    await pool.query(
+      `INSERT INTO abuse_user_state (
+         user_id,
+         last_action,
+         last_action_at,
+         last_action_metadata,
+         updated_at
+       )
+       VALUES ($1, 'admin.users.restored', now(), $2::jsonb, now())
+       ON CONFLICT (user_id) DO UPDATE
+         SET last_action = EXCLUDED.last_action,
+             last_action_at = now(),
+             last_action_metadata = EXCLUDED.last_action_metadata,
+             updated_at = now()`,
+      [
+        params.userId,
+        JSON.stringify({
+          admin_user_id: admin.id,
+          previous_status: previousStatus,
+          previous_deleted_at: previous.deleted_at,
+        }),
+      ],
+    );
+
+    await writeAuditEvent({
+      eventType: 'admin.users.restored',
+      request,
+      userId: admin.id,
+      metadata: {
+        target_user_id: params.userId,
+        previous_status: previousStatus,
+        previous_deleted_at: previous.deleted_at,
+      },
+    });
+
+    const target = updated.rows[0]!;
+    reply.send({
+      data: {
+        id: target.id,
+        email: target.email,
+        status: parseUserStatus(target.status) ?? 'active',
+        deleted_at: target.deleted_at,
+        deleted_reason: target.deleted_reason,
+      },
+    });
+  });
+
+  app.get('/admin/users/:userId/threads', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+    const admin = request.authUser!;
+    const params = request.params as { userId: string };
+
+    if (!uuidPattern.test(params.userId)) {
+      reply.code(400).send({ error: 'userId must be a valid UUID' });
+      return;
+    }
+
+    const existingUser = await pool.query<{ id: string }>('SELECT id FROM users WHERE id = $1', [params.userId]);
+    if (!existingUser.rowCount) {
+      reply.code(404).send({ error: 'User not found' });
+      return;
+    }
+
+    const threads = await pool.query<{
+      id: string;
+      title: string;
+      model: string | null;
+      created_at: string;
+      updated_at: string;
+      msg_count: string;
+    }>(
+      `SELECT t.id,
+              t.title,
+              t.model,
+              t.created_at,
+              t.updated_at,
+              COALESCE(COUNT(m.id), 0)::bigint::text AS msg_count
+       FROM threads t
+       LEFT JOIN messages m ON m.thread_id = t.id
+       WHERE t.user_id = $1
+       GROUP BY t.id, t.title, t.model, t.created_at, t.updated_at
+       ORDER BY t.updated_at DESC
+       LIMIT 200`,
+      [params.userId],
+    );
+
+    await writeAuditEvent({
+      eventType: 'admin.users.threads_viewed',
+      request,
+      userId: admin.id,
+      metadata: {
+        target_user_id: params.userId,
+        result_count: threads.rows.length,
+      },
+    });
+
+    reply.send({
+      data: threads.rows.map((thread) => ({
+        id: thread.id,
+        title: thread.title,
+        model: thread.model,
+        created_at: thread.created_at,
+        updated_at: thread.updated_at,
+        msg_count: Number.parseInt(thread.msg_count, 10) || 0,
+      })),
+    });
+  });
+
+  app.get(
+    '/admin/users/:userId/threads/:threadId/messages',
+    { preHandler: [requireAuth, requireAdmin] },
+    async (request, reply) => {
+      const admin = request.authUser!;
+      const params = request.params as { userId: string; threadId: string };
+      const queryParams = (request.query ?? {}) as { limit?: unknown; cursor?: unknown };
+      const limit = Math.min(200, Math.max(1, toPositiveInteger(queryParams.limit) ?? 100));
+      const cursor = parseMessageCursor(queryParams.cursor);
+
+      if (!uuidPattern.test(params.userId)) {
+        reply.code(400).send({ error: 'userId must be a valid UUID' });
+        return;
+      }
+
+      if (!uuidPattern.test(params.threadId)) {
+        reply.code(400).send({ error: 'threadId must be a valid UUID' });
+        return;
+      }
+
+      if (cursor === 'invalid') {
+        reply.code(400).send({ error: 'cursor must be a valid message cursor' });
+        return;
+      }
+
+      const existingUser = await pool.query<{ id: string }>('SELECT id FROM users WHERE id = $1', [params.userId]);
+      if (!existingUser.rowCount) {
+        reply.code(404).send({ error: 'User not found' });
+        return;
+      }
+
+      const threadCheck = await pool.query<{ id: string }>(
+        'SELECT id FROM threads WHERE id = $1 AND user_id = $2',
+        [params.threadId, params.userId],
+      );
+      if (!threadCheck.rowCount) {
+        reply.code(404).send({ error: 'Thread not found' });
+        return;
+      }
+
+      const messages = await pool.query<{
+        id: string;
+        role: string;
+        content: string;
+        created_at: string;
+        raw_content: unknown;
+      }>(
+        `SELECT m.id, m.role, m.content, m.created_at, m.raw_content
+         FROM messages m
+         WHERE m.thread_id = $1
+           AND m.user_id = $2
+           AND (
+             $3::timestamptz IS NULL
+             OR m.created_at > $3::timestamptz
+             OR (m.created_at = $3::timestamptz AND m.id > $4::uuid)
+           )
+         ORDER BY m.created_at ASC, m.id ASC
+         LIMIT $5`,
+        [params.threadId, params.userId, cursor?.createdAt ?? null, cursor?.id ?? null, limit + 1],
+      );
+
+      const hasMore = messages.rows.length > limit;
+      const pageRows = hasMore ? messages.rows.slice(0, limit) : messages.rows;
+      const attachmentIds = new Set<string>();
+      const attachmentIdsByMessage = new Map<string, string[]>();
+      for (const message of pageRows) {
+        const ids = extractFileIdsFromRawContent(message.raw_content);
+        attachmentIdsByMessage.set(message.id, ids);
+        for (const id of ids) {
+          attachmentIds.add(id);
+        }
+      }
+
+      let filesById = new Map<string, AttachmentFileRow>();
+      if (attachmentIds.size > 0) {
+        const files = await pool.query<AttachmentFileRow>(
+          `SELECT id, filename, mime_type, size_bytes
+           FROM files
+           WHERE user_id = $1
+             AND id = ANY($2::uuid[])`,
+          [params.userId, Array.from(attachmentIds)],
+        );
+        filesById = new Map(files.rows.map((file) => [file.id, file]));
+      }
+
+      const items = pageRows.map((message) => {
+        const attachments = (attachmentIdsByMessage.get(message.id) ?? [])
+          .map((fileId) => {
+            const file = filesById.get(fileId);
+            if (!file) {
+              return null;
+            }
+
+            return {
+              file_id: file.id,
+              filename: file.filename,
+              mime_type: file.mime_type,
+              size_bytes: file.size_bytes,
+              content_url: `/api/admin/users/${params.userId}/files/${file.id}/content`,
+            };
+          })
+          .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
+
+        return {
+          id: message.id,
+          role: message.role,
+          content: message.content,
+          created_at: message.created_at,
+          attachments,
+        };
+      });
+
+      const nextCursor =
+        hasMore && pageRows.length
+          ? buildMessageCursor({
+              createdAt: pageRows[pageRows.length - 1]!.created_at,
+              id: pageRows[pageRows.length - 1]!.id,
+            })
+          : null;
+
+      const attachmentCount = items.reduce((sum, item) => sum + item.attachments.length, 0);
+      await writeAuditEvent({
+        eventType: 'admin.users.messages_viewed',
+        request,
+        userId: admin.id,
+        metadata: {
+          target_user_id: params.userId,
+          thread_id: params.threadId,
+          limit,
+          result_count: items.length,
+          attachment_count: attachmentCount,
+          has_more: hasMore,
+        },
+      });
+
+      reply.send({
+        data: items,
+        paging: {
+          limit,
+          has_more: hasMore,
+          next_cursor: nextCursor,
+        },
+      });
+    },
+  );
+
+  app.get(
+    '/admin/users/:userId/files/:fileId/content',
+    { preHandler: [requireAuth, requireAdmin] },
+    async (request, reply) => {
+      const admin = request.authUser!;
+      const params = request.params as { userId: string; fileId: string };
+
+      if (!uuidPattern.test(params.userId)) {
+        reply.code(400).send({ error: 'userId must be a valid UUID' });
+        return;
+      }
+
+      if (!uuidPattern.test(params.fileId)) {
+        reply.code(400).send({ error: 'fileId must be a valid UUID' });
+        return;
+      }
+
+      const fileResult = await pool.query<UploadedFileRow>(
+        `SELECT id, bucket, object_key, mime_type
+         FROM files
+         WHERE id = $1 AND user_id = $2`,
+        [params.fileId, params.userId],
+      );
+
+      if (!fileResult.rowCount) {
+        reply.code(404).send({ error: 'File not found' });
+        return;
+      }
+
+      await writeAuditEvent({
+        eventType: 'admin.users.file_viewed',
+        request,
+        userId: admin.id,
+        metadata: {
+          target_user_id: params.userId,
+          file_id: params.fileId,
+        },
+      });
+
+      const file = fileResult.rows[0]!;
+      const stream = (await minio.getObject(file.bucket, file.object_key)) as Readable;
+
+      reply.header('Content-Type', file.mime_type);
+      reply.header('Cache-Control', 'private, max-age=300');
+      reply.send(stream);
+    },
+  );
 
   app.put('/admin/users/:id/limits', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
     const admin = request.authUser!;
