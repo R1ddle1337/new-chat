@@ -218,6 +218,8 @@ export default function Sidebar({ collapsed, onCloseMobile, onToggleCollapse }: 
                     type="button"
                     className="sidebar-kebab"
                     aria-label={`Thread actions for ${thread.title}`}
+                    aria-expanded={menuThreadId === thread.id}
+                    aria-haspopup="menu"
                     onClick={(event) => {
                       event.stopPropagation();
                       setMenuThreadId((current) => (current === thread.id ? null : thread.id));
@@ -225,24 +227,27 @@ export default function Sidebar({ collapsed, onCloseMobile, onToggleCollapse }: 
                   >
                     ...
                   </button>
-                  {menuThreadId === thread.id ? (
-                    <div className="sidebar-thread-menu" onClick={(event) => event.stopPropagation()}>
-                      <button
-                        type="button"
-                        className="sidebar-thread-menu-item"
-                        onClick={() => handleRenameStart(thread.id, thread.title)}
-                      >
-                        Rename
-                      </button>
-                      <button
-                        type="button"
-                        className="sidebar-thread-menu-item danger"
-                        onClick={() => void handleDeleteThread(thread.id, thread.title)}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  ) : null}
+                  <div
+                    className={`sidebar-thread-menu${menuThreadId === thread.id ? ' open' : ''}`}
+                    onClick={(event) => event.stopPropagation()}
+                    role="menu"
+                    aria-hidden={menuThreadId !== thread.id}
+                  >
+                    <button
+                      type="button"
+                      className="sidebar-thread-menu-item"
+                      onClick={() => handleRenameStart(thread.id, thread.title)}
+                    >
+                      Rename
+                    </button>
+                    <button
+                      type="button"
+                      className="sidebar-thread-menu-item danger"
+                      onClick={() => void handleDeleteThread(thread.id, thread.title)}
+                    >
+                      Delete
+                    </button>
+                  </div>
                 </div>
               ) : null}
             </div>

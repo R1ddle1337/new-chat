@@ -40,14 +40,14 @@ function AppShellChrome({ children }: AppShellProps) {
         <div className="app-main-inner">{children}</div>
       </div>
 
-      {mobileOpen ? (
-        <button
-          type="button"
-          className="app-mobile-overlay"
-          onClick={() => setMobileOpen(false)}
-          aria-label="Close sidebar"
-        />
-      ) : null}
+      <button
+        type="button"
+        className={`app-mobile-overlay${mobileOpen ? ' open' : ''}`}
+        onClick={() => setMobileOpen(false)}
+        aria-label="Close sidebar"
+        aria-hidden={!mobileOpen}
+        tabIndex={mobileOpen ? 0 : -1}
+      />
     </div>
   );
 }

@@ -1,6 +1,14 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ClipboardEvent as ReactClipboardEvent,
+  type ReactNode,
+} from 'react';
 import { useRouter } from 'next/navigation';
 import MainHeader from '../components/main-header';
 import { useChatShell } from '../components/chat-shell-context';
@@ -317,6 +325,40 @@ function makeLocalMessageId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function imageFileExtensionFromMimeType(mimeType: string): string {
+  switch (mimeType.toLowerCase()) {
+    case 'image/jpeg':
+      return 'jpg';
+    case 'image/gif':
+      return 'gif';
+    case 'image/webp':
+      return 'webp';
+    case 'image/bmp':
+      return 'bmp';
+    case 'image/heic':
+      return 'heic';
+    case 'image/heif':
+      return 'heif';
+    default:
+      return 'png';
+  }
+}
+
+function normalizePastedImageFile(file: File): File {
+  if (file.name && file.name.trim().length > 0) {
+    return file;
+  }
+
+  const mimeType = file.type || 'image/png';
+  const extension = imageFileExtensionFromMimeType(mimeType);
+  const now = Date.now();
+
+  return new File([file], `pasted-image-${now}.${extension}`, {
+    type: mimeType,
+    lastModified: now,
+  });
+}
+
 function isNearBottom(element: HTMLElement): boolean {
   const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
   return distance <= autoScrollThresholdPx;
@@ -354,12 +396,16 @@ export default function ChatPage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const toastCounterRef = useRef(0);
+  const seenMessageIdsRef = useRef<Set<string>>(new Set());
+  const seededMessageIdsRef = useRef(false);
 
   const [loading, setLoading] = useState(true);
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [input, setInput] = useState('');
   const [image, setImage] = useState<File | null>(null);
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
+  const [composerFocused, setComposerFocused] = useState(false);
+  const [animatingMessageIds, setAnimatingMessageIds] = useState<string[]>([]);
   const [provider, setProvider] = useState('');
   const [model, setModel] = useState('');
   const [allowedModels, setAllowedModels] = useState<AllowedModelItem[]>([]);
@@ -386,6 +432,7 @@ export default function ChatPage() {
 
   const canSend =
     !sending && Boolean(provider.trim()) && Boolean(model.trim()) && (input.trim().length > 0 || Boolean(image));
+  const composerActive = composerFocused || Boolean(input.trim()) || Boolean(image);
 
   const pushToast = (kind: ToastKind, message: string) => {
     const id = toastCounterRef.current + 1;
@@ -397,8 +444,8 @@ export default function ChatPage() {
     }, 4500);
   };
 
-  const clearImage = () => {
-    setImage(null);
+  const setAttachedImage = useCallback((nextImage: File | null) => {
+    setImage(nextImage);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -406,9 +453,51 @@ export default function ChatPage() {
       if (current) {
         URL.revokeObjectURL(current);
       }
-      return null;
+      return nextImage ? URL.createObjectURL(nextImage) : null;
     });
-  };
+  }, []);
+
+  const clearImage = useCallback(() => {
+    setAttachedImage(null);
+  }, [setAttachedImage]);
+
+  const handleComposerPaste = useCallback(
+    (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+      const clipboardItems = event.clipboardData?.items;
+      if (!clipboardItems || clipboardItems.length === 0) {
+        return;
+      }
+
+      let pastedImage: File | null = null;
+      for (const item of Array.from(clipboardItems)) {
+        if (!item.type.startsWith('image/')) {
+          continue;
+        }
+
+        const rawFile = item.getAsFile();
+        if (!rawFile) {
+          continue;
+        }
+
+        pastedImage = normalizePastedImageFile(rawFile);
+        break;
+      }
+
+      if (!pastedImage && event.clipboardData?.files?.length) {
+        const imageFile = Array.from(event.clipboardData.files).find((file) =>
+          file.type.startsWith('image/'),
+        );
+        if (imageFile) {
+          pastedImage = normalizePastedImageFile(imageFile);
+        }
+      }
+
+      if (pastedImage) {
+        setAttachedImage(pastedImage);
+      }
+    },
+    [setAttachedImage],
+  );
 
   const adjustComposerHeight = useCallback(() => {
     const textarea = composerInputRef.current;
@@ -543,6 +632,9 @@ export default function ChatPage() {
   useEffect(() => {
     shouldAutoScrollRef.current = true;
     setShowJumpToLatest(false);
+    seenMessageIdsRef.current = new Set();
+    seededMessageIdsRef.current = false;
+    setAnimatingMessageIds([]);
 
     if (!selectedThreadId) {
       setMessages([]);
@@ -551,6 +643,44 @@ export default function ChatPage() {
 
     void loadMessages(selectedThreadId);
   }, [selectedThreadId]);
+
+  useEffect(() => {
+    if (!seededMessageIdsRef.current) {
+      seenMessageIdsRef.current = new Set(messages.map((message) => message.id));
+      seededMessageIdsRef.current = true;
+      return;
+    }
+
+    if (messages.length === 0) {
+      return;
+    }
+
+    const nextIds = messages
+      .map((message) => message.id)
+      .filter((messageId) => !seenMessageIdsRef.current.has(messageId));
+
+    if (nextIds.length === 0) {
+      return;
+    }
+
+    for (const messageId of nextIds) {
+      seenMessageIdsRef.current.add(messageId);
+    }
+
+    setAnimatingMessageIds((current) => {
+      const mergedIds = new Set(current);
+      for (const messageId of nextIds) {
+        mergedIds.add(messageId);
+      }
+      return Array.from(mergedIds);
+    });
+
+    const timeoutId = window.setTimeout(() => {
+      setAnimatingMessageIds((current) => current.filter((messageId) => !nextIds.includes(messageId)));
+    }, 340);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [messages]);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -871,11 +1001,12 @@ export default function ChatPage() {
           {messages.map((message) => {
             const assistantMessage = message.role === 'assistant';
             const showGenerating = assistantMessage && sending && !message.content.trim();
+            const isEntering = animatingMessageIds.includes(message.id);
 
             return (
               <article
                 key={message.id}
-                className={`chat-message-row ${assistantMessage ? 'assistant' : 'user'}`}
+                className={`chat-message-row ${assistantMessage ? 'assistant' : 'user'}${isEntering ? ' chat-message-enter' : ''}`}
               >
                 <div className="chat-message-inner">
                   {message.attachments.length > 0 ? (
@@ -954,7 +1085,15 @@ export default function ChatPage() {
         ) : null}
 
         <form
-          className="chat-composer-bar"
+          className={`chat-composer-bar${composerActive ? ' is-active' : ''}`}
+          onFocusCapture={() => setComposerFocused(true)}
+          onBlurCapture={(event) => {
+            const nextTarget = event.relatedTarget;
+            if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) {
+              return;
+            }
+            setComposerFocused(false);
+          }}
           onSubmit={(event) => {
             event.preventDefault();
             void sendMessage();
@@ -968,13 +1107,7 @@ export default function ChatPage() {
             disabled={sending}
             onChange={(event) => {
               const next = event.target.files?.[0] ?? null;
-              setImage(next);
-              setImagePreviewUrl((current) => {
-                if (current) {
-                  URL.revokeObjectURL(current);
-                }
-                return next ? URL.createObjectURL(next) : null;
-              });
+              setAttachedImage(next);
             }}
           />
 
@@ -995,6 +1128,7 @@ export default function ChatPage() {
             rows={1}
             value={input}
             onChange={(event) => setInput(event.target.value)}
+            onPaste={handleComposerPaste}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
