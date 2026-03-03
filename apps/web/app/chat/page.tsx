@@ -400,6 +400,7 @@ export default function ChatPage() {
   const seededMessageIdsRef = useRef(false);
 
   const [loading, setLoading] = useState(true);
+  const [messagesLoading, setMessagesLoading] = useState(false);
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [input, setInput] = useState('');
   const [image, setImage] = useState<File | null>(null);
@@ -552,26 +553,25 @@ export default function ChatPage() {
     return list;
   };
 
-  const loadMessages = async (threadId: string) => {
+  const loadMessages = async (threadId: string): Promise<MessageItem[] | null> => {
     const res = await fetch(`/api/me/threads/${threadId}/messages`, { credentials: 'include' });
     if (!res.ok) {
       if (res.status === 404) {
-        setMessages([]);
+        return [];
       } else if (res.status === 401) {
         router.replace('/login');
+        return null;
       } else {
         pushToast('error', 'Failed to load messages');
+        return null;
       }
-      return;
     }
 
     const payload = (await res.json()) as { data: MessageItem[] };
-    setMessages(
-      payload.data.map((message) => ({
-        ...message,
-        attachments: Array.isArray(message.attachments) ? message.attachments : [],
-      })),
-    );
+    return payload.data.map((message) => ({
+      ...message,
+      attachments: Array.isArray(message.attachments) ? message.attachments : [],
+    }));
   };
 
   useEffect(() => {
@@ -630,6 +630,8 @@ export default function ChatPage() {
   }, [allowedModels, provider, model]);
 
   useEffect(() => {
+    let cancelled = false;
+
     shouldAutoScrollRef.current = true;
     setShowJumpToLatest(false);
     seenMessageIdsRef.current = new Set();
@@ -638,10 +640,27 @@ export default function ChatPage() {
 
     if (!selectedThreadId) {
       setMessages([]);
+      setMessagesLoading(false);
       return;
     }
 
-    void loadMessages(selectedThreadId);
+    setMessages([]);
+    setMessagesLoading(true);
+
+    void (async () => {
+      const nextMessages = await loadMessages(selectedThreadId);
+      if (cancelled) {
+        return;
+      }
+      if (nextMessages) {
+        setMessages(nextMessages);
+      }
+      setMessagesLoading(false);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [selectedThreadId]);
 
   useEffect(() => {
@@ -912,7 +931,10 @@ export default function ChatPage() {
 
       await refreshThreads(latestThreadId);
       if (latestThreadId) {
-        await loadMessages(latestThreadId);
+        const nextMessages = await loadMessages(latestThreadId);
+        if (nextMessages) {
+          setMessages(nextMessages);
+        }
       }
 
       pushToast('success', 'Response received');
@@ -921,7 +943,10 @@ export default function ChatPage() {
 
       await refreshThreads(latestThreadId);
       if (latestThreadId) {
-        await loadMessages(latestThreadId);
+        const nextMessages = await loadMessages(latestThreadId);
+        if (nextMessages) {
+          setMessages(nextMessages);
+        }
       }
 
       if (requestError instanceof Error && requestError.name === 'AbortError') {
@@ -935,6 +960,162 @@ export default function ChatPage() {
     }
   };
 
+  const showHomeState = !selectedThreadId || (!messagesLoading && messages.length === 0);
+
+  const chatHeaderControls = (
+    <div className="chat-header-controls">
+      <label className="inline-field">
+        <span>Model</span>
+        <select
+          value={selectedModelValue}
+          onChange={(event) => {
+            const [nextProvider, nextModel] = event.target.value.split('::');
+            if (!nextProvider || !nextModel) {
+              setProvider('');
+              setModel('');
+              return;
+            }
+
+            setProvider(nextProvider);
+            setModel(nextModel);
+          }}
+          disabled={sending || modelSelectionOptions.length === 0}
+        >
+          {modelSelectionOptions.length === 0 ? (
+            <option value="">No allowed models</option>
+          ) : (
+            modelSelectionOptions.map((item) => (
+              <option key={item.value} value={item.value}>
+                {item.provider}/{makeModelLabel(item)}
+              </option>
+            ))
+          )}
+        </select>
+      </label>
+
+      <label className="chat-toggle-field">
+        <input
+          type="checkbox"
+          checked={streamResponses}
+          onChange={(event) => setStreamResponses(event.target.checked)}
+          disabled={sending}
+        />
+        <span>Stream</span>
+      </label>
+    </div>
+  );
+
+  const composerRegion = (
+    <div className={`chat-composer-region${showHomeState ? ' chat-composer-region-home' : ''}`}>
+      {imagePreviewUrl ? (
+        <div className="chat-image-preview-row">
+          <img src={imagePreviewUrl} alt={image?.name ?? 'Selected image'} />
+          <button className="ghost" type="button" onClick={clearImage} disabled={sending}>
+            Remove image
+          </button>
+        </div>
+      ) : null}
+
+      <form
+        className={`chat-composer-bar${composerActive ? ' is-active' : ''}`}
+        onFocusCapture={() => setComposerFocused(true)}
+        onBlurCapture={(event) => {
+          const nextTarget = event.relatedTarget;
+          if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) {
+            return;
+          }
+          setComposerFocused(false);
+        }}
+        onSubmit={(event) => {
+          event.preventDefault();
+          void sendMessage();
+        }}
+      >
+        <input
+          ref={fileInputRef}
+          className="sr-only"
+          type="file"
+          accept="image/*"
+          disabled={sending}
+          onChange={(event) => {
+            const next = event.target.files?.[0] ?? null;
+            setAttachedImage(next);
+          }}
+        />
+
+        <button
+          type="button"
+          className="chat-attach-button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={sending}
+          aria-label="Attach image"
+          title="Attach image"
+        >
+          +
+        </button>
+
+        <textarea
+          ref={composerInputRef}
+          className="chat-composer-input"
+          rows={1}
+          value={input}
+          onChange={(event) => setInput(event.target.value)}
+          onPaste={handleComposerPaste}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              if (canSend) {
+                void sendMessage();
+              }
+            }
+          }}
+          placeholder="Message new-chat"
+          disabled={sending}
+        />
+
+        {sending ? (
+          <button
+            className="chat-stop-button"
+            type="button"
+            disabled={!activeAbortController}
+            onClick={stopStreaming}
+          >
+            Stop
+          </button>
+        ) : (
+          <button className="chat-send-button" type="submit" disabled={!canSend}>
+            Send
+          </button>
+        )}
+      </form>
+
+      <div className="chat-composer-status">
+        <div className="chat-composer-status-left">
+          {sending ? (
+            <span className="chat-streaming-indicator" role="status" aria-live="polite">
+              <span className="chat-streaming-dot" />
+              Generating response
+            </span>
+          ) : (
+            'Enter to send, Shift+Enter for newline'
+          )}
+        </div>
+
+        <button
+          className="ghost chat-clear-button"
+          type="button"
+          disabled={sending}
+          onClick={() => {
+            setInput('');
+            clearImage();
+          }}
+        >
+          Clear
+        </button>
+      </div>
+    </div>
+  );
+
   if (loading || shellLoading) {
     return <section className="panel page-loading">Loading chat...</section>;
   }
@@ -943,245 +1124,108 @@ export default function ChatPage() {
     <section className="chat-page app-page">
       <MainHeader
         title={selectedThread?.title ?? 'New chat'}
-        subtitle={selectedThread ? 'Conversation' : 'Start a conversation'}
-        right={
-          <div className="chat-header-controls">
-            <label className="inline-field">
-              <span>Model</span>
-              <select
-                value={selectedModelValue}
-                onChange={(event) => {
-                  const [nextProvider, nextModel] = event.target.value.split('::');
-                  if (!nextProvider || !nextModel) {
-                    setProvider('');
-                    setModel('');
-                    return;
-                  }
-
-                  setProvider(nextProvider);
-                  setModel(nextModel);
-                }}
-                disabled={sending || modelSelectionOptions.length === 0}
-              >
-                {modelSelectionOptions.length === 0 ? (
-                  <option value="">No allowed models</option>
-                ) : (
-                  modelSelectionOptions.map((item) => (
-                    <option key={item.value} value={item.value}>
-                      {item.provider}/{makeModelLabel(item)}
-                    </option>
-                  ))
-                )}
-              </select>
-            </label>
-
-            <label className="chat-toggle-field">
-              <input
-                type="checkbox"
-                checked={streamResponses}
-                onChange={(event) => setStreamResponses(event.target.checked)}
-                disabled={sending}
-              />
-              <span>Stream</span>
-            </label>
-          </div>
-        }
+        subtitle={showHomeState ? 'Start a conversation' : 'Conversation'}
+        right={chatHeaderControls}
       />
 
       {modelSelectionOptions.length === 0 ? (
         <p className="error chat-header-error">No allowed models are configured by admin.</p>
       ) : null}
 
-      <div className="chat-surface">
-        <div ref={messageListRef} className="chat-messages-scroll" onScroll={updateAutoScrollState}>
-          {messages.length === 0 ? (
-            <div className="chat-empty-state">No messages yet. Start a new conversation.</div>
-          ) : null}
+      {showHomeState ? (
+        <div className="chat-home-shell">
+          <div className="chat-home-card chat-message-enter">
+            <h2 className="chat-home-title">How can I help you today?</h2>
+            <p className="chat-home-subtitle">Start a chat with text or an image.</p>
+            {composerRegion}
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="chat-surface">
+            <div ref={messageListRef} className="chat-messages-scroll" onScroll={updateAutoScrollState}>
+              {messagesLoading ? (
+                <div className="chat-empty-state">Loading conversation...</div>
+              ) : null}
 
-          {messages.map((message) => {
-            const assistantMessage = message.role === 'assistant';
-            const showGenerating = assistantMessage && sending && !message.content.trim();
-            const isEntering = animatingMessageIds.includes(message.id);
+              {messages.map((message) => {
+                const assistantMessage = message.role === 'assistant';
+                const showGenerating = assistantMessage && sending && !message.content.trim();
+                const isEntering = animatingMessageIds.includes(message.id);
 
-            return (
-              <article
-                key={message.id}
-                className={`chat-message-row ${assistantMessage ? 'assistant' : 'user'}${isEntering ? ' chat-message-enter' : ''}`}
-              >
-                <div className="chat-message-inner">
-                  {message.attachments.length > 0 ? (
-                    <div className="chat-message-attachments-row">
-                      {message.attachments.map((attachment) => {
-                        const imageAttachment = attachment.mime_type.startsWith('image/');
+                return (
+                  <article
+                    key={message.id}
+                    className={`chat-message-row ${assistantMessage ? 'assistant' : 'user'}${isEntering ? ' chat-message-enter' : ''}`}
+                  >
+                    <div className="chat-message-inner">
+                      {message.attachments.length > 0 ? (
+                        <div className="chat-message-attachments-row">
+                          {message.attachments.map((attachment) => {
+                            const imageAttachment = attachment.mime_type.startsWith('image/');
 
-                        return (
-                          <a
-                            key={`${message.id}-${attachment.file_id}`}
-                            href={attachment.content_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="chat-message-attachment"
-                            title={attachment.filename}
-                          >
-                            {imageAttachment ? (
-                              <img
-                                src={attachment.content_url}
-                                alt={attachment.filename}
-                                loading="lazy"
-                              />
-                            ) : (
-                              <div className="chat-message-attachment-fallback">FILE</div>
-                            )}
-                            <span className="chat-message-attachment-name">{attachment.filename}</span>
-                          </a>
-                        );
-                      })}
-                    </div>
-                  ) : null}
+                            return (
+                              <a
+                                key={`${message.id}-${attachment.file_id}`}
+                                href={attachment.content_url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="chat-message-attachment"
+                                title={attachment.filename}
+                              >
+                                {imageAttachment ? (
+                                  <img
+                                    src={attachment.content_url}
+                                    alt={attachment.filename}
+                                    loading="lazy"
+                                  />
+                                ) : (
+                                  <div className="chat-message-attachment-fallback">FILE</div>
+                                )}
+                                <span className="chat-message-attachment-name">{attachment.filename}</span>
+                              </a>
+                            );
+                          })}
+                        </div>
+                      ) : null}
 
-                  <div className="chat-message-content">
-                    {showGenerating ? (
-                      <div className="chat-inline-streaming">
-                        <span className="chat-streaming-dot" />
-                        Generating...
+                      <div className="chat-message-content">
+                        {showGenerating ? (
+                          <div className="chat-inline-streaming">
+                            <span className="chat-streaming-dot" />
+                            Generating...
+                          </div>
+                        ) : (
+                          <MessageMarkdown content={message.content} />
+                        )}
                       </div>
-                    ) : (
-                      <MessageMarkdown content={message.content} />
-                    )}
-                  </div>
 
-                  {assistantMessage && message.content.trim() ? (
-                    <button
-                      type="button"
-                      className="chat-copy-button"
-                      onClick={() => void copyAssistantMessage(message)}
-                    >
-                      Copy
-                    </button>
-                  ) : null}
-                </div>
-              </article>
-            );
-          })}
+                      {assistantMessage && message.content.trim() ? (
+                        <button
+                          type="button"
+                          className="chat-copy-button"
+                          onClick={() => void copyAssistantMessage(message)}
+                        >
+                          Copy
+                        </button>
+                      ) : null}
+                    </div>
+                  </article>
+                );
+              })}
 
-          <div ref={messageListEndRef} />
-        </div>
+              <div ref={messageListEndRef} />
+            </div>
 
-        {showJumpToLatest && messages.length > 0 ? (
-          <button type="button" className="chat-jump-latest" onClick={() => scrollToLatest('smooth')}>
-            Jump to latest
-          </button>
-        ) : null}
-      </div>
-
-      <div className="chat-composer-region">
-        {imagePreviewUrl ? (
-          <div className="chat-image-preview-row">
-            <img src={imagePreviewUrl} alt={image?.name ?? 'Selected image'} />
-            <button className="ghost" type="button" onClick={clearImage} disabled={sending}>
-              Remove image
-            </button>
+            {showJumpToLatest && messages.length > 0 ? (
+              <button type="button" className="chat-jump-latest" onClick={() => scrollToLatest('smooth')}>
+                Jump to latest
+              </button>
+            ) : null}
           </div>
-        ) : null}
-
-        <form
-          className={`chat-composer-bar${composerActive ? ' is-active' : ''}`}
-          onFocusCapture={() => setComposerFocused(true)}
-          onBlurCapture={(event) => {
-            const nextTarget = event.relatedTarget;
-            if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) {
-              return;
-            }
-            setComposerFocused(false);
-          }}
-          onSubmit={(event) => {
-            event.preventDefault();
-            void sendMessage();
-          }}
-        >
-          <input
-            ref={fileInputRef}
-            className="sr-only"
-            type="file"
-            accept="image/*"
-            disabled={sending}
-            onChange={(event) => {
-              const next = event.target.files?.[0] ?? null;
-              setAttachedImage(next);
-            }}
-          />
-
-          <button
-            type="button"
-            className="chat-attach-button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={sending}
-            aria-label="Attach image"
-            title="Attach image"
-          >
-            +
-          </button>
-
-          <textarea
-            ref={composerInputRef}
-            className="chat-composer-input"
-            rows={1}
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            onPaste={handleComposerPaste}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                event.preventDefault();
-                if (canSend) {
-                  void sendMessage();
-                }
-              }
-            }}
-            placeholder="Message new-chat"
-            disabled={sending}
-          />
-
-          {sending ? (
-            <button
-              className="chat-stop-button"
-              type="button"
-              disabled={!activeAbortController}
-              onClick={stopStreaming}
-            >
-              Stop
-            </button>
-          ) : (
-            <button className="chat-send-button" type="submit" disabled={!canSend}>
-              Send
-            </button>
-          )}
-        </form>
-
-        <div className="chat-composer-status">
-          <div className="chat-composer-status-left">
-            {sending ? (
-              <span className="chat-streaming-indicator" role="status" aria-live="polite">
-                <span className="chat-streaming-dot" />
-                Generating response
-              </span>
-            ) : (
-              'Enter to send, Shift+Enter for newline'
-            )}
-          </div>
-
-          <button
-            className="ghost chat-clear-button"
-            type="button"
-            disabled={sending}
-            onClick={() => {
-              setInput('');
-              clearImage();
-            }}
-          >
-            Clear
-          </button>
-        </div>
-      </div>
+          {composerRegion}
+        </>
+      )}
 
       <div className="toast-stack">
         {toasts.map((toast) => (
