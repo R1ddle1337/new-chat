@@ -242,7 +242,7 @@ export default function Sidebar({ collapsed, onCloseMobile, onToggleCollapse }: 
                     </button>
                     <button
                       type="button"
-                      className="sidebar-thread-menu-item danger"
+                      className="sidebar-thread-menu-item sidebar-thread-menu-item-danger"
                       onClick={() => void handleDeleteThread(thread.id, thread.title)}
                     >
                       Delete

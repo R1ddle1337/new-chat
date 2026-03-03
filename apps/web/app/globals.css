@@ -377,7 +377,15 @@ code {
   background: #f3f4f6;
 }
 
-.sidebar-thread-menu-item.danger {
+.sidebar-thread-menu-item-danger {
+  background: #ffffff;
+  border-color: transparent;
+  color: var(--muted);
+}
+
+.sidebar-thread-menu-item-danger:hover,
+.sidebar-thread-menu-item-danger:focus-visible {
+  background: #fef2f2;
   color: var(--error);
 }
 
