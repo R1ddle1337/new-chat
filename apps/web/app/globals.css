@@ -769,7 +769,7 @@ code {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  background: var(--surface-soft);
+  background: #ffffff;
 }
 
 .chat-messages-scroll {
@@ -1070,7 +1070,7 @@ code {
   max-width: var(--content-max);
   margin: 0 auto;
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 0.45rem;
   border: 1px solid #d6dbe3;
   border-radius: 999px;
@@ -1128,14 +1128,14 @@ code {
   flex: 1 1 auto;
   border: 0;
   background: transparent;
-  padding: 0.72rem 0.1rem 0.68rem;
+  padding: 0.625rem 0.1rem;
   border-radius: 0;
   resize: none;
   min-height: 44px;
   max-height: 220px;
   overflow: auto;
   font-size: 1rem;
-  line-height: 1.4;
+  line-height: 1.5;
   font-weight: 400;
 }
 
@@ -1150,8 +1150,8 @@ code {
 
 .chat-composer-action-group {
   display: flex;
-  align-items: flex-end;
-  align-self: flex-end;
+  align-items: center;
+  align-self: center;
   flex: 0 0 auto;
 }
 
@@ -1231,12 +1231,13 @@ code {
   max-width: var(--content-max);
   margin: 0.43rem auto 0;
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-end;
   align-items: center;
   gap: 0.7rem;
 }
 
 .chat-composer-status-left {
+  margin-right: auto;
   color: var(--muted);
   font-size: 0.81rem;
 }

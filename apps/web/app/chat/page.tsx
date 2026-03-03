@@ -1763,16 +1763,14 @@ export default function ChatPage() {
       </form>
 
       <div className="chat-composer-status">
-        <div className="chat-composer-status-left">
-          {sending ? (
+        {sending ? (
+          <div className="chat-composer-status-left">
             <span className="chat-streaming-indicator" role="status" aria-live="polite">
               <span className="chat-streaming-dot" />
               Generating response
             </span>
-          ) : (
-            'Enter to send, Shift+Enter for newline. Math: $...$, $$...$$, \\(...\\), \\[...\\].'
-          )}
-        </div>
+          </div>
+        ) : null}
 
         <button
           className="ghost chat-clear-button"
