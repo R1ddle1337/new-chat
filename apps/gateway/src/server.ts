@@ -1414,9 +1414,10 @@ function buildResponsesHistoryInputFromThreadMessages(messages: ThreadContextMes
       continue;
     }
 
+    const contentType = message.role === 'assistant' ? 'output_text' : 'input_text';
     input.push({
       role: message.role,
-      content: [{ type: 'input_text', text: message.content }],
+      content: [{ type: contentType, text: message.content }],
     });
   }
 
@@ -3000,6 +3001,9 @@ async function setupServer(): Promise<void> {
       },
       'Injected thread context into upstream request',
     );
+    // Manual smoke test:
+    // 1) New thread, send message 1: request succeeds.
+    // 2) Same thread, send message 2: request succeeds (no 400 invalid content-part type).
 
     await persistMessage({
       threadId: targetThreadId,
