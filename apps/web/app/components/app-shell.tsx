@@ -18,6 +18,23 @@ function AppShellChrome({ children }: AppShellProps) {
     setMobileOpen(false);
   }, [pathname]);
 
+  useEffect(() => {
+    if (!mobileOpen) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMobileOpen(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [mobileOpen]);
+
   return (
     <div
       className={`app-shell${sidebarCollapsed ? ' sidebar-collapsed' : ''}${mobileOpen ? ' mobile-open' : ''}`}
@@ -35,7 +52,9 @@ function AppShellChrome({ children }: AppShellProps) {
           onClick={() => setMobileOpen(true)}
           aria-label="Open sidebar"
         >
-          =
+          <span className="app-mobile-toggle-bar" />
+          <span className="app-mobile-toggle-bar" />
+          <span className="app-mobile-toggle-bar" />
         </button>
         <div className="app-main-inner">{children}</div>
       </div>

@@ -1,7 +1,8 @@
 :root {
-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Segoe UI Variable', 'Microsoft YaHei',
-    'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Source Han Sans SC',
-    'WenQuanYi Micro Hei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Segoe UI Variable', 'Apple Color Emoji',
+    'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji', 'Twemoji Mozilla',
+    'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC',
+    'Source Han Sans SC', 'WenQuanYi Micro Hei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono',
     'Courier New', monospace;
   --bg: #ffffff;
@@ -34,6 +35,7 @@ body {
   margin: 0;
   padding: 0;
   min-height: 100%;
+  overflow-x: hidden;
   color: var(--text);
   background: var(--bg);
   font-family: var(--font-sans);
@@ -497,6 +499,17 @@ code {
   background: #ffffff;
   color: var(--text);
   z-index: 28;
+  gap: 3px;
+  align-content: center;
+  justify-items: center;
+}
+
+.app-mobile-toggle-bar {
+  display: block;
+  width: 15px;
+  height: 1.6px;
+  border-radius: 999px;
+  background: currentcolor;
 }
 
 .main-header {
@@ -505,7 +518,7 @@ code {
   z-index: 10;
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
+  align-items: center;
   gap: 1rem;
   padding: 1rem 1.4rem 0.9rem;
   border-bottom: 1px solid var(--border);
@@ -513,10 +526,17 @@ code {
   backdrop-filter: blur(4px);
 }
 
+.main-header-text {
+  min-width: 0;
+}
+
 .main-header-text h1 {
   margin: 0;
   font-size: 1.08rem;
   line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .main-header-text p {
@@ -528,6 +548,7 @@ code {
 .main-header-right {
   display: grid;
   align-items: end;
+  min-width: 0;
 }
 
 .page-stack {
@@ -609,6 +630,7 @@ code {
 .chat-page {
   position: relative;
   overflow: hidden;
+  min-width: 0;
 }
 
 .chat-header-controls {
@@ -616,6 +638,7 @@ code {
   align-items: center;
   gap: 0.7rem;
   flex-wrap: wrap;
+  min-width: 0;
 }
 
 .inline-field {
@@ -628,6 +651,7 @@ code {
 
 .inline-field select {
   min-width: 280px;
+  max-width: 100%;
   padding: 0.42rem 0.58rem;
   border-radius: 9px;
   font-size: 0.85rem;
@@ -656,6 +680,7 @@ code {
   position: relative;
   flex: 1;
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   background: var(--surface-soft);
@@ -665,7 +690,7 @@ code {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 0.8rem 0 1rem;
+  padding: 0.8rem 0 calc(1rem + env(safe-area-inset-bottom));
   -webkit-overflow-scrolling: touch;
 }
 
@@ -774,8 +799,14 @@ code {
 .chat-message-content {
   font-size: 0.95rem;
   line-height: 1.62;
+  font-family: var(--font-sans);
   color: #1f2937;
   word-break: break-word;
+}
+
+.chat-message-content.emoji-only {
+  font-size: 1.56rem;
+  line-height: 1.35;
 }
 
 .chat-message-content > * {
@@ -932,12 +963,11 @@ code {
 }
 
 .chat-composer-region {
-  position: sticky;
-  bottom: 0;
+  position: relative;
   z-index: 9;
   border-top: 1px solid var(--border);
   padding: 0.75rem 1.15rem calc(0.95rem + env(safe-area-inset-bottom));
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, #ffffff 22%);
+  background: #ffffff;
 }
 
 .chat-composer-region.chat-composer-region-home {
@@ -951,7 +981,7 @@ code {
 .chat-image-preview-row {
   max-width: var(--content-max);
   margin: 0 auto 0.55rem;
-  display: inline-grid;
+  display: grid;
   gap: 0.45rem;
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -1135,6 +1165,7 @@ code {
   .app-shell,
   .app-shell.sidebar-collapsed {
     grid-template-columns: 1fr;
+    overflow-x: hidden;
   }
 
   .app-main {
@@ -1146,8 +1177,8 @@ code {
     top: 0;
     left: 0;
     bottom: 0;
-    width: min(88vw, 320px);
-    transform: translateX(-104%);
+    width: min(86vw, 320px);
+    transform: translateX(calc(-100% - 14px));
     transition: transform var(--motion-duration-slow) var(--motion-ease);
     box-shadow: 8px 0 28px rgba(16, 24, 40, 0.16);
   }
@@ -1159,8 +1190,13 @@ code {
   .app-mobile-toggle {
     display: inline-grid;
     place-items: center;
-    width: 42px;
-    height: 42px;
+    top: calc(env(safe-area-inset-top) + 0.42rem);
+    left: 0.62rem;
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+    background: rgba(255, 255, 255, 0.94);
+    box-shadow: 0 8px 22px rgba(16, 24, 40, 0.1);
   }
 
   .app-mobile-overlay {
@@ -1186,39 +1222,126 @@ code {
   }
 
   .main-header {
-    padding: 0.95rem 1rem 0.84rem 3.2rem;
+    padding: calc(env(safe-area-inset-top) + 0.6rem) 0.9rem 0.7rem 3.25rem;
+    gap: 0.66rem;
+  }
+
+  .main-header-text h1 {
+    font-size: 1rem;
+    line-height: 1.25;
+  }
+
+  .chat-page .main-header {
+    align-items: stretch;
+  }
+
+  .chat-page .main-header-text p {
+    display: none;
+  }
+
+  .chat-page .main-header-right {
+    width: 100%;
+  }
+
+  .chat-header-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.5rem;
+    align-items: end;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .chat-header-controls .inline-field {
+    min-width: 0;
+  }
+
+  .chat-header-controls .inline-field select {
+    min-width: 0;
+    width: 100%;
+    height: 2.25rem;
+  }
+
+  .chat-toggle-field {
+    min-height: 2.25rem;
+    padding: 0 0.54rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: #ffffff;
+    white-space: nowrap;
+    flex-wrap: nowrap;
   }
 
   .page-stack {
-    padding: 0.85rem 1rem 1.15rem;
+    padding: 0.85rem 0.9rem 1.15rem;
   }
 
   .chat-header-error {
-    padding-left: 1rem;
-    padding-right: 1rem;
+    padding-left: 0.9rem;
+    padding-right: 0.9rem;
+  }
+
+  .chat-messages-scroll {
+    padding-top: 0.6rem;
   }
 
   .chat-composer-region {
-    padding-left: 0.82rem;
-    padding-right: 0.82rem;
-    padding-bottom: calc(0.95rem + env(safe-area-inset-bottom));
-  }
-
-  .chat-composer-region.chat-composer-region-home {
-    padding: 0;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+    padding-bottom: calc(0.8rem + env(safe-area-inset-bottom));
   }
 
   .chat-home-shell {
-    padding: 1rem;
+    place-items: start center;
+    padding: 0.72rem 0.75rem calc(0.9rem + env(safe-area-inset-bottom));
   }
 
   .chat-home-card {
+    width: 100%;
+    max-width: 100%;
     border-radius: 16px;
+    padding: 1rem;
+    gap: 0.82rem;
+    box-shadow: 0 14px 30px rgba(16, 24, 40, 0.08);
   }
 
+  .chat-home-title {
+    font-size: 1.22rem;
+  }
+
+  .chat-empty-state,
   .chat-message-row {
-    padding-left: 0.82rem;
-    padding-right: 0.82rem;
+    max-width: none;
+    margin-left: 0;
+    margin-right: 0;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+  }
+
+  .chat-empty-state {
+    margin-top: 0.9rem;
+    margin-bottom: 0.9rem;
+  }
+
+  .chat-message-inner {
+    max-width: 100%;
+    padding: 0.82rem 0.9rem;
+  }
+
+  .chat-image-preview-row,
+  .chat-composer-bar,
+  .chat-composer-status {
+    max-width: none;
+    width: 100%;
+  }
+
+  .chat-composer-status {
+    margin-top: 0.38rem;
+  }
+
+  .chat-image-preview-row {
+    margin-left: 0;
+    margin-right: 0;
   }
 
   .app-shell.sidebar-collapsed .sidebar-brand-label {
@@ -1249,35 +1372,37 @@ code {
 
 @media (max-width: 760px) {
   .main-header {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 0.7rem;
+    padding: calc(env(safe-area-inset-top) + 0.54rem) 0.72rem 0.62rem 3rem;
+    gap: 0.5rem;
   }
 
   .chat-header-controls {
-    justify-content: space-between;
+    gap: 0.44rem;
   }
 
   .inline-field {
-    width: 100%;
+    min-width: 0;
   }
 
   .inline-field select {
-    min-width: 0;
-    width: 100%;
+    font-size: 0.82rem;
   }
 
   .chat-composer-status {
     flex-wrap: wrap;
+    row-gap: 0.35rem;
+  }
+
+  .chat-composer-status-left {
+    font-size: 0.75rem;
   }
 
   .chat-home-shell {
-    align-items: start;
-    padding-top: 1.4rem;
+    padding-top: 0.56rem;
   }
 
   .chat-home-card {
-    padding: 1rem;
+    padding: 0.88rem;
   }
 
   .sidebar-collapse-btn,
@@ -1297,7 +1422,11 @@ code {
 
   .chat-composer-bar {
     border-radius: 22px;
-    padding: 0.5rem;
+    padding: 0.44rem;
+  }
+
+  .chat-composer-input {
+    min-height: 40px;
   }
 
   .chat-jump-latest {

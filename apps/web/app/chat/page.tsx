@@ -61,6 +61,9 @@ type MarkdownCodeProps = ComponentPropsWithoutRef<'code'> & {
   inline?: boolean;
 };
 
+const emojiOnlyTokenPattern =
+  /(?:\p{Regional_Indicator}{2}|[#*0-9]\uFE0F?\u20E3|\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?(?:\p{Emoji_Modifier})?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?(?:\p{Emoji_Modifier})?)*)/gu;
+
 function sanitizeLinkHref(rawHref: string | undefined): string | null {
   if (!rawHref) {
     return null;
@@ -338,6 +341,20 @@ function normalizePastedImageFile(file: File): File {
 function isNearBottom(element: HTMLElement): boolean {
   const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
   return distance <= autoScrollThresholdPx;
+}
+
+function isEmojiOnlyMessage(content: string): boolean {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  const compact = trimmed.replace(/\s+/g, '');
+  if (!compact) {
+    return false;
+  }
+
+  return compact.replace(emojiOnlyTokenPattern, '').length === 0;
 }
 
 async function copyTextToClipboard(value: string): Promise<void> {
@@ -1128,6 +1145,7 @@ export default function ChatPage() {
                 const assistantMessage = message.role === 'assistant';
                 const showGenerating = assistantMessage && sending && !message.content.trim();
                 const isEntering = animatingMessageIds.includes(message.id);
+                const emojiOnly = !showGenerating && isEmojiOnlyMessage(message.content);
 
                 return (
                   <article
@@ -1165,7 +1183,7 @@ export default function ChatPage() {
                         </div>
                       ) : null}
 
-                      <div className="chat-message-content">
+                      <div className={`chat-message-content${emojiOnly ? ' emoji-only' : ''}`}>
                         {showGenerating ? (
                           <div className="chat-inline-streaming">
                             <span className="chat-streaming-dot" />
