@@ -8,3 +8,6 @@ dist
 coverage
 *.log
 .DS_Store
+
+# build artifacts
+apps/web/tsconfig.tsbuildinfo
