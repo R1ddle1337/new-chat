@@ -33,18 +33,16 @@ type MessageItem = {
 };
 
 type MePayload = {
-  default_provider: string;
   default_model: string | null;
 };
 
 type AllowedModelItem = {
   id: string;
-  provider: string;
   display_name?: string | null;
 };
 
 type ModelsPayload = {
-  data: Array<{ id?: string; provider?: string; display_name?: string | null }>;
+  data: Array<{ id?: string; display_name?: string | null }>;
 };
 
 type ToastKind = 'info' | 'success' | 'error';
@@ -400,7 +398,6 @@ export default function ChatPage() {
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
   const [composerFocused, setComposerFocused] = useState(false);
   const [animatingMessageIds, setAnimatingMessageIds] = useState<string[]>([]);
-  const [provider, setProvider] = useState('');
   const [model, setModel] = useState('');
   const [allowedModels, setAllowedModels] = useState<AllowedModelItem[]>([]);
   const [streamResponses, setStreamResponses] = useState(true);
@@ -412,20 +409,20 @@ export default function ChatPage() {
   const modelSelectionOptions = useMemo(() => {
     return allowedModels.map((entry) => ({
       ...entry,
-      value: `${entry.provider}::${entry.id}`,
+      value: entry.id,
     }));
   }, [allowedModels]);
 
   const selectedModelValue = useMemo(() => {
-    if (!provider || !model) {
+    if (!model) {
       return '';
     }
 
-    return `${provider}::${model}`;
-  }, [provider, model]);
+    return model;
+  }, [model]);
 
   const canSend =
-    !sending && Boolean(provider.trim()) && Boolean(model.trim()) && (input.trim().length > 0 || Boolean(image));
+    !sending && Boolean(model.trim()) && (input.trim().length > 0 || Boolean(image));
   const composerActive = composerFocused || Boolean(input.trim()) || Boolean(image);
 
   const pushToast = (kind: ToastKind, message: string) => {
@@ -532,15 +529,21 @@ export default function ChatPage() {
 
     const payload = (await response.json()) as ModelsPayload;
     const list = payload.data
-      .filter((item): item is { id: string; provider: string; display_name?: string | null } => {
-        return typeof item.id === 'string' && typeof item.provider === 'string';
+      .filter((item): item is { id: string; display_name?: string | null } => {
+        return typeof item.id === 'string';
       })
       .map((item) => ({
         id: item.id,
-        provider: item.provider,
         display_name: item.display_name ?? null,
       }))
-      .sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+      .sort((a, b) => {
+        const nameA = (a.display_name ?? a.id).toLowerCase();
+        const nameB = (b.display_name ?? b.id).toLowerCase();
+        if (nameA !== nameB) {
+          return nameA.localeCompare(nameB);
+        }
+        return a.id.localeCompare(b.id);
+      });
 
     setAllowedModels(list);
     return list;
@@ -582,18 +585,10 @@ export default function ChatPage() {
 
       try {
         const models = await loadAllowedModels();
-        const modelProviders = Array.from(new Set(models.map((entry) => entry.provider)));
-
-        const preferredProvider = modelProviders.includes(me.default_provider)
-          ? me.default_provider
-          : modelProviders[0] ?? '';
-        setProvider(preferredProvider);
-
-        const providerModels = models.filter((entry) => entry.provider === preferredProvider);
         const preferredModel =
-          me.default_model && providerModels.some((entry) => entry.id === me.default_model)
+          me.default_model && models.some((entry) => entry.id === me.default_model)
             ? me.default_model
-            : providerModels[0]?.id ?? '';
+            : models[0]?.id ?? '';
         setModel(preferredModel);
       } catch (error) {
         pushToast('error', error instanceof Error ? error.message : 'Failed to load allowed models');
@@ -606,21 +601,15 @@ export default function ChatPage() {
   }, [router]);
 
   useEffect(() => {
-    if (!provider) {
+    if (allowedModels.length === 0) {
       setModel('');
       return;
     }
 
-    const providerModels = allowedModels.filter((entry) => entry.provider === provider);
-    if (providerModels.length === 0) {
-      setModel('');
-      return;
+    if (!allowedModels.some((entry) => entry.id === model)) {
+      setModel(allowedModels[0]!.id);
     }
-
-    if (!providerModels.some((entry) => entry.id === model)) {
-      setModel(providerModels[0]!.id);
-    }
-  }, [allowedModels, provider, model]);
+  }, [allowedModels, model]);
 
   useEffect(() => {
     let cancelled = false;
@@ -741,7 +730,7 @@ export default function ChatPage() {
       return;
     }
 
-    if (!provider.trim() || !model.trim()) {
+    if (!model.trim()) {
       pushToast('error', 'Select a model from the allowlist');
       return;
     }
@@ -798,7 +787,6 @@ export default function ChatPage() {
           },
         ],
         stream: streamResponses,
-        provider: provider.trim(),
         model: model.trim(),
       };
 
@@ -962,14 +950,12 @@ export default function ChatPage() {
         <select
           value={selectedModelValue}
           onChange={(event) => {
-            const [nextProvider, nextModel] = event.target.value.split('::');
-            if (!nextProvider || !nextModel) {
-              setProvider('');
+            const nextModel = event.target.value;
+            if (!nextModel) {
               setModel('');
               return;
             }
 
-            setProvider(nextProvider);
             setModel(nextModel);
           }}
           disabled={sending || modelSelectionOptions.length === 0}
@@ -979,7 +965,7 @@ export default function ChatPage() {
           ) : (
             modelSelectionOptions.map((item) => (
               <option key={item.value} value={item.value}>
-                {item.provider}/{makeModelLabel(item)}
+                {makeModelLabel(item)}
               </option>
             ))
           )}

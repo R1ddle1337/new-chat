@@ -40,7 +40,6 @@ services:
       SESSION_COOKIE_NAME: nc_session
       SESSION_TTL_SECONDS: 604800
       AUTH_RATE_LIMIT_PER_MIN: 20
-      V1_RATE_LIMIT_PER_MIN: 120
       MINIO_ENDPOINT: minio
       MINIO_PORT: 9000
       MINIO_USE_SSL: 'false'

@@ -5,7 +5,6 @@ import { useEffect, useState } from 'react';
 
 type MePayload = {
   is_admin?: boolean;
-  admin_enabled?: boolean;
 };
 
 export default function TopNav() {
@@ -26,7 +25,7 @@ export default function TopNav() {
 
         const me = (await response.json()) as MePayload;
         if (!cancelled) {
-          setShowAdminLink(Boolean(me.admin_enabled && me.is_admin));
+          setShowAdminLink(Boolean(me.is_admin));
         }
       } catch {
         if (!cancelled) {

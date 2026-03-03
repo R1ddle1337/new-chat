@@ -7,27 +7,17 @@ import MainHeader from '../components/main-header';
 type MePayload = {
   id: string;
   email: string;
-  default_provider: string;
   default_model: string | null;
   is_admin: boolean;
-  admin_enabled: boolean;
-};
-
-type KeyItem = {
-  provider: string;
-  enabled: boolean;
-  has_key: boolean;
-  masked_key: string | null;
 };
 
 type AllowedModelItem = {
   id: string;
-  provider: string;
   display_name?: string | null;
 };
 
 type ModelsPayload = {
-  data: Array<{ id?: string; provider?: string; display_name?: string | null }>;
+  data: Array<{ id?: string; display_name?: string | null }>;
 };
 
 function parseErrorMessage(payload: unknown, fallback: string): string {
@@ -58,32 +48,25 @@ function makeModelLabel(model: AllowedModelItem): string {
 export default function SettingsPage() {
   const router = useRouter();
   const [me, setMe] = useState<MePayload | null>(null);
-  const [keys, setKeys] = useState<KeyItem[]>([]);
-  const [provider, setProvider] = useState('openai');
-  const [apiKey, setApiKey] = useState('');
-  const [defaultProvider, setDefaultProvider] = useState('');
-  const [defaultModel, setDefaultModel] = useState('');
   const [allowedModels, setAllowedModels] = useState<AllowedModelItem[]>([]);
+  const [defaultModel, setDefaultModel] = useState('');
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const providersWithModels = useMemo(() => {
-    return Array.from(new Set(allowedModels.map((model) => model.provider))).sort((a, b) =>
-      a.localeCompare(b),
-    );
+  const hasModels = allowedModels.length > 0;
+
+  const sortedModels = useMemo(() => {
+    return [...allowedModels].sort((a, b) => {
+      const labelA = (a.display_name ?? a.id).toLowerCase();
+      const labelB = (b.display_name ?? b.id).toLowerCase();
+      if (labelA !== labelB) {
+        return labelA.localeCompare(labelB);
+      }
+      return a.id.localeCompare(b.id);
+    });
   }, [allowedModels]);
 
-  const modelsForDefaultProvider = useMemo(() => {
-    return allowedModels.filter((model) => model.provider === defaultProvider);
-  }, [allowedModels, defaultProvider]);
-
-  const modelsForDisplay = useMemo(() => {
-    return [...allowedModels].sort(
-      (a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id),
-    );
-  }, [allowedModels]);
-
-  const loadAllowedModels = async (nextMe?: MePayload | null) => {
+  const loadAllowedModels = async (): Promise<AllowedModelItem[]> => {
     const res = await fetch('/api/v1/models', { credentials: 'include' });
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as unknown;
@@ -91,36 +74,17 @@ export default function SettingsPage() {
     }
 
     const payload = (await res.json()) as ModelsPayload;
-    const list = payload.data
-      .filter((item): item is { id: string; provider: string; display_name?: string | null } => {
-        return typeof item.id === 'string' && typeof item.provider === 'string';
+    const models = payload.data
+      .filter((item): item is { id: string; display_name?: string | null } => {
+        return typeof item.id === 'string';
       })
       .map((item) => ({
         id: item.id,
-        provider: item.provider,
         display_name: item.display_name ?? null,
-      }))
-      .sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+      }));
 
-    setAllowedModels(list);
-
-    const modelProviders = Array.from(new Set(list.map((item) => item.provider)));
-    const mePayload = nextMe ?? me;
-
-    const preferredProvider =
-      mePayload && modelProviders.includes(mePayload.default_provider)
-        ? mePayload.default_provider
-        : modelProviders[0] ?? '';
-    setDefaultProvider(preferredProvider);
-
-    const matchingModels = list.filter((item) => item.provider === preferredProvider);
-    const preferredModel =
-      mePayload?.default_model && matchingModels.some((item) => item.id === mePayload.default_model)
-        ? mePayload.default_model
-        : matchingModels[0]?.id ?? '';
-    setDefaultModel(preferredModel);
-
-    return list;
+    setAllowedModels(models);
+    return models;
   };
 
   const load = async () => {
@@ -140,17 +104,13 @@ export default function SettingsPage() {
     const meBody = (await meRes.json()) as MePayload;
     setMe(meBody);
 
-    const keyRes = await fetch('/api/me/keys', { credentials: 'include' });
-    if (keyRes.ok) {
-      const keyBody = (await keyRes.json()) as { data: KeyItem[] };
-      setKeys(keyBody.data);
-
-      const firstEnabledProvider = keyBody.data.find((item) => item.enabled)?.provider;
-      setProvider(firstEnabledProvider ?? keyBody.data[0]?.provider ?? 'openai');
-    }
-
     try {
-      await loadAllowedModels(meBody);
+      const models = await loadAllowedModels();
+      if (meBody.default_model && models.some((model) => model.id === meBody.default_model)) {
+        setDefaultModel(meBody.default_model);
+      } else {
+        setDefaultModel(models[0]?.id ?? '');
+      }
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Failed to load models');
     }
@@ -161,66 +121,39 @@ export default function SettingsPage() {
   }, []);
 
   useEffect(() => {
-    if (!defaultProvider) {
+    if (!defaultModel && sortedModels.length > 0) {
+      setDefaultModel(sortedModels[0]!.id);
       return;
     }
 
-    const providerModels = allowedModels.filter((model) => model.provider === defaultProvider);
-    if (providerModels.length === 0) {
-      setDefaultModel('');
-      return;
+    if (defaultModel && !sortedModels.some((model) => model.id === defaultModel)) {
+      setDefaultModel(sortedModels[0]?.id ?? '');
     }
+  }, [defaultModel, sortedModels]);
 
-    if (!providerModels.some((model) => model.id === defaultModel)) {
-      setDefaultModel(providerModels[0]!.id);
-    }
-  }, [allowedModels, defaultProvider, defaultModel]);
-
-  const saveKey = async () => {
+  const saveDefaultModel = async () => {
     setStatus(null);
     setError(null);
 
-    const res = await fetch('/api/me/keys', {
-      method: 'POST',
+    if (!defaultModel) {
+      setError('Select a model first');
+      return;
+    }
+
+    const res = await fetch('/api/me/model', {
+      method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({ provider, apiKey }),
+      body: JSON.stringify({ model: defaultModel }),
     });
 
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as unknown;
-      setError(parseErrorMessage(body, 'Failed to save key'));
+      setError(parseErrorMessage(body, 'Failed to save default model'));
       return;
     }
 
-    setApiKey('');
-    setStatus('Provider key saved');
-    await load();
-  };
-
-  const saveDefaults = async () => {
-    setStatus(null);
-    setError(null);
-
-    if (!defaultProvider || !defaultModel) {
-      setError('Select both provider and model from the admin allowlist');
-      return;
-    }
-
-    const res = await fetch('/api/me/provider', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ provider: defaultProvider, model: defaultModel }),
-    });
-
-    if (!res.ok) {
-      const body = (await res.json().catch(() => null)) as unknown;
-      setError(parseErrorMessage(body, 'Failed to save defaults'));
-      return;
-    }
-
-    setStatus('Default provider/model updated');
+    setStatus('Default model updated');
     await load();
   };
 
@@ -230,7 +163,7 @@ export default function SettingsPage() {
 
     try {
       const models = await loadAllowedModels();
-      setStatus(`Loaded ${models.length} allowed model entries`);
+      setStatus(`Loaded ${models.length} published models`);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Failed to load models');
     }
@@ -268,85 +201,25 @@ export default function SettingsPage() {
         </div>
 
         <div className="card">
-          <h2>Provider API Keys (BYOK)</h2>
+          <h2>Default Model</h2>
           <form
             onSubmit={(event) => {
               event.preventDefault();
-              void saveKey();
+              void saveDefaultModel();
             }}
           >
             <label>
-              Provider
-              <select value={provider} onChange={(event) => setProvider(event.target.value)}>
-                {keys
-                  .filter((item) => item.enabled)
-                  .map((item) => (
-                    <option key={item.provider} value={item.provider}>
-                      {item.provider}
-                    </option>
-                  ))}
-              </select>
-            </label>
-
-            <label>
-              API key
-              <input
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                placeholder="sk-..."
-                required
-              />
-            </label>
-
-            <button className="primary" type="submit" disabled={!provider}>
-              Save key
-            </button>
-          </form>
-
-          <div className="stack-tight">
-            {keys.map((item) => (
-              <div key={item.provider} className="notice">
-                <span className="mono">{item.provider}</span> ({item.enabled ? 'enabled' : 'disabled'}):{' '}
-                {item.has_key ? item.masked_key : 'not set'}
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="card">
-          <h2>Default Provider and Model</h2>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              void saveDefaults();
-            }}
-          >
-            <label>
-              Default provider
-              <select
-                value={defaultProvider}
-                onChange={(event) => setDefaultProvider(event.target.value)}
-              >
-                {providersWithModels.map((providerCode) => (
-                  <option key={providerCode} value={providerCode}>
-                    {providerCode}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              Default model
+              Published model
               <select
                 value={defaultModel}
                 onChange={(event) => setDefaultModel(event.target.value)}
-                disabled={!defaultProvider || modelsForDefaultProvider.length === 0}
+                disabled={!hasModels}
               >
-                {modelsForDefaultProvider.length === 0 ? (
-                  <option value="">No allowed models for this provider</option>
+                {!hasModels ? (
+                  <option value="">No published models</option>
                 ) : (
-                  modelsForDefaultProvider.map((modelItem) => (
-                    <option key={`${modelItem.provider}:${modelItem.id}`} value={modelItem.id}>
+                  sortedModels.map((modelItem) => (
+                    <option key={modelItem.id} value={modelItem.id}>
                       {makeModelLabel(modelItem)}
                     </option>
                   ))
@@ -354,19 +227,19 @@ export default function SettingsPage() {
               </select>
             </label>
 
-            <button className="primary" type="submit" disabled={!defaultProvider || !defaultModel}>
-              Save defaults
+            <button className="primary" type="submit" disabled={!defaultModel}>
+              Save default model
             </button>
           </form>
 
           <div className="stack-tight">
             <button className="secondary" type="button" onClick={() => void refreshModels()}>
-              Refresh allowed models
+              Refresh published models
             </button>
             <div className="allowlist-preview">
-              {modelsForDisplay.map((modelItem) => (
-                <div key={`${modelItem.provider}:${modelItem.id}`} className="notice">
-                  <span className="mono">{modelItem.provider}</span>/{makeModelLabel(modelItem)}
+              {sortedModels.map((modelItem) => (
+                <div key={modelItem.id} className="notice">
+                  {makeModelLabel(modelItem)}
                 </div>
               ))}
             </div>

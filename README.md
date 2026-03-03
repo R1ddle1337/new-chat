@@ -6,18 +6,19 @@ Web-only chat app (OpenAI-like UI) with a Fastify gateway, Next.js frontend, Pos
 
 - Cookie-based auth (`httpOnly` session cookie) for same-origin web usage.
 - Cloud-synced chat history in Postgres (`threads` + `messages`).
-- BYOK per user (encrypted at rest with AES-256-GCM via `KEY_ENCRYPTION_KEY`).
+- Platform-hosted provider secrets (encrypted at rest with AES-256-GCM via `KEY_ENCRYPTION_KEY`).
 - Admin controls:
-  - `ADMIN_EMAIL` bootstrapped admin access
-  - provider base URL + enabled flag management
-  - allowed model allowlist (users can only use enabled admin-approved models)
+  - optional `ADMIN_EMAIL` bootstrap for first admin elevation on login/register
+  - provider base URL + provider secret management
+  - model catalog publishing (`public_id`, `display_name`, enable/disable)
+  - per-user rate-limit controls (RPM + TPM) from admin UI/API
 - Multi-provider routing:
   - `openai` (`https://api.openai.com/v1`)
   - `grok2api` (`https://gapi.lyxnb.de5.net/v1`)
 - OpenAI-compatible API surface in the gateway:
   - `POST /v1/responses` (primary, supports `stream: true` SSE proxy)
   - `POST /v1/chat/completions` (compat)
-  - `GET /v1/models` (enabled admin allowlist only)
+  - `GET /v1/models` (enabled published models only: `public_id` + `display_name`)
   - `POST /v1/files` (multipart image upload)
 - Vision flow: uploaded images are stored privately in MinIO, then gateway fetches image bytes and injects data URLs into upstream request payload.
 - Security controls:
@@ -40,8 +41,10 @@ Tables:
 
 - `users`
 - `providers`
-- `allowed_models`
-- `user_provider_keys`
+- `provider_secrets`
+- `models`
+- `settings` (admin RPM/TPM)
+- `user_provider_keys` (deprecated, no user-facing routes/UI)
 - `threads`
 - `messages`
 - `files`
@@ -86,8 +89,7 @@ pnpm --filter @new-chat/web dev
 
 1. Register in `/login`.
 2. Open `/settings`:
-   - add provider key for `openai` or `grok2api`
-   - optionally set default provider/model
+   - choose a default model from admin-published models
 3. Open `/chat`:
    - send a text prompt
    - optionally attach an image and send
@@ -109,15 +111,16 @@ Gateway routes:
 - `POST /auth/login`
 - `POST /auth/logout`
 - `GET /me`
-- `POST /me/keys`
-- `GET /me/keys`
-- `POST /me/provider`
+- `PUT /me/model`
 - `GET /admin/providers`
-- `PATCH /admin/providers/:providerCode`
+- `PUT /admin/providers/:id/base_url`
+- `PUT /admin/providers/:id/secret`
+- `GET /admin/rate-limits`
+- `PUT /admin/rate-limits`
 - `GET /admin/models`
-- `POST /admin/models`
+- `POST /admin/models/import`
+- `POST /admin/models/bulk`
 - `PATCH /admin/models/:id`
-- `DELETE /admin/models/:id`
 - `GET /me/threads`
 - `GET /me/threads/:threadId/messages`
 - `GET /v1/models`
@@ -128,6 +131,6 @@ Gateway routes:
 ## Notes
 
 - `KEY_ENCRYPTION_KEY` is mandatory.
-- `ADMIN_EMAIL` must be set to enable admin endpoints and `/admin` UI link.
+- `ADMIN_EMAIL` is optional and only bootstraps admin elevation if a login/register email matches it.
 - `APP_ORIGIN` must match the web origin used by browser clients.
 - `SECURE_COOKIES=true` should be enabled behind HTTPS.

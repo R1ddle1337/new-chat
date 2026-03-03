@@ -21,7 +21,6 @@ export type ThreadItem = {
 
 type MePayload = {
   is_admin: boolean;
-  admin_enabled: boolean;
 };
 
 type ApiResult<T> =
@@ -139,7 +138,7 @@ export function ChatShellProvider({ children }: { children: ReactNode }) {
     }
 
     const me = (await meResponse.json()) as MePayload;
-    setIsAdmin(Boolean(me.admin_enabled && me.is_admin));
+    setIsAdmin(Boolean(me.is_admin));
     await refreshThreads();
     setLoading(false);
   }, [refreshThreads, router]);
