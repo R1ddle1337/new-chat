@@ -34,8 +34,8 @@ html,
 body {
   margin: 0;
   padding: 0;
-  min-height: 100%;
-  overflow-x: hidden;
+  height: 100%;
+  overflow: hidden;
   color: var(--text);
   background: var(--bg);
   font-family: var(--font-sans);
@@ -156,7 +156,7 @@ code {
 }
 
 .app-shell {
-  min-height: 100dvh;
+  height: 100dvh;
   display: grid;
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   background: var(--bg);
@@ -168,13 +168,14 @@ code {
 }
 
 .app-sidebar {
-  min-height: 100dvh;
+  min-height: 0;
   border-right: 1px solid var(--border);
   background: var(--sidebar-bg);
   padding: 0.7rem;
   display: flex;
   flex-direction: column;
   gap: 0.65rem;
+  overflow: hidden;
   position: relative;
   z-index: 30;
   transition:
@@ -461,10 +462,11 @@ code {
 
 .app-main {
   min-width: 0;
-  min-height: 100dvh;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   position: relative;
+  overflow: hidden;
   background: #ffffff;
 }
 
@@ -477,6 +479,7 @@ code {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .app-page {
@@ -484,6 +487,7 @@ code {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .app-mobile-toggle {
@@ -1040,6 +1044,13 @@ code {
   border-radius: 999px;
   border-color: var(--border);
   background: #f8f8fb;
+}
+
+@media (min-width: 761px) {
+  .chat-attach-button {
+    align-self: start;
+    margin-top: 0.2rem;
+  }
 }
 
 .chat-attach-button:hover {
