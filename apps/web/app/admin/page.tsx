@@ -43,6 +43,13 @@ type ModelDraft = {
   enabled: boolean;
 };
 
+type ProviderDraft = {
+  code: string;
+  name: string;
+  base_url: string;
+  enabled: boolean;
+};
+
 type RateLimitsPayload = {
   rpm_limit: number;
   tpm_limit: number;
@@ -147,6 +154,36 @@ function formatDateTime(value: string | null): string {
   return new Date(value).toLocaleString();
 }
 
+function normalizeProviderCode(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function normalizeProviderBaseUrl(value: string): string | null {
+  const candidate = value.trim();
+  if (!candidate) {
+    return null;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return null;
+  }
+
+  const protocol = parsed.protocol.toLowerCase();
+  if (protocol !== 'http:' && protocol !== 'https:') {
+    return null;
+  }
+
+  if (parsed.search || parsed.hash || !parsed.hostname) {
+    return null;
+  }
+
+  const cleanedPath = parsed.pathname.replace(/\/+$/, '');
+  return `${parsed.origin}${cleanedPath}`;
+}
+
 function summarizeRuleHits(ruleHits: AbuseRuleHit[]): string {
   if (!Array.isArray(ruleHits) || ruleHits.length === 0) {
     return 'No rule hits';
@@ -164,8 +201,14 @@ export default function AdminPage() {
   const [authorized, setAuthorized] = useState(false);
 
   const [providers, setProviders] = useState<ProviderItem[]>([]);
-  const [providerBaseUrlDrafts, setProviderBaseUrlDrafts] = useState<Record<number, string>>({});
+  const [providerDrafts, setProviderDrafts] = useState<Record<number, ProviderDraft>>({});
   const [providerSecretDrafts, setProviderSecretDrafts] = useState<Record<number, string>>({});
+  const [createProviderDraft, setCreateProviderDraft] = useState<ProviderDraft>({
+    code: '',
+    name: '',
+    base_url: '',
+    enabled: true,
+  });
 
   const [models, setModels] = useState<ModelItem[]>([]);
   const [modelDrafts, setModelDrafts] = useState<Record<number, ModelDraft>>({});
@@ -220,16 +263,32 @@ export default function AdminPage() {
 
     const payload = (await res.json()) as { data: ProviderItem[] };
     setProviders(payload.data);
-    setProviderBaseUrlDrafts(
-      Object.fromEntries(payload.data.map((item) => [item.id, item.base_url])),
+    setProviderDrafts(
+      Object.fromEntries(
+        payload.data.map((item) => [
+          item.id,
+          {
+            code: item.code,
+            name: item.name,
+            base_url: item.base_url,
+            enabled: item.enabled,
+          },
+        ]),
+      ),
     );
     setProviderSecretDrafts(
       Object.fromEntries(payload.data.map((item) => [item.id, ''])),
     );
 
-    if (!importProviderId && payload.data.length > 0) {
-      setImportProviderId(String(payload.data[0]!.id));
-    }
+    setImportProviderId((previous) => {
+      if (payload.data.length === 0) {
+        return '';
+      }
+      if (previous && payload.data.some((item) => String(item.id) === previous)) {
+        return previous;
+      }
+      return String(payload.data[0]!.id);
+    });
   };
 
   const loadModels = async () => {
@@ -381,32 +440,137 @@ export default function AdminPage() {
     void bootstrap();
   }, [router]);
 
-  const saveProviderBaseUrl = async (providerId: number) => {
-    const baseUrl = (providerBaseUrlDrafts[providerId] ?? '').trim();
+  const validateProviderDraft = (draft: ProviderDraft, providerId?: number) => {
+    const code = normalizeProviderCode(draft.code);
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(code)) {
+      setError('Provider code must be 1-64 chars: lowercase letters, numbers, "_" or "-"');
+      return null;
+    }
+
+    const duplicate = providers.some((provider) => {
+      if (typeof providerId === 'number' && provider.id === providerId) {
+        return false;
+      }
+      return provider.code.toLowerCase() === code;
+    });
+    if (duplicate) {
+      setError(`Provider code "${code}" already exists`);
+      return null;
+    }
+
+    const name = draft.name.trim();
+    if (!name || name.length > 120) {
+      setError('Provider name must be non-empty and at most 120 characters');
+      return null;
+    }
+
+    const baseUrl = normalizeProviderBaseUrl(draft.base_url);
     if (!baseUrl) {
-      setError('Base URL is required');
+      setError('Base URL must be a valid http(s) URL without query string or fragment');
+      return null;
+    }
+
+    return {
+      code,
+      name,
+      base_url: baseUrl,
+      enabled: draft.enabled,
+    };
+  };
+
+  const createProvider = async () => {
+    const payload = validateProviderDraft(createProviderDraft);
+    if (!payload) {
       return;
     }
 
     setStatus(null);
     setError(null);
-    setBusy(`provider-base-${providerId}`);
+    setBusy('provider-create');
 
     try {
-      const res = await fetch(`/api/admin/providers/${providerId}/base_url`, {
-        method: 'PUT',
+      const res = await fetch('/api/admin/providers', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ base_url: baseUrl }),
+        body: JSON.stringify(payload),
       });
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, 'Failed to update provider base URL'));
+        setError(parseError(body, 'Failed to create provider'));
         return;
       }
 
-      setStatus('Provider base URL updated');
+      setCreateProviderDraft({
+        code: '',
+        name: '',
+        base_url: '',
+        enabled: true,
+      });
+      setStatus(`Provider "${payload.code}" created`);
+      await loadProviders();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const saveProvider = async (providerId: number) => {
+    const draft = providerDrafts[providerId];
+    if (!draft) {
+      return;
+    }
+
+    const payload = validateProviderDraft(draft, providerId);
+    if (!payload) {
+      return;
+    }
+
+    setStatus(null);
+    setError(null);
+    setBusy(`provider-${providerId}`);
+
+    try {
+      const res = await fetch(`/api/admin/providers/${providerId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(payload),
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, 'Failed to update provider'));
+        return;
+      }
+
+      setStatus(`Provider "${payload.code}" updated`);
+      await loadProviders();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const toggleProviderEnabled = async (provider: ProviderItem) => {
+    setStatus(null);
+    setError(null);
+    setBusy(`provider-toggle-${provider.id}`);
+
+    try {
+      const res = await fetch(`/api/admin/providers/${provider.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ enabled: !provider.enabled }),
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, 'Failed to toggle provider'));
+        return;
+      }
+
+      setStatus(`Provider "${provider.code}" ${provider.enabled ? 'disabled' : 'enabled'}`);
       await loadProviders();
     } finally {
       setBusy(null);
@@ -426,7 +590,7 @@ export default function AdminPage() {
 
     try {
       const res = await fetch(`/api/admin/providers/${providerId}/secret`, {
-        method: 'PUT',
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify({ api_key: apiKey }),
@@ -854,42 +1018,194 @@ export default function AdminPage() {
       <div className="page-stack">
         <div className="card">
           <h2>Providers</h2>
+
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void createProvider();
+            }}
+          >
+            <div className="stack-tight">
+              <div className="notice">Create provider</div>
+
+              <label>
+                Code
+                <input
+                  value={createProviderDraft.code}
+                  onChange={(event) =>
+                    setCreateProviderDraft((previous) => ({
+                      ...previous,
+                      code: event.target.value,
+                    }))
+                  }
+                  placeholder="openai"
+                />
+              </label>
+
+              <label>
+                Name
+                <input
+                  value={createProviderDraft.name}
+                  onChange={(event) =>
+                    setCreateProviderDraft((previous) => ({
+                      ...previous,
+                      name: event.target.value,
+                    }))
+                  }
+                  placeholder="OpenAI"
+                />
+              </label>
+
+              <label>
+                Base URL
+                <input
+                  value={createProviderDraft.base_url}
+                  onChange={(event) =>
+                    setCreateProviderDraft((previous) => ({
+                      ...previous,
+                      base_url: event.target.value,
+                    }))
+                  }
+                  placeholder="https://api.openai.com/v1"
+                />
+              </label>
+
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={createProviderDraft.enabled}
+                  onChange={(event) =>
+                    setCreateProviderDraft((previous) => ({
+                      ...previous,
+                      enabled: event.target.checked,
+                    }))
+                  }
+                />
+                Enabled
+              </label>
+
+              <button className="primary" type="submit" disabled={busy !== null}>
+                {busy === 'provider-create' ? 'Creating...' : 'Create provider'}
+              </button>
+            </div>
+          </form>
+
+          <hr />
+
           <div className="stack-tight">
             {providers.map((provider) => {
-              const baseUrlDraft = providerBaseUrlDrafts[provider.id] ?? provider.base_url;
+              const draft = providerDrafts[provider.id] ?? {
+                code: provider.code,
+                name: provider.name,
+                base_url: provider.base_url,
+                enabled: provider.enabled,
+              };
               const secretDraft = providerSecretDrafts[provider.id] ?? '';
               return (
                 <div key={provider.id} className="admin-item">
                   <div className="mono admin-item-title">
                     {provider.code} ({provider.enabled ? 'enabled' : 'disabled'})
                   </div>
-                  <div className="notice">Secret configured: {provider.has_secret ? 'yes' : 'no'}</div>
+                  <div className="notice">
+                    Secret configured: {provider.has_secret ? 'yes' : 'no'}
+                    {provider.secret_updated_at
+                      ? ` (updated ${new Date(provider.secret_updated_at).toLocaleString()})`
+                      : ''}
+                  </div>
 
                   <label>
-                    Base URL
+                    Code
                     <input
-                      value={baseUrlDraft}
+                      value={draft.code}
                       onChange={(event) =>
-                        setProviderBaseUrlDrafts((previous) => ({
+                        setProviderDrafts((previous) => ({
                           ...previous,
-                          [provider.id]: event.target.value,
+                          [provider.id]: {
+                            ...draft,
+                            code: event.target.value,
+                          },
                         }))
                       }
                     />
                   </label>
 
-                  <button
-                    type="button"
-                    className="secondary"
-                    onClick={() => void saveProviderBaseUrl(provider.id)}
-                    disabled={busy !== null}
-                  >
-                    {busy === `provider-base-${provider.id}` ? 'Saving...' : 'Save base URL'}
-                  </button>
+                  <label>
+                    Name
+                    <input
+                      value={draft.name}
+                      onChange={(event) =>
+                        setProviderDrafts((previous) => ({
+                          ...previous,
+                          [provider.id]: {
+                            ...draft,
+                            name: event.target.value,
+                          },
+                        }))
+                      }
+                    />
+                  </label>
+
+                  <label>
+                    Base URL
+                    <input
+                      value={draft.base_url}
+                      onChange={(event) =>
+                        setProviderDrafts((previous) => ({
+                          ...previous,
+                          [provider.id]: {
+                            ...draft,
+                            base_url: event.target.value,
+                          },
+                        }))
+                      }
+                    />
+                  </label>
+
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={draft.enabled}
+                      onChange={(event) =>
+                        setProviderDrafts((previous) => ({
+                          ...previous,
+                          [provider.id]: {
+                            ...draft,
+                            enabled: event.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    Enabled
+                  </label>
+
+                  <div className="button-row">
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void saveProvider(provider.id)}
+                      disabled={busy !== null}
+                    >
+                      {busy === `provider-${provider.id}` ? 'Saving...' : 'Save provider'}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void toggleProviderEnabled(provider)}
+                      disabled={busy !== null}
+                    >
+                      {busy === `provider-toggle-${provider.id}`
+                        ? 'Saving...'
+                        : provider.enabled
+                          ? 'Disable'
+                          : 'Enable'}
+                    </button>
+                  </div>
 
                   <label>
                     API key
                     <input
+                      type="password"
                       value={secretDraft}
                       onChange={(event) =>
                         setProviderSecretDrafts((previous) => ({
@@ -897,6 +1213,7 @@ export default function AdminPage() {
                           [provider.id]: event.target.value,
                         }))
                       }
+                      autoComplete="off"
                       placeholder="sk-..."
                     />
                   </label>

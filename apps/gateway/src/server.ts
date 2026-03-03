@@ -267,6 +267,36 @@ function isConfiguredAdminEmail(email: string): boolean {
   return Boolean(config.adminEmail) && normalizeEmail(email) === config.adminEmail;
 }
 
+function normalizeProviderCode(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const candidate = value.trim().toLowerCase();
+  if (!candidate) {
+    return null;
+  }
+
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(candidate)) {
+    return null;
+  }
+
+  return candidate;
+}
+
+function normalizeProviderName(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const candidate = value.trim();
+  if (!candidate || candidate.length > 120) {
+    return null;
+  }
+
+  return candidate;
+}
+
 function normalizeProviderBaseUrl(raw: string): string | null {
   const candidate = raw.trim();
   if (!candidate) {
@@ -296,6 +326,14 @@ function normalizeProviderBaseUrl(raw: string): string | null {
   const cleanedPath = parsed.pathname.replace(/\/+$/, '');
   const pathname = cleanedPath ? cleanedPath : '';
   return `${parsed.origin}${pathname}`;
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+
+  return (error as { code?: unknown }).code === '23505';
 }
 
 function encryptApiKey(plainText: string): { encrypted: string; iv: string; authTag: string } {
@@ -3136,14 +3174,24 @@ async function setupServer(): Promise<void> {
     };
   });
 
-  app.put('/admin/providers/:id/base_url', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+  app.post('/admin/providers', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
     const user = request.authUser!;
-    const params = request.params as { id: string };
-    const body = (request.body ?? {}) as { base_url?: unknown };
-    const id = Number(params.id);
+    const body = (request.body ?? {}) as {
+      code?: unknown;
+      name?: unknown;
+      base_url?: unknown;
+      enabled?: unknown;
+    };
 
-    if (!Number.isInteger(id) || id <= 0) {
-      reply.code(400).send({ error: 'provider id must be a positive integer' });
+    const code = normalizeProviderCode(body.code);
+    if (!code) {
+      reply.code(400).send({ error: 'code must be 1-64 chars: lowercase letters, numbers, "_" or "-"' });
+      return;
+    }
+
+    const name = normalizeProviderName(body.name);
+    if (!name) {
+      reply.code(400).send({ error: 'name must be a non-empty string (max 120 chars)' });
       return;
     }
 
@@ -3160,13 +3208,147 @@ async function setupServer(): Promise<void> {
       return;
     }
 
-    const updated = await pool.query<ProviderRow>(
-      `UPDATE providers
-       SET base_url = $2
-       WHERE id = $1
-       RETURNING id, code, name, base_url, enabled`,
-      [id, normalizedBaseUrl],
-    );
+    if (typeof body.enabled !== 'undefined' && typeof body.enabled !== 'boolean') {
+      reply.code(400).send({ error: 'enabled must be a boolean' });
+      return;
+    }
+    const enabled = typeof body.enabled === 'boolean' ? body.enabled : true;
+
+    let inserted: { rows: ProviderRow[]; rowCount: number | null };
+    try {
+      inserted = await pool.query<ProviderRow>(
+        `INSERT INTO providers (code, name, base_url, enabled, updated_at)
+         VALUES ($1, $2, $3, $4, now())
+         RETURNING id, code, name, base_url, enabled`,
+        [code, name, normalizedBaseUrl, enabled],
+      );
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        reply.code(409).send({ error: `Provider code "${code}" already exists` });
+        return;
+      }
+      throw error;
+    }
+
+    const provider = inserted.rows[0]!;
+
+    await writeAuditEvent({
+      eventType: 'admin.providers.created',
+      request,
+      userId: user.id,
+      metadata: { provider_id: provider.id, provider: provider.code, enabled: provider.enabled },
+    });
+
+    reply.code(201).send({
+      data: {
+        id: provider.id,
+        code: provider.code,
+        name: provider.name,
+        base_url: provider.base_url,
+        enabled: provider.enabled,
+        has_secret: false,
+        secret_updated_at: null,
+      },
+    });
+  });
+
+  app.patch('/admin/providers/:id', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+    const user = request.authUser!;
+    const params = request.params as { id: string };
+    const body = (request.body ?? {}) as {
+      code?: unknown;
+      name?: unknown;
+      base_url?: unknown;
+      enabled?: unknown;
+    };
+    const id = Number(params.id);
+
+    if (!Number.isInteger(id) || id <= 0) {
+      reply.code(400).send({ error: 'provider id must be a positive integer' });
+      return;
+    }
+
+    const updates: string[] = [];
+    const values: Array<string | number | boolean> = [id];
+    const updatedFields: string[] = [];
+
+    if (Object.prototype.hasOwnProperty.call(body, 'code')) {
+      const code = normalizeProviderCode(body.code);
+      if (!code) {
+        reply
+          .code(400)
+          .send({ error: 'code must be 1-64 chars: lowercase letters, numbers, "_" or "-"' });
+        return;
+      }
+      updates.push(`code = $${values.length + 1}`);
+      values.push(code);
+      updatedFields.push('code');
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'name')) {
+      const name = normalizeProviderName(body.name);
+      if (!name) {
+        reply.code(400).send({ error: 'name must be a non-empty string (max 120 chars)' });
+        return;
+      }
+      updates.push(`name = $${values.length + 1}`);
+      values.push(name);
+      updatedFields.push('name');
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'base_url')) {
+      if (typeof body.base_url !== 'string') {
+        reply.code(400).send({ error: 'base_url must be a string' });
+        return;
+      }
+
+      const normalizedBaseUrl = normalizeProviderBaseUrl(body.base_url);
+      if (!normalizedBaseUrl) {
+        reply.code(400).send({
+          error: 'base_url must be a valid http(s) URL without query string or fragment',
+        });
+        return;
+      }
+
+      updates.push(`base_url = $${values.length + 1}`);
+      values.push(normalizedBaseUrl);
+      updatedFields.push('base_url');
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, 'enabled')) {
+      if (typeof body.enabled !== 'boolean') {
+        reply.code(400).send({ error: 'enabled must be a boolean' });
+        return;
+      }
+
+      updates.push(`enabled = $${values.length + 1}`);
+      values.push(body.enabled);
+      updatedFields.push('enabled');
+    }
+
+    if (updates.length === 0) {
+      reply.code(400).send({ error: 'At least one of code, name, base_url, enabled must be provided' });
+      return;
+    }
+
+    updates.push('updated_at = now()');
+
+    let updated: { rows: ProviderRow[]; rowCount: number | null };
+    try {
+      updated = await pool.query<ProviderRow>(
+        `UPDATE providers
+         SET ${updates.join(', ')}
+         WHERE id = $1
+         RETURNING id, code, name, base_url, enabled`,
+        values,
+      );
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        reply.code(409).send({ error: 'Provider code already exists' });
+        return;
+      }
+      throw error;
+    }
 
     if (!updated.rowCount) {
       reply.code(404).send({ error: 'Provider not found' });
@@ -3175,10 +3357,10 @@ async function setupServer(): Promise<void> {
 
     const provider = updated.rows[0]!;
     await writeAuditEvent({
-      eventType: 'admin.providers.base_url_updated',
+      eventType: 'admin.providers.updated',
       request,
       userId: user.id,
-      metadata: { provider_id: provider.id, provider: provider.code },
+      metadata: { provider_id: provider.id, provider: provider.code, updated_fields: updatedFields },
     });
 
     reply.send({
@@ -3192,7 +3374,7 @@ async function setupServer(): Promise<void> {
     });
   });
 
-  app.put('/admin/providers/:id/secret', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+  const saveProviderSecret = async (request: FastifyRequest, reply: FastifyReply) => {
     const user = request.authUser!;
     const params = request.params as { id: string };
     const body = (request.body ?? {}) as { api_key?: unknown; apiKey?: unknown };
@@ -3241,7 +3423,10 @@ async function setupServer(): Promise<void> {
     });
 
     reply.send({ ok: true });
-  });
+  };
+
+  app.post('/admin/providers/:id/secret', { preHandler: [requireAuth, requireAdmin] }, saveProviderSecret);
+  app.put('/admin/providers/:id/secret', { preHandler: [requireAuth, requireAdmin] }, saveProviderSecret);
 
   app.post('/admin/models/import', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
     const user = request.authUser!;
