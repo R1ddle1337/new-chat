@@ -1103,9 +1103,12 @@ export default function ChatPage() {
       return;
     }
 
+    const computedMinHeight = Number.parseFloat(window.getComputedStyle(textarea).minHeight);
+    const minHeight = Number.isFinite(computedMinHeight) ? computedMinHeight : 44;
+
     textarea.style.height = '0px';
     const nextHeight = Math.min(textarea.scrollHeight, 220);
-    textarea.style.height = `${Math.max(nextHeight, 44)}px`;
+    textarea.style.height = `${Math.max(nextHeight, minHeight)}px`;
   }, []);
 
   const scrollToLatest = useCallback((behavior: ScrollBehavior = 'auto') => {
