@@ -2104,6 +2104,12 @@ code {
   }
 }
 
+@media (hover: none) and (pointer: coarse) {
+  .chat-page .main-header-text {
+    display: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .app-shell,
   .app-sidebar,

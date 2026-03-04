@@ -13,6 +13,18 @@ import {
 
 const mobileBreakpointPx = 980;
 
+function detectBottomSheetPreference(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  const pointerCoarse =
+    window.matchMedia('(pointer: coarse)').matches ||
+    window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+  const narrow = window.matchMedia(`(max-width: ${mobileBreakpointPx}px)`).matches;
+  return pointerCoarse || narrow;
+}
+
 export type ModelPickerOption = {
   id: string;
   display_name?: string | null;
@@ -37,12 +49,7 @@ function getSecondaryLabel(option: ModelPickerOption): string | null {
 
 function ModelPickerComponent({ options, value, onChange, disabled = false }: ModelPickerProps) {
   const [isOpen, setIsOpen] = useState(false);
-  const [isMobile, setIsMobile] = useState(() => {
-    if (typeof window === 'undefined') {
-      return false;
-    }
-    return window.matchMedia(`(max-width: ${mobileBreakpointPx}px)`).matches;
-  });
+  const [useBottomSheet, setUseBottomSheet] = useState(() => detectBottomSheetPreference());
   const [search, setSearch] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
 
@@ -84,23 +91,44 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
       return;
     }
 
-    const mediaQuery = window.matchMedia(`(max-width: ${mobileBreakpointPx}px)`);
-    const syncIsMobile = () => {
-      setIsMobile(mediaQuery.matches);
+    const narrowQuery = window.matchMedia(`(max-width: ${mobileBreakpointPx}px)`);
+    const pointerCoarseQuery = window.matchMedia('(pointer: coarse)');
+    const hoverNoneAndPointerCoarseQuery = window.matchMedia('(hover: none) and (pointer: coarse)');
+
+    const syncUseBottomSheet = () => {
+      const pointerCoarse =
+        pointerCoarseQuery.matches || hoverNoneAndPointerCoarseQuery.matches;
+      setUseBottomSheet(pointerCoarse || narrowQuery.matches);
     };
 
-    syncIsMobile();
+    const addMediaListener = (query: MediaQueryList, listener: () => void) => {
+      if (typeof query.addEventListener === 'function') {
+        query.addEventListener('change', listener);
+        return;
+      }
 
-    if (typeof mediaQuery.addEventListener === 'function') {
-      mediaQuery.addEventListener('change', syncIsMobile);
-      return () => {
-        mediaQuery.removeEventListener('change', syncIsMobile);
-      };
-    }
+      query.addListener(listener);
+    };
 
-    mediaQuery.addListener(syncIsMobile);
+    const removeMediaListener = (query: MediaQueryList, listener: () => void) => {
+      if (typeof query.removeEventListener === 'function') {
+        query.removeEventListener('change', listener);
+        return;
+      }
+
+      query.removeListener(listener);
+    };
+
+    syncUseBottomSheet();
+
+    addMediaListener(narrowQuery, syncUseBottomSheet);
+    addMediaListener(pointerCoarseQuery, syncUseBottomSheet);
+    addMediaListener(hoverNoneAndPointerCoarseQuery, syncUseBottomSheet);
+
     return () => {
-      mediaQuery.removeListener(syncIsMobile);
+      removeMediaListener(narrowQuery, syncUseBottomSheet);
+      removeMediaListener(pointerCoarseQuery, syncUseBottomSheet);
+      removeMediaListener(hoverNoneAndPointerCoarseQuery, syncUseBottomSheet);
     };
   }, []);
 
@@ -183,7 +211,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
   }, [activeIndex, filteredOptions.length, isOpen]);
 
   useEffect(() => {
-    if (!isOpen || !isMobile) {
+    if (!isOpen || !useBottomSheet) {
       return;
     }
 
@@ -192,7 +220,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
     return () => {
       document.body.style.overflow = previousOverflow;
     };
-  }, [isMobile, isOpen]);
+  }, [isOpen, useBottomSheet]);
 
   const closePicker = useCallback((focusTrigger: boolean) => {
     setIsOpen(false);
@@ -389,7 +417,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
       </button>
 
       {isOpen ? (
-        isMobile ? (
+        useBottomSheet ? (
           <>
             <button
               type="button"
