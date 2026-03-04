@@ -598,6 +598,25 @@ code {
   justify-content: space-between;
   align-items: center;
   gap: 0.7rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.card-title-row > h2,
+.card-title-row > strong {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card-title-row > strong {
+  display: block;
+}
+
+.card-title-row button {
+  flex: 0 0 auto;
 }
 
 .stack-tight {
@@ -967,11 +986,15 @@ code {
 @media (max-width: 640px) {
   .admin-subnav {
     flex-wrap: nowrap;
-    overflow: auto;
-    padding-bottom: 0.2rem;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    padding: 0 0.2rem 0.2rem;
   }
 
   .admin-subnav-link {
+    flex: 0 0 auto;
     white-space: nowrap;
   }
 
