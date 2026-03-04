@@ -11,7 +11,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 
-const mobileBreakpointPx = 760;
+const mobileBreakpointPx = 980;
 
 export type ModelPickerOption = {
   id: string;
@@ -37,7 +37,12 @@ function getSecondaryLabel(option: ModelPickerOption): string | null {
 
 function ModelPickerComponent({ options, value, onChange, disabled = false }: ModelPickerProps) {
   const [isOpen, setIsOpen] = useState(false);
-  const [isMobile, setIsMobile] = useState(false);
+  const [isMobile, setIsMobile] = useState(() => {
+    if (typeof window === 'undefined') {
+      return false;
+    }
+    return window.matchMedia(`(max-width: ${mobileBreakpointPx}px)`).matches;
+  });
   const [search, setSearch] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
 
@@ -383,31 +388,37 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
         </span>
       </button>
 
-      {isOpen && !isMobile ? <div className="chat-model-popover">{optionsPanel}</div> : null}
-
-      {isOpen && isMobile ? (
-        <>
-          <button
-            type="button"
-            className="chat-model-sheet-backdrop"
-            onClick={() => closePicker(true)}
-            aria-label="Close model picker"
-          />
-          <section
-            className="chat-model-sheet"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Select model"
-          >
-            <header className="chat-model-sheet-header">
-              <strong>Select model</strong>
-              <button type="button" className="chat-model-sheet-close" onClick={() => closePicker(true)}>
-                Done
-              </button>
-            </header>
-            {optionsPanel}
-          </section>
-        </>
+      {isOpen ? (
+        isMobile ? (
+          <>
+            <button
+              type="button"
+              className="chat-model-sheet-backdrop"
+              onClick={() => closePicker(true)}
+              aria-label="Close model picker"
+            />
+            <section
+              className="chat-model-sheet"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Select model"
+            >
+              <header className="chat-model-sheet-header">
+                <strong>Select model</strong>
+                <button
+                  type="button"
+                  className="chat-model-sheet-close"
+                  onClick={() => closePicker(true)}
+                >
+                  Done
+                </button>
+              </header>
+              {optionsPanel}
+            </section>
+          </>
+        ) : (
+          <div className="chat-model-popover">{optionsPanel}</div>
+        )
       ) : null}
     </div>
   );

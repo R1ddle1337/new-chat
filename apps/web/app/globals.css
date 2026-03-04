@@ -1928,6 +1928,10 @@ code {
     align-items: stretch;
   }
 
+  .chat-page .main-header-text {
+    display: none;
+  }
+
   .chat-page .main-header-text p {
     display: none;
   }
