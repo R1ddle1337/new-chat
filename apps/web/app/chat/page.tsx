@@ -17,6 +17,7 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import MainHeader from '../components/main-header';
 import { useChatShell } from '../components/chat-shell-context';
+import ImageAttachment from './image-attachment';
 
 type MessageAttachment = {
   file_id: string;
@@ -728,7 +729,7 @@ const ChatMessageRow = memo(
                     title={attachment.filename}
                   >
                     {imageAttachment ? (
-                      <img src={attachment.content_url} alt={attachment.filename} loading="lazy" />
+                      <ImageAttachment url={attachment.content_url} alt={attachment.filename} />
                     ) : (
                       <div className="chat-message-attachment-fallback">FILE</div>
                     )}
