@@ -165,6 +165,16 @@ declare module 'fastify' {
   }
 }
 
+const truthyEnvValues = new Set(['1', 'true', 'yes', 'on']);
+
+function parseEnvToggle(rawValue: string | undefined): boolean {
+  if (typeof rawValue !== 'string') {
+    return false;
+  }
+
+  return truthyEnvValues.has(rawValue.trim().toLowerCase());
+}
+
 const config = {
   host: process.env.HOST ?? '0.0.0.0',
   port: Number(process.env.PORT ?? 3001),
@@ -186,6 +196,8 @@ const config = {
   oauthGoogleClientId: (process.env.OAUTH_GOOGLE_CLIENT_ID ?? '').trim(),
   oauthGoogleClientSecret: (process.env.OAUTH_GOOGLE_CLIENT_SECRET ?? '').trim(),
   oauthGoogleRedirectUri: (process.env.OAUTH_GOOGLE_REDIRECT_URI ?? '').trim(),
+  disablePasswordRegister: parseEnvToggle(process.env.DISABLE_PASSWORD_REGISTER),
+  disablePasswordLogin: parseEnvToggle(process.env.DISABLE_PASSWORD_LOGIN),
   abuseThrottleDurationMinutes: Number(process.env.ABUSE_THROTTLE_DURATION_MINUTES ?? 20),
   abuseBanDurationMinutes: Number(process.env.ABUSE_TEMP_BAN_DURATION_MINUTES ?? 60),
   abuseThrottleScoreThreshold: Number(process.env.ABUSE_THROTTLE_SCORE_THRESHOLD ?? 55),
@@ -2940,6 +2952,14 @@ async function setupServer(): Promise<void> {
 
   app.get('/healthz', async () => ({ ok: true }));
 
+  app.get('/auth/methods', async () => {
+    return {
+      password_login_enabled: !config.disablePasswordLogin,
+      password_register_enabled: !config.disablePasswordRegister,
+      oauth_providers: oauthRegistry.listConfiguredProviders(),
+    };
+  });
+
   app.get('/auth/oauth/providers', async () => {
     return { data: oauthRegistry.listConfiguredProviders() };
   });
@@ -3053,6 +3073,16 @@ async function setupServer(): Promise<void> {
   });
 
   app.post('/auth/register', { preHandler: [authRateLimit] }, async (request, reply) => {
+    if (config.disablePasswordRegister) {
+      await writeAuditEvent({
+        eventType: 'auth.password_register_disabled',
+        request,
+        metadata: {},
+      });
+      reply.code(404).send({ error: 'Not found' });
+      return;
+    }
+
     const body = request.body as { email?: unknown; password?: unknown };
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
     const password = typeof body?.password === 'string' ? body.password : '';
@@ -3119,6 +3149,16 @@ async function setupServer(): Promise<void> {
   });
 
   app.post('/auth/login', { preHandler: [authRateLimit] }, async (request, reply) => {
+    if (config.disablePasswordLogin) {
+      await writeAuditEvent({
+        eventType: 'auth.password_login_disabled',
+        request,
+        metadata: {},
+      });
+      reply.code(404).send({ error: 'Not found' });
+      return;
+    }
+
     const body = request.body as { email?: unknown; password?: unknown };
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
     const password = typeof body?.password === 'string' ? body.password : '';
