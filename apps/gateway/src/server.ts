@@ -4355,16 +4355,22 @@ async function setupServer(): Promise<void> {
     const user = request.authUser!;
     const params = request.params as { threadId: string };
     const body = (request.body ?? {}) as { title?: unknown };
-    const title =
-      typeof body.title === 'string' ? body.title.replace(/\s+/g, ' ').trim() : '';
+    const threadId = typeof params.threadId === 'string' ? params.threadId.trim() : '';
+
+    if (!uuidPattern.test(threadId)) {
+      reply.code(400).send({ error: 'threadId must be a valid UUID' });
+      return;
+    }
+
+    const title = typeof body.title === 'string' ? body.title.replace(/\s+/g, ' ').trim() : '';
 
     if (!title) {
       reply.code(400).send({ error: 'title is required' });
       return;
     }
 
-    if (title.length > 120) {
-      reply.code(400).send({ error: 'title must be 120 characters or fewer' });
+    if (title.length > 80) {
+      reply.code(400).send({ error: 'title must be between 1 and 80 characters' });
       return;
     }
 
@@ -4380,7 +4386,7 @@ async function setupServer(): Promise<void> {
            updated_at = now()
        WHERE id = $1 AND user_id = $2
        RETURNING id, title, model, updated_at, created_at`,
-      [params.threadId, user.id, title],
+      [threadId, user.id, title],
     );
 
     if (!updated.rowCount) {
@@ -4393,7 +4399,7 @@ async function setupServer(): Promise<void> {
       request,
       userId: user.id,
       metadata: {
-        thread_id: params.threadId,
+        thread_id: threadId,
       },
     });
 
@@ -4403,12 +4409,18 @@ async function setupServer(): Promise<void> {
   app.delete('/me/threads/:threadId', { preHandler: [requireAuth] }, async (request, reply) => {
     const user = request.authUser!;
     const params = request.params as { threadId: string };
+    const threadId = typeof params.threadId === 'string' ? params.threadId.trim() : '';
+
+    if (!uuidPattern.test(threadId)) {
+      reply.code(400).send({ error: 'threadId must be a valid UUID' });
+      return;
+    }
 
     const deleted = await pool.query<{ id: string }>(
       `DELETE FROM threads
        WHERE id = $1 AND user_id = $2
        RETURNING id`,
-      [params.threadId, user.id],
+      [threadId, user.id],
     );
 
     if (!deleted.rowCount) {
@@ -4421,11 +4433,29 @@ async function setupServer(): Promise<void> {
       request,
       userId: user.id,
       metadata: {
-        thread_id: params.threadId,
+        thread_id: threadId,
       },
     });
 
     reply.send({ ok: true });
+  });
+
+  app.post('/me/threads/clear', { preHandler: [requireAuth] }, async (request, reply) => {
+    const user = request.authUser!;
+
+    const deleted = await pool.query('DELETE FROM threads WHERE user_id = $1', [user.id]);
+    const deletedCount = deleted.rowCount ?? 0;
+
+    await writeAuditEvent({
+      eventType: 'threads.cleared',
+      request,
+      userId: user.id,
+      metadata: {
+        deleted_count: deletedCount,
+      },
+    });
+
+    reply.send({ ok: true, deleted_count: deletedCount });
   });
 
   app.get('/me/threads/:threadId/messages', { preHandler: [requireAuth] }, async (request, reply) => {

@@ -44,6 +44,7 @@ type ChatShellContextValue = {
   createThread: () => Promise<ApiResult<string>>;
   renameThread: (threadId: string, title: string) => Promise<ApiResult<ThreadItem>>;
   deleteThread: (threadId: string) => Promise<ApiResult<void>>;
+  clearThreads: () => Promise<ApiResult<void>>;
 };
 
 const ChatShellContext = createContext<ChatShellContextValue | null>(null);
@@ -77,9 +78,16 @@ function pickSelectedThreadId(
   previousSelectedId: string | null,
   preferredThreadId?: string | null,
 ): string | null {
-  const preferred = preferredThreadId ?? previousSelectedId;
-  if (preferred && threads.some((thread) => thread.id === preferred)) {
-    return preferred;
+  if (preferredThreadId === null) {
+    return null;
+  }
+
+  if (preferredThreadId && threads.some((thread) => thread.id === preferredThreadId)) {
+    return preferredThreadId;
+  }
+
+  if (previousSelectedId && threads.some((thread) => thread.id === previousSelectedId)) {
+    return previousSelectedId;
   }
 
   return threads[0]?.id ?? null;
@@ -213,13 +221,12 @@ export function ChatShellProvider({ children }: { children: ReactNode }) {
       }
 
       const payload = (await response.json()) as { data: ThreadItem };
-      setThreads((current) =>
-        current.map((thread) => (thread.id === threadId ? payload.data : thread)),
-      );
+      setThreads((current) => current.map((thread) => (thread.id === threadId ? payload.data : thread)));
+      await refreshThreads(threadId);
 
       return { ok: true, value: payload.data };
     },
-    [router],
+    [refreshThreads, router],
   );
 
   const deleteThread = useCallback(
@@ -239,14 +246,50 @@ export function ChatShellProvider({ children }: { children: ReactNode }) {
         return { ok: false, error: parseErrorMessage(body, 'Failed to delete thread') };
       }
 
+      const deletingSelectedThread = selectedThreadId === threadId;
       setThreads((current) => current.filter((thread) => thread.id !== threadId));
-      setSelectedThreadId((current) => (current === threadId ? null : current));
+      if (deletingSelectedThread) {
+        setSelectedThreadId(null);
+      }
 
-      await refreshThreads(selectedThreadId === threadId ? null : selectedThreadId);
+      await refreshThreads(deletingSelectedThread ? null : (selectedThreadId ?? undefined));
+      if (deletingSelectedThread && pathname !== '/chat') {
+        router.push('/chat');
+      }
 
       return { ok: true, value: undefined };
     },
-    [refreshThreads, router, selectedThreadId],
+    [pathname, refreshThreads, router, selectedThreadId],
+  );
+
+  const clearThreads = useCallback(
+    async (): Promise<ApiResult<void>> => {
+      const response = await fetch('/api/me/threads/clear', {
+        method: 'POST',
+        credentials: 'include',
+      });
+
+      if (response.status === 401) {
+        router.replace('/login');
+        return { ok: false, error: 'Your session expired. Please log in again.' };
+      }
+
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as unknown;
+        return { ok: false, error: parseErrorMessage(body, 'Failed to clear threads') };
+      }
+
+      setThreads([]);
+      setSelectedThreadId(null);
+      await refreshThreads(null);
+
+      if (pathname !== '/chat') {
+        router.push('/chat');
+      }
+
+      return { ok: true, value: undefined };
+    },
+    [pathname, refreshThreads, router],
   );
 
   const contextValue = useMemo<ChatShellContextValue>(
@@ -261,6 +304,7 @@ export function ChatShellProvider({ children }: { children: ReactNode }) {
       createThread,
       renameThread,
       deleteThread,
+      clearThreads,
     }),
     [
       loading,
@@ -273,6 +317,7 @@ export function ChatShellProvider({ children }: { children: ReactNode }) {
       createThread,
       renameThread,
       deleteThread,
+      clearThreads,
     ],
   );
 

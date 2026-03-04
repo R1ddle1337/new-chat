@@ -235,14 +235,15 @@ code {
 }
 
 .sidebar-new-chat {
-  width: 100%;
   border-radius: 11px;
   border: 1px solid var(--border);
   background: #ffffff;
   color: var(--text);
-  display: inline-flex;
+  display: flex;
   align-items: center;
   justify-content: flex-start;
+  flex: 1;
+  min-width: 0;
   gap: 0.48rem;
   padding: 0.56rem 0.7rem;
 }
@@ -254,6 +255,38 @@ code {
 .sidebar-new-chat-plus {
   font-size: 1rem;
   line-height: 1;
+}
+
+.sidebar-toolbar {
+  display: grid;
+  gap: 0.46rem;
+}
+
+.sidebar-search-input {
+  width: 100%;
+  font-size: 0.84rem;
+  border-radius: 10px;
+  padding: 0.5rem 0.62rem;
+  background: #ffffff;
+}
+
+.sidebar-search-input::placeholder {
+  color: #7a7f87;
+}
+
+.sidebar-toolbar-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.38rem;
+}
+
+.sidebar-header-menu-wrap {
+  position: relative;
+}
+
+.sidebar-header-menu {
+  top: calc(100% + 0.28rem);
 }
 
 .sidebar-thread-list {
@@ -305,8 +338,8 @@ code {
   text-overflow: ellipsis;
 }
 
-.sidebar-thread-model {
-  font-size: 0.76rem;
+.sidebar-thread-updated {
+  font-size: 0.74rem;
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
@@ -314,7 +347,50 @@ code {
 }
 
 .sidebar-thread-actions {
-  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.22rem;
+  min-height: 100%;
+  padding-right: 0.1rem;
+}
+
+.sidebar-thread-action {
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.73rem;
+  font-weight: 600;
+  padding: 0.22rem 0.42rem;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity var(--motion-duration) var(--motion-ease),
+    background-color var(--motion-duration) var(--motion-ease),
+    color var(--motion-duration) var(--motion-ease);
+}
+
+.sidebar-thread-action:hover,
+.sidebar-thread-action:focus-visible {
+  background: #e5e7ec;
+  color: var(--text);
+}
+
+.sidebar-thread-action.danger:hover,
+.sidebar-thread-action.danger:focus-visible {
+  background: #fef2f2;
+  color: var(--error);
+}
+
+.sidebar-thread-row:hover .sidebar-thread-action,
+.sidebar-thread-row:focus-within .sidebar-thread-action,
+.sidebar-thread-row.selected .sidebar-thread-action {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.sidebar-thread-mobile-kebab {
+  display: none;
 }
 
 .sidebar-kebab {
@@ -389,6 +465,72 @@ code {
   color: var(--error);
 }
 
+.sidebar-sheet-backdrop,
+.sidebar-sheet {
+  display: none;
+}
+
+.sidebar-sheet-backdrop {
+  border: 0;
+  padding: 0;
+  position: fixed;
+  inset: 0;
+  z-index: 41;
+  background: rgba(17, 17, 17, 0.42);
+}
+
+.sidebar-sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 42;
+  background: #ffffff;
+  border-radius: 16px 16px 0 0;
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -12px 28px rgba(16, 24, 40, 0.2);
+  padding: 0.5rem 0.7rem calc(0.9rem + env(safe-area-inset-bottom));
+}
+
+.sidebar-sheet-handle {
+  width: 38px;
+  height: 4px;
+  border-radius: 999px;
+  background: #d1d5db;
+  margin: 0.15rem auto 0.56rem;
+}
+
+.sidebar-sheet-title {
+  text-align: center;
+  font-size: 0.86rem;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 0.45rem;
+}
+
+.sidebar-sheet-action {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #ffffff;
+  color: var(--text);
+  text-align: left;
+  padding: 0.6rem 0.68rem;
+  font-size: 0.88rem;
+}
+
+.sidebar-sheet-action + .sidebar-sheet-action {
+  margin-top: 0.35rem;
+}
+
+.sidebar-sheet-action.danger {
+  color: var(--error);
+  border-color: #f0cdcd;
+  background: #fff7f7;
+}
+
 .sidebar-rename-row {
   display: grid;
   gap: 0.4rem;
@@ -459,15 +601,11 @@ code {
 }
 
 .app-shell.sidebar-collapsed .sidebar-brand-label,
-.app-shell.sidebar-collapsed .sidebar-new-chat-label,
+.app-shell.sidebar-collapsed .sidebar-toolbar,
 .app-shell.sidebar-collapsed .sidebar-thread-list,
 .app-shell.sidebar-collapsed .sidebar-nav-label,
 .app-shell.sidebar-collapsed .sidebar-feedback {
   display: none;
-}
-
-.app-shell.sidebar-collapsed .sidebar-new-chat {
-  justify-content: center;
 }
 
 .app-shell.sidebar-collapsed .sidebar-nav-link {
@@ -2238,8 +2376,8 @@ code {
     display: inline;
   }
 
-  .app-shell.sidebar-collapsed .sidebar-new-chat-label {
-    display: inline;
+  .app-shell.sidebar-collapsed .sidebar-toolbar {
+    display: grid;
   }
 
   .app-shell.sidebar-collapsed .sidebar-thread-list {
@@ -2254,7 +2392,6 @@ code {
     display: block;
   }
 
-  .app-shell.sidebar-collapsed .sidebar-new-chat,
   .app-shell.sidebar-collapsed .sidebar-nav-link {
     justify-content: flex-start;
   }
@@ -2301,6 +2438,24 @@ code {
     min-height: 42px;
   }
 
+  .sidebar-toolbar-actions {
+    gap: 0.32rem;
+  }
+
+  .sidebar-thread-action {
+    display: none;
+  }
+
+  .sidebar-thread-mobile-kebab {
+    display: inline-grid;
+    place-items: center;
+  }
+
+  .sidebar-sheet-backdrop,
+  .sidebar-sheet {
+    display: block;
+  }
+
   .chat-page {
     --chat-jump-bottom-offset: 5.45rem;
   }
@@ -2323,6 +2478,20 @@ code {
 @media (hover: none) and (pointer: coarse) {
   .chat-page .main-header-text {
     display: none;
+  }
+
+  .sidebar-thread-action {
+    display: none;
+  }
+
+  .sidebar-thread-mobile-kebab {
+    display: inline-grid;
+    place-items: center;
+  }
+
+  .sidebar-sheet-backdrop,
+  .sidebar-sheet {
+    display: block;
   }
 }
 

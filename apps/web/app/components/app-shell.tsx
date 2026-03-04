@@ -41,6 +41,8 @@ function AppShellChrome({ children }: AppShellProps) {
     >
       <Sidebar
         collapsed={sidebarCollapsed}
+        mobileOpen={mobileOpen}
+        onOpenMobile={() => setMobileOpen(true)}
         onCloseMobile={() => setMobileOpen(false)}
         onToggleCollapse={() => setSidebarCollapsed((current) => !current)}
       />
