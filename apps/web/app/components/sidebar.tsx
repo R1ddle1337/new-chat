@@ -123,6 +123,8 @@ export default function Sidebar({ collapsed, onCloseMobile, onToggleCollapse }: 
     setRenamingThreadId(null);
   };
 
+  const isNavItemActive = (href: string) => pathname === href || pathname.startsWith(`${href}/`);
+
   return (
     <aside className="app-sidebar">
       <div className="sidebar-header">
@@ -258,7 +260,7 @@ export default function Sidebar({ collapsed, onCloseMobile, onToggleCollapse }: 
       <footer className="sidebar-footer">
         <Link
           href="/chat"
-          className={`sidebar-nav-link${pathname === '/chat' ? ' active' : ''}`}
+          className={`sidebar-nav-link${isNavItemActive('/chat') ? ' active' : ''}`}
           onClick={handleNavClick}
         >
           <span className="sidebar-nav-icon">C</span>
@@ -269,7 +271,7 @@ export default function Sidebar({ collapsed, onCloseMobile, onToggleCollapse }: 
           <Link
             key={item.href}
             href={item.href}
-            className={`sidebar-nav-link${pathname === item.href ? ' active' : ''}`}
+            className={`sidebar-nav-link${isNavItemActive(item.href) ? ' active' : ''}`}
             onClick={handleNavClick}
           >
             <span className="sidebar-nav-icon">{item.label[0]}</span>
