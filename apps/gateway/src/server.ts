@@ -8,6 +8,7 @@ import { Client as MinioClient } from 'minio';
 import { Pool } from 'pg';
 import Redis from 'ioredis';
 import { runMigrations } from './migrations';
+import { createOAuthRegistry } from './oauth';
 
 type DbUser = {
   id: string;
@@ -182,6 +183,9 @@ const config = {
   keyEncryptionKey: process.env.KEY_ENCRYPTION_KEY ?? '',
   secureCookies: process.env.SECURE_COOKIES === 'true',
   adminEmail: (process.env.ADMIN_EMAIL ?? '').trim().toLowerCase(),
+  oauthGoogleClientId: (process.env.OAUTH_GOOGLE_CLIENT_ID ?? '').trim(),
+  oauthGoogleClientSecret: (process.env.OAUTH_GOOGLE_CLIENT_SECRET ?? '').trim(),
+  oauthGoogleRedirectUri: (process.env.OAUTH_GOOGLE_REDIRECT_URI ?? '').trim(),
   abuseThrottleDurationMinutes: Number(process.env.ABUSE_THROTTLE_DURATION_MINUTES ?? 20),
   abuseBanDurationMinutes: Number(process.env.ABUSE_TEMP_BAN_DURATION_MINUTES ?? 60),
   abuseThrottleScoreThreshold: Number(process.env.ABUSE_THROTTLE_SCORE_THRESHOLD ?? 55),
@@ -235,6 +239,16 @@ const app = Fastify({
   bodyLimit: 20 * 1024 * 1024,
 });
 
+const oauthRegistry = createOAuthRegistry({
+  redis,
+  secureCookies: config.secureCookies,
+  google: {
+    clientId: config.oauthGoogleClientId,
+    clientSecret: config.oauthGoogleClientSecret,
+    redirectUri: config.oauthGoogleRedirectUri,
+  },
+});
+
 const stateChangingMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const MAX_RAW_CONTENT_JSON_BYTES = 200 * 1024;
 const RATE_LIMIT_WINDOW_SECONDS = 60;
@@ -273,6 +287,20 @@ let rateLimitSettingsCache:
 
 function normalizeEmail(value: string): string {
   return value.trim().toLowerCase();
+}
+
+function normalizeLoginErrorCode(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return normalized || 'oauth_failed';
+}
+
+function redirectToLoginError(reply: FastifyReply, errorCode: string): void {
+  const normalizedError = normalizeLoginErrorCode(errorCode);
+  reply.redirect(`/login?error=${encodeURIComponent(normalizedError)}`);
 }
 
 function isConfiguredAdminEmail(email: string): boolean {
@@ -1759,6 +1787,129 @@ async function getUserById(userId: string): Promise<DbUser | null> {
   return result.rowCount ? result.rows[0]! : null;
 }
 
+async function getUserByEmail(email: string): Promise<DbUser | null> {
+  const normalizedEmail = normalizeEmail(email);
+  const result = await pool.query<DbUser>(
+    'SELECT id, email, is_admin, default_model, status, ban_expires_at FROM users WHERE email = $1',
+    [normalizedEmail],
+  );
+  return result.rowCount ? result.rows[0]! : null;
+}
+
+async function getUserByIdentity(
+  provider: string,
+  providerSubject: string,
+): Promise<DbUser | null> {
+  const result = await pool.query<DbUser>(
+    `SELECT u.id, u.email, u.is_admin, u.default_model, u.status, u.ban_expires_at
+     FROM user_identities ui
+     JOIN users u ON u.id = ui.user_id
+     WHERE ui.provider = $1
+       AND ui.provider_subject = $2`,
+    [provider, providerSubject],
+  );
+  return result.rowCount ? result.rows[0]! : null;
+}
+
+async function createOAuthUser(params: {
+  email: string;
+  clientIp: string;
+  clientUa: string | null;
+}): Promise<DbUser> {
+  const normalizedEmail = normalizeEmail(params.email);
+  const randomSecret = crypto.randomBytes(48).toString('base64url');
+  const passwordHash = await bcrypt.hash(randomSecret, 12);
+  const isAdmin = isConfiguredAdminEmail(normalizedEmail);
+
+  try {
+    const created = await pool.query<DbUser>(
+      `INSERT INTO users (
+         email,
+         password_hash,
+         is_admin,
+         last_login_at,
+         last_login_ip,
+         last_seen_ip,
+         last_seen_ua,
+         last_seen_at
+       )
+       VALUES ($1, $2, $3, now(), $4, $4, $5, now())
+       RETURNING id, email, is_admin, default_model, status, ban_expires_at`,
+      [normalizedEmail, passwordHash, isAdmin, params.clientIp, params.clientUa],
+    );
+    return created.rows[0]!;
+  } catch (error) {
+    if (!isUniqueViolation(error)) {
+      throw error;
+    }
+
+    const existing = await getUserByEmail(normalizedEmail);
+    if (!existing) {
+      throw error;
+    }
+    return existing;
+  }
+}
+
+async function resolveOAuthUser(params: {
+  provider: string;
+  providerSubject: string;
+  email: string;
+  clientIp: string;
+  clientUa: string | null;
+}): Promise<DbUser> {
+  const normalizedEmail = normalizeEmail(params.email);
+  const byIdentity = await getUserByIdentity(params.provider, params.providerSubject);
+  if (byIdentity) {
+    return byIdentity;
+  }
+
+  const byEmail = await getUserByEmail(normalizedEmail);
+  if (byEmail) {
+    return byEmail;
+  }
+
+  return createOAuthUser({
+    email: normalizedEmail,
+    clientIp: params.clientIp,
+    clientUa: params.clientUa,
+  });
+}
+
+async function upsertUserIdentity(params: {
+  userId: string;
+  provider: string;
+  providerSubject: string;
+  email: string;
+  emailVerified: boolean;
+}): Promise<void> {
+  const normalizedEmail = normalizeEmail(params.email);
+  await pool.query(
+    `INSERT INTO user_identities (
+       user_id,
+       provider,
+       provider_subject,
+       email,
+       email_verified,
+       last_login_at
+     )
+     VALUES ($1, $2, $3, $4, $5, now())
+     ON CONFLICT (provider, provider_subject)
+     DO UPDATE SET
+       user_id = EXCLUDED.user_id,
+       email = EXCLUDED.email,
+       email_verified = EXCLUDED.email_verified,
+       last_login_at = now()`,
+    [
+      params.userId,
+      params.provider,
+      params.providerSubject,
+      normalizedEmail,
+      params.emailVerified,
+    ],
+  );
+}
+
 async function getProviderByCode(code: string): Promise<ProviderRow | null> {
   const result = await pool.query<ProviderRow>(
     'SELECT id, code, name, base_url, enabled FROM providers WHERE code = $1',
@@ -2788,6 +2939,118 @@ async function setupServer(): Promise<void> {
   });
 
   app.get('/healthz', async () => ({ ok: true }));
+
+  app.get('/auth/oauth/providers', async () => {
+    return { data: oauthRegistry.listConfiguredProviders() };
+  });
+
+  app.get('/auth/oauth/:provider/start', async (request, reply) => {
+    const routeParams = request.params as { provider?: unknown };
+    const provider = typeof routeParams.provider === 'string' ? routeParams.provider : '';
+
+    const started = await oauthRegistry.startAuth(provider, request, reply);
+    if (!started.ok) {
+      await writeAuditEvent({
+        eventType: 'auth.oauth_start_failed',
+        request,
+        metadata: {
+          provider,
+          reason: started.error,
+        },
+      });
+      redirectToLoginError(reply, started.error);
+    }
+  });
+
+  app.get('/auth/oauth/:provider/callback', async (request, reply) => {
+    const routeParams = request.params as { provider?: unknown };
+    const provider = typeof routeParams.provider === 'string' ? routeParams.provider : '';
+
+    try {
+      const callback = await oauthRegistry.handleCallback(provider, request, reply);
+      if (!callback.ok) {
+        await writeAuditEvent({
+          eventType: 'auth.oauth_login_failed',
+          request,
+          metadata: {
+            provider,
+            reason: callback.error,
+          },
+        });
+        redirectToLoginError(reply, callback.error);
+        return;
+      }
+
+      const clientIp = getClientIp(request);
+      const clientUa = getClientUserAgent(request);
+      const normalizedEmail = normalizeEmail(callback.identity.email);
+      const emailDomain = normalizedEmail.split('@')[1] ?? null;
+
+      const resolvedUser = await resolveOAuthUser({
+        provider: callback.identity.provider,
+        providerSubject: callback.identity.providerSubject,
+        email: normalizedEmail,
+        clientIp,
+        clientUa,
+      });
+
+      await upsertUserIdentity({
+        userId: resolvedUser.id,
+        provider: callback.identity.provider,
+        providerSubject: callback.identity.providerSubject,
+        email: normalizedEmail,
+        emailVerified: callback.identity.emailVerified,
+      });
+
+      const maybeUnbanned = await maybeLiftExpiredBan(resolvedUser);
+      const syncedUser = await syncUserAdminBootstrapFlag(maybeUnbanned);
+      if (hasActiveBan(syncedUser)) {
+        await writeAuditEvent({
+          eventType: 'auth.oauth_login_blocked',
+          request,
+          userId: syncedUser.id,
+          metadata: {
+            provider: callback.identity.provider,
+            reason: 'account_banned',
+            ban_expires_at: syncedUser.ban_expires_at,
+          },
+        });
+        redirectToLoginError(reply, 'account_banned');
+        return;
+      }
+
+      await recordSuccessfulLogin(syncedUser.id, clientIp, clientUa);
+      await incrementAbuseCounters(syncedUser.id, [
+        { dimension: 'auth_login_success', value: 1 },
+        { dimension: `seen_ip:${shortHash(clientIp)}`, value: 1 },
+        { dimension: `seen_ua:${shortHash(clientUa ?? 'unknown')}`, value: 1 },
+      ]);
+      await createSession(reply, syncedUser.id);
+
+      await writeAuditEvent({
+        eventType: 'auth.oauth_login_success',
+        request,
+        userId: syncedUser.id,
+        metadata: {
+          provider: callback.identity.provider,
+          email_domain: emailDomain,
+        },
+      });
+
+      reply.redirect('/chat');
+    } catch (error) {
+      app.log.error({ err: error, provider }, 'OAuth callback failed');
+      await writeAuditEvent({
+        eventType: 'auth.oauth_login_failed',
+        request,
+        metadata: {
+          provider,
+          reason: error instanceof Error ? normalizeLoginErrorCode(error.message) : 'oauth_failed',
+        },
+      });
+      redirectToLoginError(reply, 'oauth_failed');
+    }
+  });
 
   app.post('/auth/register', { preHandler: [authRateLimit] }, async (request, reply) => {
     const body = request.body as { email?: unknown; password?: unknown };
