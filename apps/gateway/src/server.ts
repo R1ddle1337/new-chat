@@ -4,6 +4,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
+import { inflateSync } from 'node:zlib';
 import { Client as MinioClient } from 'minio';
 import { Pool } from 'pg';
 import Redis from 'ioredis';
@@ -45,6 +46,12 @@ type UploadedFileRow = {
   object_key: string;
   mime_type: string;
   size_bytes?: number | null;
+};
+
+type InputFileHydrationRow = {
+  id: string;
+  filename: string;
+  content_text: string | null;
 };
 
 type StoredFileRow = {
@@ -293,6 +300,8 @@ const DEFAULT_PROVIDER_API_TYPE: ProviderApiType = 'openai_chat';
 const ANTHROPIC_VERSION = '2023-06-01';
 const ANTHROPIC_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_RAW_CONTENT_JSON_BYTES = 200 * 1024;
+const MAX_EXTRACTED_FILE_TEXT_CHARS = 200_000;
+const supportedDocumentUploadMimeTypes = new Set(['text/plain', 'text/markdown', 'application/pdf']);
 const RATE_LIMIT_WINDOW_SECONDS = 60;
 const TPM_WINDOW_MS = RATE_LIMIT_WINDOW_SECONDS * 1000;
 const TPM_COUNTER_TTL_SECONDS = RATE_LIMIT_WINDOW_SECONDS * 3;
@@ -2325,6 +2334,289 @@ async function streamToBuffer(stream: Readable): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+function normalizeUploadMimeType(mimeType: string): string {
+  const [normalized] = mimeType.split(';', 1);
+  return (normalized ?? '').trim().toLowerCase();
+}
+
+function isSupportedUploadMimeType(mimeType: string): boolean {
+  const normalized = normalizeUploadMimeType(mimeType);
+  return normalized.startsWith('image/') || supportedDocumentUploadMimeTypes.has(normalized);
+}
+
+function isDocumentUploadMimeType(mimeType: string): boolean {
+  return supportedDocumentUploadMimeTypes.has(normalizeUploadMimeType(mimeType));
+}
+
+function isPlainTextUploadMimeType(mimeType: string): boolean {
+  const normalized = normalizeUploadMimeType(mimeType);
+  return normalized === 'text/plain' || normalized === 'text/markdown';
+}
+
+function stripUtf8Bom(input: string): string {
+  if (input.charCodeAt(0) === 0xfeff) {
+    return input.slice(1);
+  }
+  return input;
+}
+
+function normalizeExtractedFileText(rawText: string): string {
+  const trimmed = stripUtf8Bom(rawText).replace(/\u0000/g, '').trim();
+  if (trimmed.length <= MAX_EXTRACTED_FILE_TEXT_CHARS) {
+    return trimmed;
+  }
+  return trimmed.slice(0, MAX_EXTRACTED_FILE_TEXT_CHARS);
+}
+
+type PdfParseResult = {
+  text?: unknown;
+};
+
+type PdfParseFunction = (buffer: Buffer) => Promise<PdfParseResult>;
+
+let pdfParseFunction: PdfParseFunction | null | undefined;
+
+function resolvePdfParseFunction(): PdfParseFunction | null {
+  if (typeof pdfParseFunction !== 'undefined') {
+    return pdfParseFunction;
+  }
+
+  try {
+    const loaded = require('pdf-parse') as PdfParseFunction | { default?: PdfParseFunction };
+    if (typeof loaded === 'function') {
+      pdfParseFunction = loaded;
+      return pdfParseFunction;
+    }
+    pdfParseFunction = typeof loaded.default === 'function' ? loaded.default : null;
+  } catch {
+    pdfParseFunction = null;
+  }
+
+  return pdfParseFunction;
+}
+
+function decodePdfLiteralString(input: string): string {
+  let output = '';
+
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index];
+    if (character !== '\\') {
+      output += character;
+      continue;
+    }
+
+    index += 1;
+    if (index >= input.length) {
+      break;
+    }
+
+    const escaped = input[index];
+    if (escaped === 'n') {
+      output += '\n';
+      continue;
+    }
+    if (escaped === 'r') {
+      output += '\r';
+      continue;
+    }
+    if (escaped === 't') {
+      output += '\t';
+      continue;
+    }
+    if (escaped === 'b') {
+      output += '\b';
+      continue;
+    }
+    if (escaped === 'f') {
+      output += '\f';
+      continue;
+    }
+    if (escaped === '\r') {
+      if (input[index + 1] === '\n') {
+        index += 1;
+      }
+      continue;
+    }
+    if (escaped === '\n') {
+      continue;
+    }
+    if (/[0-7]/.test(escaped)) {
+      let octal = escaped;
+      for (let lookahead = 0; lookahead < 2; lookahead += 1) {
+        const nextChar = input[index + 1];
+        if (!nextChar || !/[0-7]/.test(nextChar)) {
+          break;
+        }
+        index += 1;
+        octal += nextChar;
+      }
+      output += String.fromCharCode(Number.parseInt(octal, 8));
+      continue;
+    }
+
+    output += escaped;
+  }
+
+  return output;
+}
+
+function decodePdfHexString(input: string): string {
+  const cleaned = input.replace(/[^0-9a-fA-F]/g, '');
+  if (!cleaned) {
+    return '';
+  }
+
+  const padded = cleaned.length % 2 === 0 ? cleaned : `${cleaned}0`;
+  const bytes = Buffer.from(padded, 'hex');
+  const utf8 = bytes.toString('utf8');
+  return utf8.includes('\ufffd') ? bytes.toString('latin1') : utf8;
+}
+
+function decodePdfTextToken(token: string): string {
+  if (token.startsWith('(') && token.endsWith(')')) {
+    return decodePdfLiteralString(token.slice(1, -1));
+  }
+
+  if (token.startsWith('<') && token.endsWith('>')) {
+    return decodePdfHexString(token.slice(1, -1));
+  }
+
+  return '';
+}
+
+type PositionedPdfTextFragment = {
+  index: number;
+  text: string;
+};
+
+function extractPdfTextFragmentsFromTextObject(textObject: string): string[] {
+  const fragments: PositionedPdfTextFragment[] = [];
+  const inlineTextPattern = /(\((?:\\.|[^\\()])*\)|<[\da-fA-F\s]+>)\s*(?:Tj|'|")/g;
+  let inlineMatch: RegExpExecArray | null = inlineTextPattern.exec(textObject);
+  while (inlineMatch) {
+    const decoded = decodePdfTextToken(inlineMatch[1] ?? '');
+    if (decoded.trim()) {
+      fragments.push({
+        index: inlineMatch.index,
+        text: decoded,
+      });
+    }
+    inlineMatch = inlineTextPattern.exec(textObject);
+  }
+
+  const textArrayPattern = /\[(.*?)\]\s*TJ/gs;
+  let textArrayMatch: RegExpExecArray | null = textArrayPattern.exec(textObject);
+  while (textArrayMatch) {
+    const arrayBody = textArrayMatch[1] ?? '';
+    const arrayTextTokenPattern = /(\((?:\\.|[^\\()])*\)|<[\da-fA-F\s]+>)/g;
+    let arrayTokenMatch: RegExpExecArray | null = arrayTextTokenPattern.exec(arrayBody);
+    const chunks: string[] = [];
+    while (arrayTokenMatch) {
+      const decoded = decodePdfTextToken(arrayTokenMatch[1] ?? '');
+      if (decoded) {
+        chunks.push(decoded);
+      }
+      arrayTokenMatch = arrayTextTokenPattern.exec(arrayBody);
+    }
+    const joined = chunks.join('');
+    if (joined.trim()) {
+      fragments.push({
+        index: textArrayMatch.index,
+        text: joined,
+      });
+    }
+    textArrayMatch = textArrayPattern.exec(textObject);
+  }
+
+  fragments.sort((left, right) => left.index - right.index);
+  return fragments.map((fragment) => fragment.text);
+}
+
+function extractPdfTextFromStreamContent(content: string): string {
+  const textChunks: string[] = [];
+  const textObjectPattern = /BT[\s\S]*?ET/g;
+  let textObjectMatch: RegExpExecArray | null = textObjectPattern.exec(content);
+  while (textObjectMatch) {
+    const fragments = extractPdfTextFragmentsFromTextObject(textObjectMatch[0] ?? '');
+    if (fragments.length > 0) {
+      textChunks.push(fragments.join('\n'));
+    }
+    textObjectMatch = textObjectPattern.exec(content);
+  }
+
+  return textChunks.join('\n');
+}
+
+function extractTextFromPdfBufferFallback(buffer: Buffer): string {
+  const binary = buffer.toString('latin1');
+  const streamPattern = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+  let streamMatch: RegExpExecArray | null = streamPattern.exec(binary);
+  const textChunks: string[] = [];
+
+  while (streamMatch) {
+    const streamBody = streamMatch[1] ?? '';
+    const streamBuffer = Buffer.from(streamBody, 'latin1');
+    const candidateStreams: Buffer[] = [streamBuffer];
+
+    try {
+      candidateStreams.push(inflateSync(streamBuffer));
+    } catch {
+      // Non-deflate PDF streams are parsed as-is.
+    }
+
+    for (const candidateStream of candidateStreams) {
+      const extracted = extractPdfTextFromStreamContent(candidateStream.toString('latin1'));
+      if (extracted.trim()) {
+        textChunks.push(extracted);
+      }
+    }
+
+    streamMatch = streamPattern.exec(binary);
+  }
+
+  return textChunks.join('\n');
+}
+
+async function extractTextFromPdfBuffer(buffer: Buffer): Promise<string> {
+  const parsePdf = resolvePdfParseFunction();
+  if (parsePdf) {
+    try {
+      const parsed = await parsePdf(buffer);
+      if (typeof parsed.text === 'string') {
+        return parsed.text;
+      }
+    } catch {
+      // Fall back to the lightweight parser below.
+    }
+  }
+
+  return extractTextFromPdfBufferFallback(buffer);
+}
+
+async function extractTextFromUploadedBuffer(buffer: Buffer, mimeType: string): Promise<string | null> {
+  if (isPlainTextUploadMimeType(mimeType)) {
+    return normalizeExtractedFileText(buffer.toString('utf8'));
+  }
+
+  if (normalizeUploadMimeType(mimeType) === 'application/pdf') {
+    const extracted = await extractTextFromPdfBuffer(buffer);
+    return normalizeExtractedFileText(extracted);
+  }
+
+  return null;
+}
+
+async function upsertExtractedFileText(fileId: string, contentText: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO file_text (file_id, content_text)
+     VALUES ($1, $2)
+     ON CONFLICT (file_id) DO UPDATE
+       SET content_text = EXCLUDED.content_text,
+           extracted_at = now()`,
+    [fileId, contentText],
+  );
+}
+
 async function loadImageDataUrl(userId: string, fileId: string): Promise<string> {
   const result = await pool.query<UploadedFileRow>(
     `SELECT id, bucket, object_key, mime_type
@@ -2341,6 +2633,22 @@ async function loadImageDataUrl(userId: string, fileId: string): Promise<string>
   const objectStream = await getMinioObjectStream(file.bucket, file.object_key);
   const buffer = await streamToBuffer(objectStream);
   return `data:${file.mime_type};base64,${buffer.toString('base64')}`;
+}
+
+async function loadInputFileForHydration(userId: string, fileId: string): Promise<InputFileHydrationRow> {
+  const result = await pool.query<InputFileHydrationRow>(
+    `SELECT f.id, f.filename, ft.content_text
+     FROM files f
+     LEFT JOIN file_text ft ON ft.file_id = f.id
+     WHERE f.id = $1 AND f.user_id = $2`,
+    [fileId, userId],
+  );
+
+  if (!result.rowCount) {
+    throw new Error(`Unknown file: ${fileId}`);
+  }
+
+  return result.rows[0]!;
 }
 
 async function hydrateResponsesInput(input: unknown, userId: string): Promise<unknown> {
@@ -2365,20 +2673,31 @@ async function hydrateResponsesInput(input: unknown, userId: string): Promise<un
         continue;
       }
 
-      const imagePart = part as Record<string, unknown>;
-      if (imagePart.type === 'input_image') {
-        const fileId =
-          typeof imagePart.file_id === 'string'
-            ? imagePart.file_id
-            : typeof imagePart.fileId === 'string'
-              ? imagePart.fileId
-              : null;
+      const contentPart = part as Record<string, unknown>;
+      const fileId =
+        typeof contentPart.file_id === 'string'
+          ? contentPart.file_id
+          : typeof contentPart.fileId === 'string'
+            ? contentPart.fileId
+            : null;
 
-        if (fileId) {
-          const dataUrl = await loadImageDataUrl(userId, fileId);
-          nextContent.push({ type: 'input_image', image_url: dataUrl });
-          continue;
-        }
+      if (contentPart.type === 'input_image' && fileId) {
+        const dataUrl = await loadImageDataUrl(userId, fileId);
+        nextContent.push({ type: 'input_image', image_url: dataUrl });
+        continue;
+      }
+
+      if (contentPart.type === 'input_file' && fileId) {
+        const file = await loadInputFileForHydration(userId, fileId);
+        const hydratedText =
+          file.content_text === null
+            ? `[File: ${file.filename}] (text extraction unavailable)`
+            : `[File: ${file.filename}]\n${file.content_text}`;
+        nextContent.push({
+          type: 'input_text',
+          text: hydratedText,
+        });
+        continue;
       }
 
       nextContent.push(part);
@@ -6257,8 +6576,9 @@ async function setupServer(): Promise<void> {
       return;
     }
 
-    if (!file.mimetype.startsWith('image/')) {
-      reply.code(400).send({ error: 'Only image uploads are supported' });
+    const uploadMimeType = normalizeUploadMimeType(file.mimetype);
+    if (!isSupportedUploadMimeType(uploadMimeType)) {
+      reply.code(400).send({ error: 'Unsupported file type. Allowed: image/*, text/plain, text/markdown, application/pdf' });
       return;
     }
 
@@ -6266,24 +6586,43 @@ async function setupServer(): Promise<void> {
     const objectKey = `${user.id}/${crypto.randomUUID()}-${file.filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
 
     await minio.putObject(config.minioBucket, objectKey, buffer, buffer.length, {
-      'Content-Type': file.mimetype,
+      'Content-Type': uploadMimeType,
     });
 
     const insert = await pool.query<{ id: string; created_at: string }>(
       `INSERT INTO files (user_id, bucket, object_key, filename, mime_type, size_bytes)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, created_at`,
-      [user.id, config.minioBucket, objectKey, file.filename, file.mimetype, buffer.length],
+      [user.id, config.minioBucket, objectKey, file.filename, uploadMimeType, buffer.length],
     );
 
     const record = insert.rows[0]!;
+
+    if (isDocumentUploadMimeType(uploadMimeType)) {
+      try {
+        const extractedText = await extractTextFromUploadedBuffer(buffer, uploadMimeType);
+        if (extractedText !== null) {
+          await upsertExtractedFileText(record.id, extractedText);
+        }
+      } catch (error) {
+        request.log.warn(
+          {
+            err: error,
+            fileId: record.id,
+            userId: user.id,
+            mimeType: uploadMimeType,
+          },
+          'Failed to extract text from uploaded file',
+        );
+      }
+    }
 
     await writeAuditEvent({
       eventType: 'files.uploaded',
       request,
       userId: user.id,
       metadata: {
-        mime_type: file.mimetype,
+        mime_type: uploadMimeType,
         size_bytes: buffer.length,
       },
     });
@@ -6397,7 +6736,7 @@ async function setupServer(): Promise<void> {
     requestBody.model = selectedModel.model_id;
 
     const hydratedCurrentInput = await hydrateResponsesInput(currentInput, user.id);
-    const userPrompt = extractTextFromResponsesInput(hydratedCurrentInput);
+    const userPrompt = extractTextFromResponsesInput(storageInput);
     const effectiveModel = selectedModel.public_id;
 
     const targetThreadId = await getOrCreateThread({

@@ -63,9 +63,12 @@ type Toast = {
 const autoScrollThresholdPx = 120;
 const streamingRenderIntervalMs = 50;
 const maxComposerImages = 6;
+const maxComposerDocs = 5;
 const chatModelStorageKey = 'nchat_last_model';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const userMessagePlaceholderPattern = /^\[(?:image|images|non-text input)\]$/i;
+const supportedDocumentMimeTypes = new Set(['text/plain', 'text/markdown', 'application/pdf']);
+const supportedDocumentExtensions = new Set(['txt', 'md', 'pdf']);
+const userMessagePlaceholderPattern = /^\[(?:image|images|file|files|attachments|non-text input)\]$/i;
 
 type MarkdownCodeProps = ComponentPropsWithoutRef<'code'> & {
   inline?: boolean;
@@ -967,20 +970,35 @@ function normalizeUserMessageTextForInput(content: string): string {
   return trimmed;
 }
 
-function buildUserMessagePreview(content: string, attachmentCount: number): string {
+function buildUserMessagePreview(content: string, attachments: MessageAttachment[]): string {
   if (content) {
     return content;
   }
 
-  if (attachmentCount > 1) {
+  if (attachments.length === 0) {
+    return '[non-text input]';
+  }
+
+  const imageCount = attachments.filter((attachment) => attachment.mime_type.startsWith('image/')).length;
+  const docCount = attachments.length - imageCount;
+
+  if (docCount > 0 && imageCount > 0) {
+    return '[attachments]';
+  }
+
+  if (imageCount > 1) {
     return '[images]';
   }
 
-  if (attachmentCount === 1) {
+  if (imageCount === 1) {
     return '[image]';
   }
 
-  return '[non-text input]';
+  if (docCount > 1) {
+    return '[files]';
+  }
+
+  return '[file]';
 }
 
 function findLatestUserMessage(messages: MessageItem[]): MessageItem | null {
@@ -1058,6 +1076,55 @@ function normalizePastedImageFile(file: File): File {
 
 function isImageFile(file: File): boolean {
   return file.type.startsWith('image/');
+}
+
+function getFileExtension(fileName: string): string {
+  const index = fileName.lastIndexOf('.');
+  if (index === -1) {
+    return '';
+  }
+  return fileName.slice(index + 1).toLowerCase();
+}
+
+function inferDocumentMimeType(fileName: string): string | null {
+  const extension = getFileExtension(fileName);
+  if (extension === 'txt') {
+    return 'text/plain';
+  }
+  if (extension === 'md') {
+    return 'text/markdown';
+  }
+  if (extension === 'pdf') {
+    return 'application/pdf';
+  }
+  return null;
+}
+
+function normalizeDocumentUploadFile(file: File): File {
+  const normalizedMimeType = file.type.toLowerCase();
+  if (supportedDocumentMimeTypes.has(normalizedMimeType)) {
+    return file;
+  }
+
+  const inferredMimeType = inferDocumentMimeType(file.name);
+  if (!inferredMimeType) {
+    return file;
+  }
+
+  return new File([file], file.name, {
+    type: inferredMimeType,
+    lastModified: file.lastModified || Date.now(),
+  });
+}
+
+function isDocumentFile(file: File): boolean {
+  const normalizedMimeType = file.type.toLowerCase();
+  if (supportedDocumentMimeTypes.has(normalizedMimeType)) {
+    return true;
+  }
+
+  const extension = getFileExtension(file.name);
+  return extension.length > 0 && supportedDocumentExtensions.has(extension);
 }
 
 function readStoredChatModelId(): string | null {
@@ -1183,6 +1250,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [input, setInput] = useState('');
   const [images, setImages] = useState<File[]>([]);
+  const [docs, setDocs] = useState<File[]>([]);
   const [imagePreviewUrls, setImagePreviewUrls] = useState<string[]>([]);
   const [composerFocused, setComposerFocused] = useState(false);
   const [animatingMessageIds, setAnimatingMessageIds] = useState<string[]>([]);
@@ -1207,8 +1275,11 @@ export default function ChatPage() {
 
   const editingActive = editingMessageId !== null;
   const canSend =
-    !sending && !editingActive && Boolean(model.trim()) && (input.trim().length > 0 || images.length > 0);
-  const composerActive = composerFocused || Boolean(input.trim()) || images.length > 0;
+    !sending &&
+    !editingActive &&
+    Boolean(model.trim()) &&
+    (input.trim().length > 0 || images.length > 0 || docs.length > 0);
+  const composerActive = composerFocused || Boolean(input.trim()) || images.length > 0 || docs.length > 0;
 
   const pushToast = useCallback((kind: ToastKind, message: string) => {
     const id = toastCounterRef.current + 1;
@@ -1221,14 +1292,9 @@ export default function ChatPage() {
   }, []);
 
   const appendImages = useCallback((nextFiles: File[]) => {
-    const imageFiles = nextFiles.filter((file) => isImageFile(file));
-    if (imageFiles.length === 0) {
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
+    if (nextFiles.length === 0) {
       return;
     }
-
     setImages((previous) => {
       if (previous.length >= maxComposerImages) {
         return previous;
@@ -1239,13 +1305,45 @@ export default function ChatPage() {
         return previous;
       }
 
-      return [...previous, ...imageFiles.slice(0, remainingSlots)];
+      return [...previous, ...nextFiles.slice(0, remainingSlots)];
     });
-
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-    }
   }, []);
+
+  const appendDocs = useCallback((nextFiles: File[]) => {
+    if (nextFiles.length === 0) {
+      return;
+    }
+
+    setDocs((previous) => {
+      if (previous.length >= maxComposerDocs) {
+        return previous;
+      }
+
+      const remainingSlots = maxComposerDocs - previous.length;
+      if (remainingSlots <= 0) {
+        return previous;
+      }
+
+      return [...previous, ...nextFiles.slice(0, remainingSlots)];
+    });
+  }, []);
+
+  const appendSelectedFiles = useCallback(
+    (nextFiles: File[]) => {
+      const imageFiles = nextFiles.filter((file) => isImageFile(file));
+      const docFiles = nextFiles
+        .filter((file) => !isImageFile(file) && isDocumentFile(file))
+        .map((file) => normalizeDocumentUploadFile(file));
+
+      appendImages(imageFiles);
+      appendDocs(docFiles);
+
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    },
+    [appendDocs, appendImages],
+  );
 
   const removeImageAtIndex = useCallback((indexToRemove: number) => {
     setImages((previous) =>
@@ -1253,11 +1351,18 @@ export default function ChatPage() {
     );
   }, []);
 
+  const removeDocAtIndex = useCallback((indexToRemove: number) => {
+    setDocs((previous) =>
+      previous.filter((_file, index) => index !== indexToRemove),
+    );
+  }, []);
+
   const clearImages = useCallback(() => {
     setImages([]);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-    }
+  }, []);
+
+  const clearDocs = useCallback(() => {
+    setDocs([]);
   }, []);
 
   const handleComposerPaste = useCallback(
@@ -1755,13 +1860,18 @@ export default function ChatPage() {
       threadId: string | null;
       promptText: string;
       imageFiles?: File[];
+      docFiles?: File[];
       existingAttachments?: MessageAttachment[];
       clearComposerOnStart?: boolean;
     }): Promise<void> => {
       const normalizedPromptText = params.promptText.trim();
       const imageFiles = params.imageFiles ?? [];
+      const docFiles = params.docFiles ?? [];
       const preloadedAttachments = params.existingAttachments ?? [];
-      if (sending || (!normalizedPromptText && imageFiles.length === 0 && preloadedAttachments.length === 0)) {
+      if (
+        sending ||
+        (!normalizedPromptText && imageFiles.length === 0 && docFiles.length === 0 && preloadedAttachments.length === 0)
+      ) {
         return;
       }
 
@@ -1783,9 +1893,14 @@ export default function ChatPage() {
 
       try {
         const uploadedAttachments: MessageAttachment[] = [...preloadedAttachments];
-        for (const image of imageFiles) {
+
+        const uploadAttachment = async (
+          file: File,
+          fallbackMimeType: string,
+          failureMessage: string,
+        ): Promise<MessageAttachment> => {
           const formData = new FormData();
-          formData.append('file', image);
+          formData.append('file', file);
           formData.append('purpose', 'vision');
 
           const uploadRes = await fetch('/api/v1/files', {
@@ -1797,16 +1912,30 @@ export default function ChatPage() {
 
           if (!uploadRes.ok) {
             const uploadBody = (await uploadRes.json().catch(() => null)) as unknown;
-            throw new Error(parseErrorMessage(uploadBody, 'Image upload failed'));
+            throw new Error(parseErrorMessage(uploadBody, failureMessage));
           }
 
           const uploadBody = (await uploadRes.json()) as { id: string };
-          uploadedAttachments.push({
+          return {
             file_id: uploadBody.id,
-            filename: image.name || 'image',
-            mime_type: image.type || 'image/*',
+            filename: file.name || 'attachment',
+            mime_type: file.type || fallbackMimeType,
             content_url: `/api/v1/files/${uploadBody.id}/content`,
-          });
+          };
+        };
+
+        for (const image of imageFiles) {
+          uploadedAttachments.push(await uploadAttachment(image, 'image/*', 'Image upload failed'));
+        }
+
+        for (const doc of docFiles) {
+          uploadedAttachments.push(
+            await uploadAttachment(
+              doc,
+              inferDocumentMimeType(doc.name) ?? 'application/octet-stream',
+              'File upload failed',
+            ),
+          );
         }
 
         const content: Array<Record<string, unknown>> = [];
@@ -1818,8 +1947,16 @@ export default function ChatPage() {
         }
 
         for (const attachment of uploadedAttachments) {
+          if (attachment.mime_type.startsWith('image/')) {
+            content.push({
+              type: 'input_image',
+              file_id: attachment.file_id,
+            });
+            continue;
+          }
+
           content.push({
-            type: 'input_image',
+            type: 'input_file',
             file_id: attachment.file_id,
           });
         }
@@ -1863,7 +2000,7 @@ export default function ChatPage() {
           {
             id: optimisticUserId,
             role: 'user',
-            content: buildUserMessagePreview(normalizedPromptText, uploadedAttachments.length),
+            content: buildUserMessagePreview(normalizedPromptText, uploadedAttachments),
             created_at: new Date().toISOString(),
             attachments: uploadedAttachments,
           },
@@ -1879,6 +2016,10 @@ export default function ChatPage() {
         if (params.clearComposerOnStart) {
           setInput('');
           clearImages();
+          clearDocs();
+          if (fileInputRef.current) {
+            fileInputRef.current.value = '';
+          }
         }
 
         const res = await fetch('/api/v1/responses', {
@@ -2053,6 +2194,7 @@ export default function ChatPage() {
       }
     },
     [
+      clearDocs,
       clearImages,
       loadMessages,
       model,
@@ -2074,6 +2216,7 @@ export default function ChatPage() {
       threadId: selectedThreadId,
       promptText: input,
       imageFiles: images,
+      docFiles: docs,
       clearComposerOnStart: true,
     });
   };
@@ -2094,12 +2237,13 @@ export default function ChatPage() {
       setEditDraftAttachments(message.attachments);
       setInput(draftText);
       clearImages();
+      clearDocs();
 
       window.requestAnimationFrame(() => {
         composerInputRef.current?.focus();
       });
     },
-    [clearImages, latestUserMessage, selectedThreadId, sending],
+    [clearDocs, clearImages, latestUserMessage, selectedThreadId, sending],
   );
 
   const cancelEditMode = useCallback(() => {
@@ -2108,7 +2252,8 @@ export default function ChatPage() {
     setEditDraftAttachments([]);
     setInput('');
     clearImages();
-  }, [clearImages]);
+    clearDocs();
+  }, [clearDocs, clearImages]);
 
   const regenerateLatestAssistant = useCallback(
     async (assistantMessage: MessageItem) => {
@@ -2305,6 +2450,46 @@ export default function ChatPage() {
         </div>
       ) : null}
 
+      {docs.length > 0 ? (
+        <div className="chat-doc-preview-row">
+          <div className="chat-doc-chip-list">
+            {docs.map((doc, index) => (
+              <div
+                key={`${doc.name}-${doc.size}-${doc.lastModified}-${index}`}
+                className="chat-doc-chip"
+                title={doc.name}
+              >
+                <span className="chat-doc-chip-name">{doc.name}</span>
+                <button
+                  type="button"
+                  className="chat-doc-chip-remove"
+                  onClick={() => removeDocAtIndex(index)}
+                  disabled={sending}
+                  aria-label={`Remove ${doc.name}`}
+                  title={`Remove ${doc.name}`}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+
+          <div className="chat-doc-preview-footer">
+            <span className="chat-image-preview-meta">
+              {docs.length}/{maxComposerDocs} selected
+            </span>
+            <button
+              className="ghost"
+              type="button"
+              onClick={clearDocs}
+              disabled={sending || editingActive}
+            >
+              Clear files
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       <form
         className={`chat-composer-bar${composerActive ? ' is-active' : ''}`}
         onFocusCapture={() => setComposerFocused(true)}
@@ -2324,11 +2509,11 @@ export default function ChatPage() {
           ref={fileInputRef}
           className="sr-only"
           type="file"
-          accept="image/*"
+          accept="image/*,.pdf,.txt,.md,text/plain,text/markdown,application/pdf"
           multiple
           disabled={sending || editingActive}
           onChange={(event) => {
-            appendImages(Array.from(event.target.files ?? []));
+            appendSelectedFiles(Array.from(event.target.files ?? []));
           }}
         />
 
@@ -2336,21 +2521,25 @@ export default function ChatPage() {
           type="button"
           className="chat-attach-button"
           onClick={() => fileInputRef.current?.click()}
-          disabled={sending || editingActive || images.length >= maxComposerImages}
-          aria-label="Attach image"
+          disabled={
+            sending ||
+            editingActive ||
+            (images.length >= maxComposerImages && docs.length >= maxComposerDocs)
+          }
+          aria-label="Attach files"
           title={
-            images.length >= maxComposerImages
-              ? `Maximum ${maxComposerImages} images`
+            images.length >= maxComposerImages && docs.length >= maxComposerDocs
+              ? `Maximum ${maxComposerImages} images and ${maxComposerDocs} files`
               : editingActive
                 ? 'Editing uses the original attachments'
-                : 'Attach image'
+                : 'Attach image or file'
           }
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M12 5v14" />
             <path d="M5 12h14" />
           </svg>
-          <span className="sr-only">Attach image</span>
+          <span className="sr-only">Attach files</span>
         </button>
 
         <textarea

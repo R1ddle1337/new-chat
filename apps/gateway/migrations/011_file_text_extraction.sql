@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS file_text (
+  file_id UUID PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  content_text TEXT NOT NULL,
+  extracted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
