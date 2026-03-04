@@ -3,7 +3,7 @@ import multipart from '@fastify/multipart';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { inflateSync } from 'node:zlib';
 import { Client as MinioClient } from 'minio';
 import { Pool } from 'pg';
@@ -301,6 +301,9 @@ const ANTHROPIC_VERSION = '2023-06-01';
 const ANTHROPIC_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_RAW_CONTENT_JSON_BYTES = 200 * 1024;
 const MAX_EXTRACTED_FILE_TEXT_CHARS = 200_000;
+const MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024;
+const MAX_STREAMED_TEXT_CAPTURE_BYTES = MAX_EXTRACTED_FILE_TEXT_CHARS * 4;
+const MAX_INLINE_PDF_EXTRACTION_BYTES = 25 * 1024 * 1024;
 const supportedDocumentUploadMimeTypes = new Set(['text/plain', 'text/markdown', 'application/pdf']);
 const RATE_LIMIT_WINDOW_SECONDS = 60;
 const TPM_WINDOW_MS = RATE_LIMIT_WINDOW_SECONDS * 1000;
@@ -2353,6 +2356,25 @@ function isPlainTextUploadMimeType(mimeType: string): boolean {
   return normalized === 'text/plain' || normalized === 'text/markdown';
 }
 
+function getErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== 'object') {
+    return null;
+  }
+
+  const candidateCode = (error as { code?: unknown }).code;
+  return typeof candidateCode === 'string' ? candidateCode : null;
+}
+
+function isMultipartLimitError(error: unknown): boolean {
+  const code = getErrorCode(error);
+  return (
+    code === 'FST_REQ_FILE_TOO_LARGE' ||
+    code === 'FST_PARTS_LIMIT' ||
+    code === 'FST_FILES_LIMIT' ||
+    code === 'FST_FIELDS_LIMIT'
+  );
+}
+
 function stripUtf8Bom(input: string): string {
   if (input.charCodeAt(0) === 0xfeff) {
     return input.slice(1);
@@ -3943,7 +3965,7 @@ async function setupServer(): Promise<void> {
   await app.register(cookie);
   await app.register(multipart, {
     limits: {
-      fileSize: 100 * 1024 * 1024,
+      fileSize: MAX_UPLOAD_FILE_BYTES,
       files: 1,
     },
   });
@@ -6599,7 +6621,16 @@ async function setupServer(): Promise<void> {
 
   app.post('/v1/files', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
     const user = request.authUser!;
-    const file = await request.file();
+    let file;
+    try {
+      file = await request.file();
+    } catch (error) {
+      if (isMultipartLimitError(error)) {
+        reply.code(400).send({ error: 'File too large. Maximum upload size is 100MB' });
+        return;
+      }
+      throw error;
+    }
 
     if (!file) {
       reply.code(400).send({ error: 'No file provided' });
@@ -6612,25 +6643,136 @@ async function setupServer(): Promise<void> {
       return;
     }
 
-    const buffer = await file.toBuffer();
     const objectKey = `${user.id}/${crypto.randomUUID()}-${file.filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const passthrough = new PassThrough();
+    const shouldCapturePlainText = isPlainTextUploadMimeType(uploadMimeType);
+    const capturedTextChunks: Buffer[] = [];
+    let capturedTextBytes = 0;
+    let bytes = 0;
+    let multipartStreamError: unknown = null;
+    let multipartLimitExceeded = false;
 
-    await minio.putObject(config.minioBucket, objectKey, buffer, buffer.length, {
-      'Content-Type': uploadMimeType,
+    const cleanupUploadedObject = async (): Promise<void> => {
+      try {
+        await minio.removeObject(config.minioBucket, objectKey);
+      } catch (error) {
+        request.log.warn(
+          { err: error, userId: user.id, bucket: config.minioBucket, objectKey },
+          'Failed to cleanup object after upload error',
+        );
+      }
+    };
+
+    passthrough.on('data', (chunk) => {
+      const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += chunkBuffer.length;
+
+      if (!shouldCapturePlainText || capturedTextBytes >= MAX_STREAMED_TEXT_CAPTURE_BYTES) {
+        return;
+      }
+
+      const remainingBytes = MAX_STREAMED_TEXT_CAPTURE_BYTES - capturedTextBytes;
+      const captureChunk =
+        chunkBuffer.length > remainingBytes ? chunkBuffer.subarray(0, remainingBytes) : chunkBuffer;
+      capturedTextChunks.push(Buffer.from(captureChunk));
+      capturedTextBytes += captureChunk.length;
     });
+
+    file.file.on('limit', () => {
+      multipartLimitExceeded = true;
+      const limitError = new Error('multipart file too large');
+      multipartStreamError = limitError;
+      if (!passthrough.destroyed) {
+        passthrough.destroy(limitError);
+      }
+    });
+
+    file.file.on('error', (error) => {
+      multipartStreamError = error;
+      if (!passthrough.destroyed) {
+        passthrough.destroy(error instanceof Error ? error : new Error('multipart stream error'));
+      }
+    });
+
+    file.file.pipe(passthrough);
+
+    try {
+      await minio.putObject(config.minioBucket, objectKey, passthrough, undefined, {
+        'Content-Type': uploadMimeType,
+      });
+    } catch (error) {
+      const limitExceeded = multipartLimitExceeded || file.file.truncated || isMultipartLimitError(error);
+      if (limitExceeded) {
+        await cleanupUploadedObject();
+        reply.code(400).send({ error: 'File too large. Maximum upload size is 100MB' });
+        return;
+      }
+
+      if (multipartStreamError) {
+        await cleanupUploadedObject();
+        reply.code(400).send({ error: 'Invalid multipart upload stream' });
+        return;
+      }
+
+      request.log.error(
+        {
+          err: error,
+          userId: user.id,
+          bucket: config.minioBucket,
+          objectKey,
+          mimeType: uploadMimeType,
+        },
+        'Failed to upload file to object storage',
+      );
+      if (!passthrough.destroyed) {
+        passthrough.destroy(error instanceof Error ? error : new Error('minio upload failed'));
+      }
+      if (!file.file.destroyed) {
+        file.file.destroy(error instanceof Error ? error : new Error('minio upload failed'));
+      }
+      reply.code(502).send({ error: 'Upstream storage error' });
+      return;
+    }
+
+    if (multipartLimitExceeded || file.file.truncated) {
+      await cleanupUploadedObject();
+      reply.code(400).send({ error: 'File too large. Maximum upload size is 100MB' });
+      return;
+    }
 
     const insert = await pool.query<{ id: string; created_at: string }>(
       `INSERT INTO files (user_id, bucket, object_key, filename, mime_type, size_bytes)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, created_at`,
-      [user.id, config.minioBucket, objectKey, file.filename, uploadMimeType, buffer.length],
+      [user.id, config.minioBucket, objectKey, file.filename, uploadMimeType, bytes],
     );
 
     const record = insert.rows[0]!;
 
     if (isDocumentUploadMimeType(uploadMimeType)) {
       try {
-        const extractedText = await extractTextFromUploadedBuffer(buffer, uploadMimeType);
+        let extractedText: string | null = null;
+        if (isPlainTextUploadMimeType(uploadMimeType)) {
+          extractedText = normalizeExtractedFileText(Buffer.concat(capturedTextChunks).toString('utf8'));
+        } else if (uploadMimeType === 'application/pdf') {
+          if (bytes <= MAX_INLINE_PDF_EXTRACTION_BYTES) {
+            const objectStream = await getMinioObjectStream(config.minioBucket, objectKey);
+            const pdfBuffer = await streamToBuffer(objectStream);
+            extractedText = await extractTextFromUploadedBuffer(pdfBuffer, uploadMimeType);
+          } else {
+            request.log.warn(
+              {
+                fileId: record.id,
+                userId: user.id,
+                mimeType: uploadMimeType,
+                sizeBytes: bytes,
+                thresholdBytes: MAX_INLINE_PDF_EXTRACTION_BYTES,
+              },
+              'Skipped PDF extraction due to size',
+            );
+          }
+        }
+
         if (extractedText !== null) {
           await upsertExtractedFileText(record.id, extractedText);
         }
@@ -6653,14 +6795,14 @@ async function setupServer(): Promise<void> {
       userId: user.id,
       metadata: {
         mime_type: uploadMimeType,
-        size_bytes: buffer.length,
+        size_bytes: bytes,
       },
     });
 
     reply.send({
       id: record.id,
       object: 'file',
-      bytes: buffer.length,
+      bytes,
       created_at: Math.floor(new Date(record.created_at).getTime() / 1000),
       filename: file.filename,
       purpose: 'vision',
