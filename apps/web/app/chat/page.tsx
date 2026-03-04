@@ -61,6 +61,7 @@ type Toast = {
 };
 
 const autoScrollThresholdPx = 120;
+const streamingRenderIntervalMs = 50;
 const maxComposerImages = 6;
 const chatModelStorageKey = 'nchat_last_model';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -634,7 +635,7 @@ function MessageMarkdown({ content, streaming = false }: { content: string; stre
       return;
     }
 
-    const minSplitIntervalMs = 64;
+    const minSplitIntervalMs = streamingRenderIntervalMs;
     const scheduleFrame = (timestamp: number) => {
       if (timestamp - lastSplitAtRef.current < minSplitIntervalMs) {
         splitFrameRef.current = window.requestAnimationFrame(scheduleFrame);
@@ -1093,6 +1094,35 @@ function isNearBottom(element: HTMLElement): boolean {
   return distance <= autoScrollThresholdPx;
 }
 
+function detectCoarsePointerDevice(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  return (
+    window.matchMedia('(pointer: coarse)').matches ||
+    window.matchMedia('(hover: none) and (pointer: coarse)').matches
+  );
+}
+
+function addMediaListener(query: MediaQueryList, listener: () => void): void {
+  if (typeof query.addEventListener === 'function') {
+    query.addEventListener('change', listener);
+    return;
+  }
+
+  query.addListener(listener);
+}
+
+function removeMediaListener(query: MediaQueryList, listener: () => void): void {
+  if (typeof query.removeEventListener === 'function') {
+    query.removeEventListener('change', listener);
+    return;
+  }
+
+  query.removeListener(listener);
+}
+
 function isEmojiOnlyMessage(content: string): boolean {
   const trimmed = content.trim();
   if (!trimmed) {
@@ -1134,8 +1164,8 @@ export default function ChatPage() {
     useChatShell();
 
   const messageListRef = useRef<HTMLDivElement | null>(null);
-  const messageListEndRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
+  const isAtBottomRef = useRef(true);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const toastCounterRef = useRef(0);
@@ -1143,6 +1173,10 @@ export default function ChatPage() {
   const seededMessageIdsRef = useRef(false);
   const stopRequestedRef = useRef(false);
   const latestAssistantTextRef = useRef('');
+  const streamBufferedAssistantTextRef = useRef('');
+  const streamRenderedAssistantTextRef = useRef('');
+  const streamFlushFrameRef = useRef<number | null>(null);
+  const streamLastFlushAtRef = useRef(0);
 
   const [loading, setLoading] = useState(true);
   const [messagesLoading, setMessagesLoading] = useState(false);
@@ -1157,6 +1191,9 @@ export default function ChatPage() {
   const [streamResponses, setStreamResponses] = useState(true);
   const [sending, setSending] = useState(false);
   const [generationActive, setGenerationActive] = useState(false);
+  const [desktopComposerEnterSends, setDesktopComposerEnterSends] = useState(
+    () => !detectCoarsePointerDevice(),
+  );
   const [activeAbortController, setActiveAbortController] = useState<AbortController | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
@@ -1292,11 +1329,32 @@ export default function ChatPage() {
     textarea.style.height = `${Math.max(nextHeight, minHeight)}px`;
   }, []);
 
-  const scrollToLatest = useCallback((behavior: ScrollBehavior = 'auto') => {
-    messageListEndRef.current?.scrollIntoView({ behavior, block: 'end' });
-    shouldAutoScrollRef.current = true;
-    setShowJumpToLatest(false);
+  const setAutoScrollState = useCallback((atBottom: boolean) => {
+    shouldAutoScrollRef.current = atBottom;
+    isAtBottomRef.current = atBottom;
+    setShowJumpToLatest((previous) => {
+      const next = !atBottom;
+      return previous === next ? previous : next;
+    });
   }, []);
+
+  const scrollToLatest = useCallback(
+    (behavior: ScrollBehavior = 'auto') => {
+      const container = messageListRef.current;
+      if (!container) {
+        return;
+      }
+
+      if (behavior === 'smooth') {
+        container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+      } else {
+        container.scrollTop = container.scrollHeight;
+      }
+
+      setAutoScrollState(true);
+    },
+    [setAutoScrollState],
+  );
 
   const updateAutoScrollState = useCallback(() => {
     const container = messageListRef.current;
@@ -1304,10 +1362,8 @@ export default function ChatPage() {
       return;
     }
 
-    const nearBottom = isNearBottom(container);
-    shouldAutoScrollRef.current = nearBottom;
-    setShowJumpToLatest(!nearBottom);
-  }, []);
+    setAutoScrollState(isNearBottom(container));
+  }, [setAutoScrollState]);
 
   const loadAllowedModels = async (): Promise<AllowedModelItem[]> => {
     const response = await fetch('/api/v1/models', { credentials: 'include' });
@@ -1385,6 +1441,34 @@ export default function ChatPage() {
   }, []);
 
   useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const pointerCoarseQuery = window.matchMedia('(pointer: coarse)');
+    const hoverNoneAndPointerCoarseQuery = window.matchMedia('(hover: none) and (pointer: coarse)');
+
+    const syncDesktopComposerEnterSends = () => {
+      const pointerIsCoarse =
+        pointerCoarseQuery.matches || hoverNoneAndPointerCoarseQuery.matches;
+      const nextDesktopBehavior = !pointerIsCoarse;
+      setDesktopComposerEnterSends((previous) =>
+        previous === nextDesktopBehavior ? previous : nextDesktopBehavior,
+      );
+    };
+
+    syncDesktopComposerEnterSends();
+
+    addMediaListener(pointerCoarseQuery, syncDesktopComposerEnterSends);
+    addMediaListener(hoverNoneAndPointerCoarseQuery, syncDesktopComposerEnterSends);
+
+    return () => {
+      removeMediaListener(pointerCoarseQuery, syncDesktopComposerEnterSends);
+      removeMediaListener(hoverNoneAndPointerCoarseQuery, syncDesktopComposerEnterSends);
+    };
+  }, []);
+
+  useEffect(() => {
     const bootstrap = async () => {
       setLoading(true);
 
@@ -1437,6 +1521,7 @@ export default function ChatPage() {
     let cancelled = false;
 
     shouldAutoScrollRef.current = true;
+    isAtBottomRef.current = true;
     setShowJumpToLatest(false);
     seenMessageIdsRef.current = new Set();
     seededMessageIdsRef.current = false;
@@ -1450,6 +1535,13 @@ export default function ChatPage() {
     setEditDraftAttachments([]);
     setEditSavePending(false);
     latestAssistantTextRef.current = '';
+    streamBufferedAssistantTextRef.current = '';
+    streamRenderedAssistantTextRef.current = '';
+    streamLastFlushAtRef.current = 0;
+    if (streamFlushFrameRef.current !== null) {
+      window.cancelAnimationFrame(streamFlushFrameRef.current);
+      streamFlushFrameRef.current = null;
+    }
     stopRequestedRef.current = false;
 
     if (!selectedThreadId) {
@@ -1515,6 +1607,15 @@ export default function ChatPage() {
     return () => window.clearTimeout(timeoutId);
   }, [messages]);
 
+  useEffect(() => {
+    return () => {
+      if (streamFlushFrameRef.current !== null) {
+        window.cancelAnimationFrame(streamFlushFrameRef.current);
+        streamFlushFrameRef.current = null;
+      }
+    };
+  }, []);
+
   const animatingMessageIdSet = useMemo(() => new Set(animatingMessageIds), [animatingMessageIds]);
   const latestUserMessage = useMemo(() => findLatestUserMessage(messages), [messages]);
   const latestAssistantWithSourceUser = useMemo(
@@ -1524,16 +1625,21 @@ export default function ChatPage() {
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      if (shouldAutoScrollRef.current) {
+      const container = messageListRef.current;
+      if (!container) {
+        return;
+      }
+
+      if (shouldAutoScrollRef.current || isNearBottom(container)) {
         scrollToLatest('auto');
         return;
       }
 
-      updateAutoScrollState();
+      setAutoScrollState(false);
     });
 
     return () => window.cancelAnimationFrame(frame);
-  }, [messages, scrollToLatest, streamingAssistantContent, updateAutoScrollState]);
+  }, [messages, scrollToLatest, setAutoScrollState, streamingAssistantContent]);
 
   useEffect(() => {
     adjustComposerHeight();
@@ -1602,7 +1708,10 @@ export default function ChatPage() {
 
     stopRequestedRef.current = true;
     setGenerationActive(false);
-    const stoppedText = latestAssistantTextRef.current || streamingAssistantContent;
+    const stoppedText =
+      latestAssistantTextRef.current ||
+      streamBufferedAssistantTextRef.current ||
+      streamRenderedAssistantTextRef.current;
     if (streamingAssistantId && stoppedText.trim()) {
       updateMessageContent(streamingAssistantId, stoppedText.trim());
     }
@@ -1741,6 +1850,13 @@ export default function ChatPage() {
         setGenerationActive(true);
         setStreamingAssistantId(optimisticAssistantMessageId);
         setStreamingAssistantContent('');
+        streamBufferedAssistantTextRef.current = '';
+        streamRenderedAssistantTextRef.current = '';
+        streamLastFlushAtRef.current = 0;
+        if (streamFlushFrameRef.current !== null) {
+          window.cancelAnimationFrame(streamFlushFrameRef.current);
+          streamFlushFrameRef.current = null;
+        }
 
         setMessages((previous) => [
           ...previous,
@@ -1793,40 +1909,36 @@ export default function ChatPage() {
           }
 
           let parserBuffer = '';
-          let assistantText = '';
-          let renderedAssistantText = '';
-          let streamFlushFrameId: number | null = null;
-          let lastStreamFlushAt = 0;
           const decoder = new TextDecoder();
-          const streamFlushIntervalMs = 64;
 
           const flushAssistantContent = (force: boolean) => {
-            if (!force && assistantText === renderedAssistantText) {
+            const bufferedAssistantText = streamBufferedAssistantTextRef.current;
+            if (!force && bufferedAssistantText === streamRenderedAssistantTextRef.current) {
               return;
             }
-            renderedAssistantText = assistantText;
-            latestAssistantTextRef.current = renderedAssistantText;
-            lastStreamFlushAt = Date.now();
+            streamRenderedAssistantTextRef.current = bufferedAssistantText;
+            latestAssistantTextRef.current = bufferedAssistantText;
+            streamLastFlushAtRef.current = performance.now();
             setStreamingAssistantContent((previous) =>
-              previous === renderedAssistantText ? previous : renderedAssistantText,
+              previous === bufferedAssistantText ? previous : bufferedAssistantText,
             );
           };
 
           const scheduleAssistantFlush = () => {
-            if (streamFlushFrameId !== null) {
+            if (streamFlushFrameRef.current !== null) {
               return;
             }
 
-            const flushFrame = () => {
-              if (Date.now() - lastStreamFlushAt < streamFlushIntervalMs) {
-                streamFlushFrameId = window.requestAnimationFrame(flushFrame);
+            const flushFrame = (timestamp: number) => {
+              if (timestamp - streamLastFlushAtRef.current < streamingRenderIntervalMs) {
+                streamFlushFrameRef.current = window.requestAnimationFrame(flushFrame);
                 return;
               }
-              streamFlushFrameId = null;
+              streamFlushFrameRef.current = null;
               flushAssistantContent(false);
             };
 
-            streamFlushFrameId = window.requestAnimationFrame(flushFrame);
+            streamFlushFrameRef.current = window.requestAnimationFrame(flushFrame);
           };
 
           try {
@@ -1845,8 +1957,8 @@ export default function ChatPage() {
                 continue;
               }
 
-              assistantText += parsed.assistantDelta;
-              latestAssistantTextRef.current = assistantText;
+              streamBufferedAssistantTextRef.current += parsed.assistantDelta;
+              latestAssistantTextRef.current = streamBufferedAssistantTextRef.current;
               scheduleAssistantFlush();
             }
 
@@ -1854,18 +1966,21 @@ export default function ChatPage() {
             if (tail) {
               parserBuffer += tail;
               const parsedTail = parseResponsesSseBuffer(parserBuffer);
-              assistantText += parsedTail.assistantDelta;
+              streamBufferedAssistantTextRef.current += parsedTail.assistantDelta;
             }
 
             flushAssistantContent(true);
-            const finalizedAssistantText = assistantText || '[stream ended without text]';
+            const finalizedAssistantText =
+              streamBufferedAssistantTextRef.current || '[stream ended without text]';
             latestAssistantTextRef.current = finalizedAssistantText;
-            setStreamingAssistantContent(finalizedAssistantText);
+            setStreamingAssistantContent((previous) =>
+              previous === finalizedAssistantText ? previous : finalizedAssistantText,
+            );
             updateMessageContent(optimisticAssistantMessageId, finalizedAssistantText);
           } finally {
-            if (streamFlushFrameId !== null) {
-              window.cancelAnimationFrame(streamFlushFrameId);
-              streamFlushFrameId = null;
+            if (streamFlushFrameRef.current !== null) {
+              window.cancelAnimationFrame(streamFlushFrameRef.current);
+              streamFlushFrameRef.current = null;
             }
           }
         } else {
@@ -1887,7 +2002,11 @@ export default function ChatPage() {
       } catch (requestError) {
         const isAbortError = requestError instanceof Error && requestError.name === 'AbortError';
         if (isAbortError) {
-          const stoppedText = (latestAssistantTextRef.current || streamingAssistantContent).trim();
+          const stoppedText = (
+            latestAssistantTextRef.current ||
+            streamBufferedAssistantTextRef.current ||
+            streamRenderedAssistantTextRef.current
+          ).trim();
           if (optimisticAssistantId && stoppedText) {
             updateMessageContent(optimisticAssistantId, stoppedText);
           } else if (optimisticAssistantId) {
@@ -1922,6 +2041,13 @@ export default function ChatPage() {
         setActiveAbortController(null);
         setStreamingAssistantId(null);
         setStreamingAssistantContent('');
+        if (streamFlushFrameRef.current !== null) {
+          window.cancelAnimationFrame(streamFlushFrameRef.current);
+          streamFlushFrameRef.current = null;
+        }
+        streamBufferedAssistantTextRef.current = '';
+        streamRenderedAssistantTextRef.current = '';
+        streamLastFlushAtRef.current = 0;
         stopRequestedRef.current = false;
         latestAssistantTextRef.current = '';
       }
@@ -1935,7 +2061,6 @@ export default function ChatPage() {
       selectThread,
       sending,
       streamResponses,
-      streamingAssistantContent,
       updateMessageContent,
     ],
   );
@@ -2242,11 +2367,15 @@ export default function ChatPage() {
           }}
           onPaste={handleComposerPaste}
           onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-              event.preventDefault();
-              if (canSend) {
-                void sendMessage();
-              }
+            if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) {
+              return;
+            }
+            if (!desktopComposerEnterSends || editingActive) {
+              return;
+            }
+            event.preventDefault();
+            if (canSend) {
+              void sendMessage();
             }
           }}
           placeholder={editingActive ? 'edit your message' : 'ask anything'}
@@ -2391,13 +2520,11 @@ export default function ChatPage() {
                   />
                 );
               })}
-
-              <div ref={messageListEndRef} />
             </div>
 
             {showJumpToLatest && messages.length > 0 ? (
               <button type="button" className="chat-jump-latest" onClick={() => scrollToLatest('smooth')}>
-                Jump to latest
+                Jump to bottom
               </button>
             ) : null}
           </div>
