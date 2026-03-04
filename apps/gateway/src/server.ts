@@ -6238,6 +6238,7 @@ async function setupServer(): Promise<void> {
     }
 
     const currentInput = requestBody.input;
+    const storageInput = currentInput;
     const inputTokenEstimate = estimateTokensFromUnknown(currentInput);
     const effectiveRateLimits =
       request.effectiveRateLimits ?? (await loadEffectiveRateLimitsForUser(user.id));
@@ -6303,7 +6304,7 @@ async function setupServer(): Promise<void> {
       userId: user.id,
       role: 'user',
       content: userPrompt || '[non-text input]',
-      rawContent: hydratedCurrentInput,
+      rawContent: storageInput,
     });
 
     await maybeAutoRenameThread({
@@ -6669,6 +6670,7 @@ async function setupServer(): Promise<void> {
     }
 
     const currentMessages = requestBody.messages;
+    const storageMessages = currentMessages;
     const inputTokenEstimate = estimateTokensFromUnknown(currentMessages);
     const effectiveRateLimits =
       request.effectiveRateLimits ?? (await loadEffectiveRateLimitsForUser(user.id));
@@ -6733,7 +6735,7 @@ async function setupServer(): Promise<void> {
       userId: user.id,
       role: 'user',
       content: userPrompt || '[non-text input]',
-      rawContent: hydratedCurrentMessages,
+      rawContent: storageMessages,
     });
 
     await maybeAutoRenameThread({
