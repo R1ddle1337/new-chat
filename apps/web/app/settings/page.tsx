@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { readStreamResponsesPreference, writeStreamResponsesPreference } from '../components/chat-preferences';
 import MainHeader from '../components/main-header';
 
 type MePayload = {
@@ -50,6 +51,7 @@ export default function SettingsPage() {
   const [me, setMe] = useState<MePayload | null>(null);
   const [allowedModels, setAllowedModels] = useState<AllowedModelItem[]>([]);
   const [defaultModel, setDefaultModel] = useState('');
+  const [streamResponses, setStreamResponses] = useState(true);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -121,6 +123,10 @@ export default function SettingsPage() {
   }, []);
 
   useEffect(() => {
+    setStreamResponses(readStreamResponsesPreference());
+  }, []);
+
+  useEffect(() => {
     if (!defaultModel && sortedModels.length > 0) {
       setDefaultModel(sortedModels[0]!.id);
       return;
@@ -172,6 +178,11 @@ export default function SettingsPage() {
   const logout = async () => {
     await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
     router.replace('/login');
+  };
+
+  const toggleStreamResponses = (nextValue: boolean) => {
+    setStreamResponses(nextValue);
+    writeStreamResponsesPreference(nextValue);
   };
 
   return (
@@ -244,6 +255,19 @@ export default function SettingsPage() {
               ))}
             </div>
           </div>
+        </div>
+
+        <div className="card">
+          <h2>Chat</h2>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={streamResponses}
+              onChange={(event) => toggleStreamResponses(event.target.checked)}
+            />
+            <span>Stream responses</span>
+          </label>
+          <p className="notice">When enabled, assistant responses render incrementally in chat.</p>
         </div>
 
         {status ? <div className="notice">{status}</div> : null}

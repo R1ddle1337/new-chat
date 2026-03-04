@@ -15,6 +15,10 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import {
+  STREAM_RESPONSES_STORAGE_KEY,
+  readStreamResponsesPreference,
+} from '../components/chat-preferences';
 import MainHeader from '../components/main-header';
 import { useChatShell } from '../components/chat-shell-context';
 import ImageAttachment from './image-attachment';
@@ -898,7 +902,7 @@ function parseErrorMessage(payload: unknown, fallback: string): string {
 
 function makeModelLabel(model: AllowedModelItem): string {
   const displayName = model.display_name?.trim();
-  return displayName ? `${displayName} (${model.id})` : model.id;
+  return displayName || model.id;
 }
 
 function makeLocalMessageId(prefix: string): string {
@@ -1180,6 +1184,29 @@ export default function ChatPage() {
       attachments: Array.isArray(message.attachments) ? message.attachments : [],
     }));
   };
+
+  useEffect(() => {
+    const syncStreamResponsesPreference = () => {
+      setStreamResponses(readStreamResponsesPreference());
+    };
+
+    syncStreamResponsesPreference();
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.storageArea !== window.localStorage) {
+        return;
+      }
+      if (event.key !== null && event.key !== STREAM_RESPONSES_STORAGE_KEY) {
+        return;
+      }
+      syncStreamResponsesPreference();
+    };
+
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
 
   useEffect(() => {
     const bootstrap = async () => {
@@ -1621,9 +1648,10 @@ export default function ChatPage() {
 
   const chatHeaderControls = (
     <div className="chat-header-controls">
-      <label className="inline-field">
-        <span>Model</span>
+      <label className="chat-model-pill">
+        <span className="sr-only">Select model</span>
         <select
+          aria-label="Select model"
           value={selectedModelValue}
           onChange={(event) => {
             const nextModel = event.target.value;
@@ -1646,16 +1674,11 @@ export default function ChatPage() {
             ))
           )}
         </select>
-      </label>
-
-      <label className="chat-toggle-field">
-        <input
-          type="checkbox"
-          checked={streamResponses}
-          onChange={(event) => setStreamResponses(event.target.checked)}
-          disabled={sending}
-        />
-        <span>Stream</span>
+        <span className="chat-model-pill-chevron" aria-hidden="true">
+          <svg viewBox="0 0 20 20">
+            <path d="m6 8 4 4 4-4" />
+          </svg>
+        </span>
       </label>
     </div>
   );

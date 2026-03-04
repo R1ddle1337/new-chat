@@ -1012,39 +1012,83 @@ code {
 .chat-header-controls {
   display: flex;
   align-items: center;
-  gap: 0.7rem;
-  flex-wrap: wrap;
+  justify-content: flex-end;
+  width: 100%;
   min-width: 0;
 }
 
-.inline-field {
-  display: grid;
-  gap: 0.24rem;
-  font-size: 0.82rem;
-  font-weight: 600;
-  color: var(--muted);
-}
-
-.inline-field select {
-  min-width: 280px;
-  max-width: 100%;
-  padding: 0.42rem 0.58rem;
-  border-radius: 9px;
-  font-size: 0.85rem;
-  color: var(--text);
-}
-
-.chat-toggle-field {
+.chat-model-pill {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 0.38rem;
-  color: var(--muted);
-  font-size: 0.84rem;
-  font-weight: 600;
+  width: clamp(190px, 24vw, 320px);
+  max-width: 100%;
+  min-width: 0;
+  border: 1px solid #d6dbe3;
+  border-radius: 999px;
+  background: #f8f9fb;
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.08),
+    0 8px 20px rgba(15, 23, 42, 0.05);
+  transition:
+    border-color var(--motion-duration) var(--motion-ease),
+    box-shadow var(--motion-duration) var(--motion-ease),
+    background-color var(--motion-duration) var(--motion-ease);
 }
 
-.chat-toggle-field input {
-  width: auto;
+.chat-model-pill:focus-within {
+  border-color: #c6ccd6;
+  background: #fbfcfd;
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.08),
+    0 10px 24px rgba(15, 23, 42, 0.1);
+}
+
+.chat-model-pill select {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  padding: 0.46rem 2rem 0.46rem 0.9rem;
+  min-width: 0;
+  width: 100%;
+  font-size: 0.85rem;
+  color: var(--text);
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-model-pill select:focus {
+  box-shadow: none;
+}
+
+.chat-model-pill select:disabled {
+  color: var(--muted);
+}
+
+.chat-model-pill-chevron {
+  position: absolute;
+  right: 0.72rem;
+  width: 0.9rem;
+  height: 0.9rem;
+  color: #6b7280;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.chat-model-pill-chevron svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.85;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .chat-header-error {
@@ -1611,8 +1655,8 @@ code {
 }
 
 @media (max-width: 1100px) {
-  .inline-field select {
-    min-width: 220px;
+  .chat-model-pill {
+    width: clamp(176px, 30vw, 280px);
   }
 }
 
@@ -1699,32 +1743,18 @@ code {
   }
 
   .chat-header-controls {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 0.5rem;
-    align-items: end;
+    justify-content: flex-start;
+  }
+
+  .chat-model-pill {
     width: 100%;
-    min-width: 0;
+    max-width: none;
   }
 
-  .chat-header-controls .inline-field {
-    min-width: 0;
-  }
-
-  .chat-header-controls .inline-field select {
+  .chat-model-pill select {
     min-width: 0;
     width: 100%;
-    height: 2.25rem;
-  }
-
-  .chat-toggle-field {
     min-height: 2.25rem;
-    padding: 0 0.54rem;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background: #ffffff;
-    white-space: nowrap;
-    flex-wrap: nowrap;
   }
 
   .page-stack {
@@ -1835,11 +1865,7 @@ code {
     gap: 0.44rem;
   }
 
-  .inline-field {
-    min-width: 0;
-  }
-
-  .inline-field select {
+  .chat-model-pill select {
     font-size: 0.82rem;
   }
 
