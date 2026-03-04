@@ -44,6 +44,7 @@ type UploadedFileRow = {
   bucket: string;
   object_key: string;
   mime_type: string;
+  size_bytes?: number | null;
 };
 
 type StoredFileRow = {
@@ -247,6 +248,12 @@ const minio = new MinioClient({
   accessKey: config.minioAccessKey,
   secretKey: config.minioSecretKey,
 });
+
+async function getMinioObjectStream(bucket: string, objectKey: string): Promise<Readable> {
+  // MinIO SDK (v8) supports promise API when no callback is provided.
+  // Use the promise-returning form; it returns a Node Readable stream.
+  return (await minio.getObject(bucket, objectKey)) as unknown as Readable;
+}
 
 const app = Fastify({
   logger: {
@@ -2314,7 +2321,7 @@ async function loadImageDataUrl(userId: string, fileId: string): Promise<string>
   }
 
   const file = result.rows[0]!;
-  const objectStream = (await minio.getObject(file.bucket, file.object_key)) as Readable;
+  const objectStream = await getMinioObjectStream(file.bucket, file.object_key);
   const buffer = await streamToBuffer(objectStream);
   return `data:${file.mime_type};base64,${buffer.toString('base64')}`;
 }
@@ -5652,7 +5659,7 @@ async function setupServer(): Promise<void> {
       }
 
       const fileResult = await pool.query<UploadedFileRow>(
-        `SELECT id, bucket, object_key, mime_type
+        `SELECT id, bucket, object_key, mime_type, size_bytes
          FROM files
          WHERE id = $1 AND user_id = $2`,
         [params.fileId, params.userId],
@@ -5674,10 +5681,13 @@ async function setupServer(): Promise<void> {
       });
 
       const file = fileResult.rows[0]!;
-      const stream = (await minio.getObject(file.bucket, file.object_key)) as Readable;
+      const stream = await getMinioObjectStream(file.bucket, file.object_key);
 
       reply.header('Content-Type', file.mime_type);
       reply.header('Cache-Control', 'private, max-age=300');
+      if (typeof file.size_bytes === 'number') {
+        reply.header('Content-Length', String(file.size_bytes));
+      }
       reply.send(stream);
     },
   );
@@ -6180,7 +6190,7 @@ async function setupServer(): Promise<void> {
     const params = request.params as { fileId: string };
 
     const fileResult = await pool.query<UploadedFileRow>(
-      `SELECT id, bucket, object_key, mime_type
+      `SELECT id, bucket, object_key, mime_type, size_bytes
        FROM files
        WHERE id = $1 AND user_id = $2`,
       [params.fileId, user.id],
@@ -6192,10 +6202,13 @@ async function setupServer(): Promise<void> {
     }
 
     const file = fileResult.rows[0]!;
-    const stream = (await minio.getObject(file.bucket, file.object_key)) as Readable;
+    const stream = await getMinioObjectStream(file.bucket, file.object_key);
 
     reply.header('Content-Type', file.mime_type);
     reply.header('Cache-Control', 'private, max-age=300');
+    if (typeof file.size_bytes === 'number') {
+      reply.header('Content-Length', String(file.size_bytes));
+    }
     reply.send(stream);
   });
 
