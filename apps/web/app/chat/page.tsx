@@ -21,6 +21,7 @@ import {
 } from '../components/chat-preferences';
 import MainHeader from '../components/main-header';
 import { useChatShell } from '../components/chat-shell-context';
+import ModelPicker from '../components/model-picker';
 import ImageAttachment from './image-attachment';
 
 type MessageAttachment = {
@@ -900,11 +901,6 @@ function parseErrorMessage(payload: unknown, fallback: string): string {
   return fallback;
 }
 
-function makeModelLabel(model: AllowedModelItem): string {
-  const displayName = model.display_name?.trim();
-  return displayName || model.id;
-}
-
 function makeLocalMessageId(prefix: string): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return `${prefix}-${crypto.randomUUID()}`;
@@ -1017,21 +1013,6 @@ export default function ChatPage() {
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [streamingAssistantId, setStreamingAssistantId] = useState<string | null>(null);
   const [streamingAssistantContent, setStreamingAssistantContent] = useState('');
-
-  const modelSelectionOptions = useMemo(() => {
-    return allowedModels.map((entry) => ({
-      ...entry,
-      value: entry.id,
-    }));
-  }, [allowedModels]);
-
-  const selectedModelValue = useMemo(() => {
-    if (!model) {
-      return '';
-    }
-
-    return model;
-  }, [model]);
 
   const canSend =
     !sending && Boolean(model.trim()) && (input.trim().length > 0 || Boolean(image));
@@ -1648,38 +1629,12 @@ export default function ChatPage() {
 
   const chatHeaderControls = (
     <div className="chat-header-controls">
-      <label className="chat-model-pill">
-        <span className="sr-only">Select model</span>
-        <select
-          aria-label="Select model"
-          value={selectedModelValue}
-          onChange={(event) => {
-            const nextModel = event.target.value;
-            if (!nextModel) {
-              setModel('');
-              return;
-            }
-
-            setModel(nextModel);
-          }}
-          disabled={sending || modelSelectionOptions.length === 0}
-        >
-          {modelSelectionOptions.length === 0 ? (
-            <option value="">No allowed models</option>
-          ) : (
-            modelSelectionOptions.map((item) => (
-              <option key={item.value} value={item.value}>
-                {makeModelLabel(item)}
-              </option>
-            ))
-          )}
-        </select>
-        <span className="chat-model-pill-chevron" aria-hidden="true">
-          <svg viewBox="0 0 20 20">
-            <path d="m6 8 4 4 4-4" />
-          </svg>
-        </span>
-      </label>
+      <ModelPicker
+        options={allowedModels}
+        value={model}
+        onChange={setModel}
+        disabled={sending || allowedModels.length === 0}
+      />
     </div>
   );
 
@@ -1809,7 +1764,7 @@ export default function ChatPage() {
         right={chatHeaderControls}
       />
 
-      {modelSelectionOptions.length === 0 ? (
+      {allowedModels.length === 0 ? (
         <p className="error chat-header-error">No allowed models are configured by admin.</p>
       ) : null}
 
