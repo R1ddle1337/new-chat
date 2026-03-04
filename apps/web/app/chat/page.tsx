@@ -61,6 +61,8 @@ type Toast = {
 };
 
 const autoScrollThresholdPx = 120;
+const maxComposerImages = 6;
+const chatModelStorageKey = 'nchat_last_model';
 
 type MarkdownCodeProps = ComponentPropsWithoutRef<'code'> & {
   inline?: boolean;
@@ -942,6 +944,39 @@ function normalizePastedImageFile(file: File): File {
   });
 }
 
+function isImageFile(file: File): boolean {
+  return file.type.startsWith('image/');
+}
+
+function readStoredChatModelId(): string | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  try {
+    const value = window.localStorage.getItem(chatModelStorageKey);
+    if (!value) {
+      return null;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredChatModelId(modelId: string): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(chatModelStorageKey, modelId);
+  } catch {
+    // Ignore localStorage write failures.
+  }
+}
+
 function isNearBottom(element: HTMLElement): boolean {
   const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
   return distance <= autoScrollThresholdPx;
@@ -1000,8 +1035,8 @@ export default function ChatPage() {
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [input, setInput] = useState('');
-  const [image, setImage] = useState<File | null>(null);
-  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
+  const [images, setImages] = useState<File[]>([]);
+  const [imagePreviewUrls, setImagePreviewUrls] = useState<string[]>([]);
   const [composerFocused, setComposerFocused] = useState(false);
   const [animatingMessageIds, setAnimatingMessageIds] = useState<string[]>([]);
   const [model, setModel] = useState('');
@@ -1015,8 +1050,8 @@ export default function ChatPage() {
   const [streamingAssistantContent, setStreamingAssistantContent] = useState('');
 
   const canSend =
-    !sending && Boolean(model.trim()) && (input.trim().length > 0 || Boolean(image));
-  const composerActive = composerFocused || Boolean(input.trim()) || Boolean(image);
+    !sending && Boolean(model.trim()) && (input.trim().length > 0 || images.length > 0);
+  const composerActive = composerFocused || Boolean(input.trim()) || images.length > 0;
 
   const pushToast = useCallback((kind: ToastKind, message: string) => {
     const id = toastCounterRef.current + 1;
@@ -1028,59 +1063,91 @@ export default function ChatPage() {
     }, 4500);
   }, []);
 
-  const setAttachedImage = useCallback((nextImage: File | null) => {
-    setImage(nextImage);
+  const appendImages = useCallback((nextFiles: File[]) => {
+    const imageFiles = nextFiles.filter((file) => isImageFile(file));
+    if (imageFiles.length === 0) {
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+      return;
+    }
+
+    setImages((previous) => {
+      if (previous.length >= maxComposerImages) {
+        return previous;
+      }
+
+      const remainingSlots = maxComposerImages - previous.length;
+      if (remainingSlots <= 0) {
+        return previous;
+      }
+
+      return [...previous, ...imageFiles.slice(0, remainingSlots)];
+    });
+
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
-    setImagePreviewUrl((current) => {
-      if (current) {
-        URL.revokeObjectURL(current);
-      }
-      return nextImage ? URL.createObjectURL(nextImage) : null;
-    });
   }, []);
 
-  const clearImage = useCallback(() => {
-    setAttachedImage(null);
-  }, [setAttachedImage]);
+  const removeImageAtIndex = useCallback((indexToRemove: number) => {
+    setImages((previous) =>
+      previous.filter((_file, index) => index !== indexToRemove),
+    );
+  }, []);
+
+  const clearImages = useCallback(() => {
+    setImages([]);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  }, []);
 
   const handleComposerPaste = useCallback(
     (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+      const pastedImages: File[] = [];
+      const seenPastedSignatures = new Set<string>();
+      const addPastedImage = (file: File) => {
+        if (!isImageFile(file)) {
+          return;
+        }
+
+        const normalized = normalizePastedImageFile(file);
+        const signature = `${normalized.name}:${normalized.size}:${normalized.lastModified}:${normalized.type}`;
+        if (seenPastedSignatures.has(signature)) {
+          return;
+        }
+
+        seenPastedSignatures.add(signature);
+        pastedImages.push(normalized);
+      };
+
       const clipboardItems = event.clipboardData?.items;
-      if (!clipboardItems || clipboardItems.length === 0) {
-        return;
-      }
-
-      let pastedImage: File | null = null;
-      for (const item of Array.from(clipboardItems)) {
-        if (!item.type.startsWith('image/')) {
-          continue;
-        }
-
-        const rawFile = item.getAsFile();
-        if (!rawFile) {
-          continue;
-        }
-
-        pastedImage = normalizePastedImageFile(rawFile);
-        break;
-      }
-
-      if (!pastedImage && event.clipboardData?.files?.length) {
-        const imageFile = Array.from(event.clipboardData.files).find((file) =>
-          file.type.startsWith('image/'),
-        );
-        if (imageFile) {
-          pastedImage = normalizePastedImageFile(imageFile);
+      if (clipboardItems?.length) {
+        for (const item of Array.from(clipboardItems)) {
+          if (!item.type.startsWith('image/')) {
+            continue;
+          }
+          const rawFile = item.getAsFile();
+          if (!rawFile) {
+            continue;
+          }
+          addPastedImage(rawFile);
         }
       }
 
-      if (pastedImage) {
-        setAttachedImage(pastedImage);
+      const clipboardFiles = event.clipboardData?.files;
+      if (clipboardFiles?.length) {
+        for (const file of Array.from(clipboardFiles)) {
+          addPastedImage(file);
+        }
+      }
+
+      if (pastedImages.length > 0) {
+        appendImages(pastedImages);
       }
     },
-    [setAttachedImage],
+    [appendImages],
   );
 
   const adjustComposerHeight = useCallback(() => {
@@ -1203,12 +1270,18 @@ export default function ChatPage() {
       const me = (await meRes.json()) as MePayload;
 
       try {
+        const storedModelId = readStoredChatModelId();
         const models = await loadAllowedModels();
         const preferredModel =
-          me.default_model && models.some((entry) => entry.id === me.default_model)
+          storedModelId && models.some((entry) => entry.id === storedModelId)
+            ? storedModelId
+            : me.default_model && models.some((entry) => entry.id === me.default_model)
             ? me.default_model
             : models[0]?.id ?? '';
         setModel(preferredModel);
+        if (preferredModel) {
+          writeStoredChatModelId(preferredModel);
+        }
       } catch (error) {
         pushToast('error', error instanceof Error ? error.message : 'Failed to load allowed models');
       } finally {
@@ -1226,7 +1299,9 @@ export default function ChatPage() {
     }
 
     if (!allowedModels.some((entry) => entry.id === model)) {
-      setModel(allowedModels[0]!.id);
+      const fallbackModelId = allowedModels[0]!.id;
+      setModel(fallbackModelId);
+      writeStoredChatModelId(fallbackModelId);
     }
   }, [allowedModels, model]);
 
@@ -1324,12 +1399,15 @@ export default function ChatPage() {
   }, [adjustComposerHeight, input]);
 
   useEffect(() => {
+    const nextPreviewUrls = images.map((file) => URL.createObjectURL(file));
+    setImagePreviewUrls(nextPreviewUrls);
+
     return () => {
-      if (imagePreviewUrl) {
-        URL.revokeObjectURL(imagePreviewUrl);
+      for (const previewUrl of nextPreviewUrls) {
+        URL.revokeObjectURL(previewUrl);
       }
     };
-  }, [imagePreviewUrl]);
+  }, [images]);
 
   const copyAssistantMessage = useCallback(
     async (_message: MessageItem, content: string) => {
@@ -1349,6 +1427,11 @@ export default function ChatPage() {
     },
     [copyAssistantMessage],
   );
+
+  const handleModelChange = useCallback((nextModelId: string) => {
+    setModel(nextModelId);
+    writeStoredChatModelId(nextModelId);
+  }, []);
 
   const stopStreaming = () => {
     if (!activeAbortController) {
@@ -1380,7 +1463,8 @@ export default function ChatPage() {
 
   const sendMessage = async () => {
     const promptText = input.trim();
-    if (sending || (!promptText && !image)) {
+    const composedImages = images;
+    if (sending || (!promptText && composedImages.length === 0)) {
       return;
     }
 
@@ -1397,8 +1481,8 @@ export default function ChatPage() {
     let latestThreadId = selectedThreadId;
 
     try {
-      let fileId: string | null = null;
-      if (image) {
+      const uploadedAttachments: MessageAttachment[] = [];
+      for (const image of composedImages) {
         const formData = new FormData();
         formData.append('file', image);
         formData.append('purpose', 'vision');
@@ -1416,7 +1500,12 @@ export default function ChatPage() {
         }
 
         const uploadBody = (await uploadRes.json()) as { id: string };
-        fileId = uploadBody.id;
+        uploadedAttachments.push({
+          file_id: uploadBody.id,
+          filename: image.name || 'image',
+          mime_type: image.type || 'image/*',
+          content_url: `/api/v1/files/${uploadBody.id}/content`,
+        });
       }
 
       const content: Array<Record<string, unknown>> = [];
@@ -1426,10 +1515,10 @@ export default function ChatPage() {
           text: promptText,
         });
       }
-      if (fileId) {
+      for (const attachment of uploadedAttachments) {
         content.push({
           type: 'input_image',
-          file_id: fileId,
+          file_id: attachment.file_id,
         });
       }
 
@@ -1454,23 +1543,14 @@ export default function ChatPage() {
       setStreamingAssistantId(optimisticAssistantId);
       setStreamingAssistantContent('');
 
-      const optimisticAttachments: MessageAttachment[] = fileId
-        ? [
-            {
-              file_id: fileId,
-              filename: image?.name ?? 'image',
-              mime_type: image?.type || 'image/*',
-              content_url: `/api/v1/files/${fileId}/content`,
-            },
-          ]
-        : [];
+      const optimisticAttachments: MessageAttachment[] = uploadedAttachments;
 
       setMessages((previous) => [
         ...previous,
         {
           id: optimisticUserId,
           role: 'user',
-          content: promptText || '[image]',
+          content: promptText || (uploadedAttachments.length > 1 ? '[images]' : '[image]'),
           created_at: new Date().toISOString(),
           attachments: optimisticAttachments,
         },
@@ -1484,7 +1564,7 @@ export default function ChatPage() {
       ]);
 
       setInput('');
-      clearImage();
+      clearImages();
 
       const res = await fetch('/api/v1/responses', {
         method: 'POST',
@@ -1632,7 +1712,7 @@ export default function ChatPage() {
       <ModelPicker
         options={allowedModels}
         value={model}
-        onChange={setModel}
+        onChange={handleModelChange}
         disabled={sending || allowedModels.length === 0}
       />
     </div>
@@ -1640,12 +1720,39 @@ export default function ChatPage() {
 
   const composerRegion = (
     <div className={`chat-composer-region${showHomeState ? ' chat-composer-region-home' : ''}`}>
-      {imagePreviewUrl ? (
+      {imagePreviewUrls.length > 0 ? (
         <div className="chat-image-preview-row">
-          <img src={imagePreviewUrl} alt={image?.name ?? 'Selected image'} />
-          <button className="ghost" type="button" onClick={clearImage} disabled={sending}>
-            Remove image
-          </button>
+          <div className="chat-image-preview-grid">
+            {imagePreviewUrls.map((previewUrl, index) => {
+              const file = images[index];
+              const fileName = file?.name || `Image ${index + 1}`;
+
+              return (
+                <div key={previewUrl} className="chat-image-preview-item">
+                  <img src={previewUrl} alt={fileName} />
+                  <button
+                    type="button"
+                    className="chat-image-preview-remove"
+                    onClick={() => removeImageAtIndex(index)}
+                    disabled={sending}
+                    aria-label={`Remove ${fileName}`}
+                    title={`Remove ${fileName}`}
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="chat-image-preview-footer">
+            <span className="chat-image-preview-meta">
+              {images.length}/{maxComposerImages} selected
+            </span>
+            <button className="ghost" type="button" onClick={clearImages} disabled={sending}>
+              Clear images
+            </button>
+          </div>
         </div>
       ) : null}
 
@@ -1669,10 +1776,10 @@ export default function ChatPage() {
           className="sr-only"
           type="file"
           accept="image/*"
+          multiple
           disabled={sending}
           onChange={(event) => {
-            const next = event.target.files?.[0] ?? null;
-            setAttachedImage(next);
+            appendImages(Array.from(event.target.files ?? []));
           }}
         />
 
@@ -1680,9 +1787,13 @@ export default function ChatPage() {
           type="button"
           className="chat-attach-button"
           onClick={() => fileInputRef.current?.click()}
-          disabled={sending}
+          disabled={sending || images.length >= maxComposerImages}
           aria-label="Attach image"
-          title="Attach image"
+          title={
+            images.length >= maxComposerImages
+              ? `Maximum ${maxComposerImages} images`
+              : 'Attach image'
+          }
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M12 5v14" />
@@ -1772,7 +1883,7 @@ export default function ChatPage() {
         <div className="chat-home-shell">
           <div className="chat-home-card chat-message-enter">
             <h2 className="chat-home-title">How can I help you today?</h2>
-            <p className="chat-home-subtitle">Start a chat with text or an image.</p>
+            <p className="chat-home-subtitle">Start a chat with text or images.</p>
             {composerRegion}
           </div>
         </div>
