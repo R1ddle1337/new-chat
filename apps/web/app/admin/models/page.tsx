@@ -9,6 +9,8 @@ import type {
 } from '../_components/types';
 import { parseError } from '../_components/utils';
 
+type ModelActionBusy = 'save-name' | 'enable' | 'disable' | 'delete';
+
 export default function AdminModelsPage() {
   const [providers, setProviders] = useState<ProviderItem[]>([]);
   const [models, setModels] = useState<ModelItem[]>([]);
@@ -21,7 +23,8 @@ export default function AdminModelsPage() {
 
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [catalogBusy, setCatalogBusy] = useState<string | null>(null);
+  const [modelBusy, setModelBusy] = useState<Record<number, ModelActionBusy>>({});
 
   const filteredImportedModels = useMemo(() => {
     const query = importSearch.trim().toLowerCase();
@@ -78,7 +81,6 @@ export default function AdminModelsPage() {
           item.id,
           {
             display_name: item.display_name,
-            enabled: item.enabled,
           },
         ]),
       ),
@@ -115,7 +117,7 @@ export default function AdminModelsPage() {
 
     setStatus(null);
     setError(null);
-    setBusy('import-models');
+    setCatalogBusy('import-models');
 
     try {
       const res = await fetch('/api/admin/models/import', {
@@ -138,7 +140,7 @@ export default function AdminModelsPage() {
       setImportSearch('');
       setStatus(`已导入 ${items.length} 个上游模型`);
     } finally {
-      setBusy(null);
+      setCatalogBusy(null);
     }
   };
 
@@ -156,7 +158,7 @@ export default function AdminModelsPage() {
 
     setStatus(null);
     setError(null);
-    setBusy('publish-imported');
+    setCatalogBusy('publish-imported');
 
     try {
       const res = await fetch('/api/admin/models/bulk', {
@@ -187,11 +189,32 @@ export default function AdminModelsPage() {
       setImportSelection({});
       await loadModels();
     } finally {
-      setBusy(null);
+      setCatalogBusy(null);
     }
   };
 
-  const saveModel = async (modelId: number) => {
+  const withModelBusy = async (
+    modelId: number,
+    action: ModelActionBusy,
+    task: () => Promise<void>,
+  ) => {
+    setModelBusy((previous) => ({
+      ...previous,
+      [modelId]: action,
+    }));
+
+    try {
+      await task();
+    } finally {
+      setModelBusy((previous) => {
+        const next = { ...previous };
+        delete next[modelId];
+        return next;
+      });
+    }
+  };
+
+  const saveModelDisplayName = async (modelId: number) => {
     const draft = modelDrafts[modelId];
     if (!draft) {
       return;
@@ -205,16 +228,13 @@ export default function AdminModelsPage() {
 
     setStatus(null);
     setError(null);
-    setBusy(`model-${modelId}`);
-
-    try {
+    await withModelBusy(modelId, 'save-name', async () => {
       const res = await fetch(`/api/admin/models/${modelId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify({
           display_name: displayName,
-          enabled: draft.enabled,
         }),
       });
 
@@ -224,11 +244,71 @@ export default function AdminModelsPage() {
         return;
       }
 
-      setStatus(`模型 ${modelId} 已更新`);
+      setStatus(`模型 ${modelId} 显示名称已更新`);
       await loadModels();
-    } finally {
-      setBusy(null);
+    });
+  };
+
+  const setModelEnabled = async (model: ModelItem, enabled: boolean) => {
+    setStatus(null);
+    setError(null);
+
+    await withModelBusy(model.id, enabled ? 'enable' : 'disable', async () => {
+      const res = await fetch(`/api/admin/models/${model.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          enabled,
+        }),
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `更新模型 ${model.public_id} 状态失败`));
+        return;
+      }
+
+      setStatus(`模型 ${model.public_id} 已${enabled ? '启用' : '下架'}`);
+      await loadModels();
+    });
+  };
+
+  const deleteModel = async (model: ModelItem) => {
+    const firstConfirmed = window.confirm(
+      `确认要永久删除模型 "${model.public_id}" 吗？此操作不可恢复。`,
+    );
+    if (!firstConfirmed) {
+      return;
     }
+
+    const typedPublicId = window.prompt(
+      `请输入模型 public_id（${model.public_id}）以确认永久删除：`,
+      '',
+    );
+    if ((typedPublicId ?? '').trim() !== model.public_id) {
+      setError('输入的 public_id 不匹配，已取消删除');
+      return;
+    }
+
+    setStatus(null);
+    setError(null);
+
+    await withModelBusy(model.id, 'delete', async () => {
+      const res = await fetch(`/api/admin/models/${model.id}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      });
+
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        setError(parseError(body, `永久删除模型 ${model.public_id} 失败`));
+        return;
+      }
+
+      setStatus(`模型 ${model.public_id} 已永久删除`);
+      await loadModels();
+    });
   };
 
   return (
@@ -252,17 +332,17 @@ export default function AdminModelsPage() {
             type="button"
             className="secondary"
             onClick={() => void importModels()}
-            disabled={busy !== null || !importProviderId}
+            disabled={catalogBusy !== null || !importProviderId}
           >
-            {busy === 'import-models' ? '导入中...' : '导入上游模型'}
+            {catalogBusy === 'import-models' ? '导入中...' : '导入上游模型'}
           </button>
           <button
             type="button"
             className="primary"
             onClick={() => void publishSelectedImportedModels()}
-            disabled={busy !== null || selectedImportedModelIds.length === 0}
+            disabled={catalogBusy !== null || selectedImportedModelIds.length === 0}
           >
-            {busy === 'publish-imported' ? '发布中...' : '发布所选模型'}
+            {catalogBusy === 'publish-imported' ? '发布中...' : '发布所选模型'}
           </button>
         </div>
 
@@ -311,6 +391,8 @@ export default function AdminModelsPage() {
             if (!draft) {
               return null;
             }
+            const busyAction = modelBusy[model.id];
+            const rowBusy = Boolean(busyAction);
 
             return (
               <div key={model.id} className="admin-item">
@@ -334,31 +416,47 @@ export default function AdminModelsPage() {
                   />
                 </label>
 
-                <label className="checkbox-row">
-                  <input
-                    type="checkbox"
-                    checked={draft.enabled}
-                    onChange={(event) =>
-                      setModelDrafts((previous) => ({
-                        ...previous,
-                        [model.id]: {
-                          ...previous[model.id],
-                          enabled: event.target.checked,
-                        },
-                      }))
-                    }
-                  />
-                  已启用
-                </label>
+                <div className="notice">状态：{model.enabled ? '已启用' : '已下架'}</div>
 
-                <button
-                  type="button"
-                  className="secondary"
-                  onClick={() => void saveModel(model.id)}
-                  disabled={busy !== null}
-                >
-                  {busy === `model-${model.id}` ? '保存中...' : '保存模型'}
-                </button>
+                <div className="button-row">
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => void saveModelDisplayName(model.id)}
+                    disabled={rowBusy}
+                  >
+                    {busyAction === 'save-name' ? '保存中...' : '保存名称'}
+                  </button>
+
+                  {model.enabled ? (
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void setModelEnabled(model, false)}
+                      disabled={rowBusy}
+                    >
+                      {busyAction === 'disable' ? '下架中...' : '下架'}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => void setModelEnabled(model, true)}
+                      disabled={rowBusy}
+                    >
+                      {busyAction === 'enable' ? '启用中...' : '启用'}
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => void deleteModel(model)}
+                    disabled={rowBusy}
+                  >
+                    {busyAction === 'delete' ? '删除中...' : '永久删除'}
+                  </button>
+                </div>
               </div>
             );
           })}

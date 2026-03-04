@@ -34,7 +34,6 @@ export type ModelItem = {
 
 export type ModelDraft = {
   display_name: string;
-  enabled: boolean;
 };
 
 export type ProviderDraft = {

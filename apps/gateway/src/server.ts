@@ -3857,6 +3857,67 @@ async function setupServer(): Promise<void> {
     });
   });
 
+  app.delete('/admin/models/:id', { preHandler: [requireAuth, requireAdmin] }, async (request, reply) => {
+    const user = request.authUser!;
+    const params = request.params as { id: string };
+
+    const id = toPositiveInteger(params.id);
+    if (!id) {
+      reply.code(400).send({ error: 'id must be a positive integer' });
+      return;
+    }
+
+    const deleted = await pool.query<{
+      id: number;
+      public_id: string;
+      provider_code: string;
+      model_id: string;
+      display_name: string;
+      enabled: boolean;
+    }>(
+      `DELETE FROM models m
+       USING providers p
+       WHERE m.id = $1
+         AND p.id = m.provider_id
+       RETURNING m.id,
+                 m.public_id,
+                 p.code AS provider_code,
+                 m.model_id,
+                 m.display_name,
+                 m.enabled`,
+      [id],
+    );
+
+    if (!deleted.rowCount) {
+      reply.code(404).send({ error: 'Model not found' });
+      return;
+    }
+
+    const model = deleted.rows[0]!;
+    await writeAuditEvent({
+      eventType: 'admin.models.deleted',
+      request,
+      userId: user.id,
+      metadata: {
+        id: model.id,
+        model_id: model.model_id,
+        public_id: model.public_id,
+        provider: model.provider_code,
+      },
+    });
+
+    reply.send({
+      data: {
+        id: model.id,
+        public_id: model.public_id,
+        provider_code: model.provider_code,
+        model_id: model.model_id,
+        display_name: model.display_name,
+        enabled: model.enabled,
+      },
+    });
+  });
+
   app.get('/admin/rate-limits', { preHandler: [requireAuth, requireAdmin] }, async () => {
     const settings = await loadRateLimitSettings();
     return {
