@@ -63,6 +63,8 @@ type Toast = {
 const autoScrollThresholdPx = 120;
 const maxComposerImages = 6;
 const chatModelStorageKey = 'nchat_last_model';
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const userMessagePlaceholderPattern = /^\[(?:image|images|non-text input)\]$/i;
 
 type MarkdownCodeProps = ComponentPropsWithoutRef<'code'> & {
   inline?: boolean;
@@ -700,6 +702,13 @@ type ChatMessageRowProps = {
   isStreaming: boolean;
   streamingContent: string | null;
   onCopyAssistantMessage: (message: MessageItem, content: string) => void;
+  showRegenerateAction: boolean;
+  regenerateDisabled: boolean;
+  regenerateBusy: boolean;
+  onRegenerateAssistantMessage: (message: MessageItem) => void;
+  showEditAction: boolean;
+  editDisabled: boolean;
+  onEditUserMessage: (message: MessageItem) => void;
 };
 
 const ChatMessageRow = memo(
@@ -709,12 +718,21 @@ const ChatMessageRow = memo(
     isStreaming,
     streamingContent,
     onCopyAssistantMessage,
+    showRegenerateAction,
+    regenerateDisabled,
+    regenerateBusy,
+    onRegenerateAssistantMessage,
+    showEditAction,
+    editDisabled,
+    onEditUserMessage,
   }: ChatMessageRowProps) {
     const assistantMessage = message.role === 'assistant';
     const renderedContent =
       assistantMessage && isStreaming && streamingContent !== null ? streamingContent : message.content;
     const showGenerating = assistantMessage && isStreaming && !renderedContent.trim();
     const emojiOnly = !showGenerating && isEmojiOnlyMessage(renderedContent);
+    const showCopyAction = assistantMessage && renderedContent.trim().length > 0;
+    const showActions = showCopyAction || showRegenerateAction || showEditAction;
 
     return (
       <article
@@ -758,14 +776,40 @@ const ChatMessageRow = memo(
             )}
           </div>
 
-          {assistantMessage && renderedContent.trim() ? (
-            <button
-              type="button"
-              className="chat-copy-button"
-              onClick={() => onCopyAssistantMessage(message, renderedContent)}
-            >
-              Copy
-            </button>
+          {showActions ? (
+            <div className="chat-message-actions">
+              {showCopyAction ? (
+                <button
+                  type="button"
+                  className="chat-copy-button chat-message-action-button"
+                  onClick={() => onCopyAssistantMessage(message, renderedContent)}
+                >
+                  Copy
+                </button>
+              ) : null}
+
+              {showRegenerateAction ? (
+                <button
+                  type="button"
+                  className="chat-regenerate-button chat-message-action-button"
+                  disabled={regenerateDisabled}
+                  onClick={() => onRegenerateAssistantMessage(message)}
+                >
+                  {regenerateBusy ? 'Regenerating...' : 'Regenerate'}
+                </button>
+              ) : null}
+
+              {showEditAction ? (
+                <button
+                  type="button"
+                  className="chat-edit-button chat-message-action-button"
+                  disabled={editDisabled}
+                  onClick={() => onEditUserMessage(message)}
+                >
+                  Edit
+                </button>
+              ) : null}
+            </div>
           ) : null}
         </div>
       </article>
@@ -776,7 +820,14 @@ const ChatMessageRow = memo(
     previous.isEntering === next.isEntering &&
     previous.isStreaming === next.isStreaming &&
     previous.streamingContent === next.streamingContent &&
-    previous.onCopyAssistantMessage === next.onCopyAssistantMessage,
+    previous.onCopyAssistantMessage === next.onCopyAssistantMessage &&
+    previous.showRegenerateAction === next.showRegenerateAction &&
+    previous.regenerateDisabled === next.regenerateDisabled &&
+    previous.regenerateBusy === next.regenerateBusy &&
+    previous.onRegenerateAssistantMessage === next.onRegenerateAssistantMessage &&
+    previous.showEditAction === next.showEditAction &&
+    previous.editDisabled === next.editDisabled &&
+    previous.onEditUserMessage === next.onEditUserMessage,
 );
 
 function findSseBoundary(input: string): { index: number; length: number } | null {
@@ -901,6 +952,66 @@ function parseErrorMessage(payload: unknown, fallback: string): string {
     }
   }
   return fallback;
+}
+
+function isPersistedUuid(value: string): boolean {
+  return uuidPattern.test(value);
+}
+
+function normalizeUserMessageTextForInput(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed || userMessagePlaceholderPattern.test(trimmed)) {
+    return '';
+  }
+  return trimmed;
+}
+
+function buildUserMessagePreview(content: string, attachmentCount: number): string {
+  if (content) {
+    return content;
+  }
+
+  if (attachmentCount > 1) {
+    return '[images]';
+  }
+
+  if (attachmentCount === 1) {
+    return '[image]';
+  }
+
+  return '[non-text input]';
+}
+
+function findLatestUserMessage(messages: MessageItem[]): MessageItem | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const candidate = messages[index];
+    if (candidate?.role === 'user') {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function findLatestAssistantWithSourceUser(
+  messages: MessageItem[],
+): { assistant: MessageItem; sourceUser: MessageItem | null } | null {
+  for (let assistantIndex = messages.length - 1; assistantIndex >= 0; assistantIndex -= 1) {
+    const assistant = messages[assistantIndex];
+    if (!assistant || assistant.role !== 'assistant') {
+      continue;
+    }
+
+    for (let sourceIndex = assistantIndex - 1; sourceIndex >= 0; sourceIndex -= 1) {
+      const sourceCandidate = messages[sourceIndex];
+      if (sourceCandidate?.role === 'user') {
+        return { assistant, sourceUser: sourceCandidate };
+      }
+    }
+
+    return { assistant, sourceUser: null };
+  }
+
+  return null;
 }
 
 function makeLocalMessageId(prefix: string): string {
@@ -1030,6 +1141,8 @@ export default function ChatPage() {
   const toastCounterRef = useRef(0);
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
   const seededMessageIdsRef = useRef(false);
+  const stopRequestedRef = useRef(false);
+  const latestAssistantTextRef = useRef('');
 
   const [loading, setLoading] = useState(true);
   const [messagesLoading, setMessagesLoading] = useState(false);
@@ -1043,14 +1156,21 @@ export default function ChatPage() {
   const [allowedModels, setAllowedModels] = useState<AllowedModelItem[]>([]);
   const [streamResponses, setStreamResponses] = useState(true);
   const [sending, setSending] = useState(false);
+  const [generationActive, setGenerationActive] = useState(false);
   const [activeAbortController, setActiveAbortController] = useState<AbortController | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [streamingAssistantId, setStreamingAssistantId] = useState<string | null>(null);
   const [streamingAssistantContent, setStreamingAssistantContent] = useState('');
+  const [regeneratingAssistantId, setRegeneratingAssistantId] = useState<string | null>(null);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editDraftText, setEditDraftText] = useState('');
+  const [editDraftAttachments, setEditDraftAttachments] = useState<MessageAttachment[]>([]);
+  const [editSavePending, setEditSavePending] = useState(false);
 
+  const editingActive = editingMessageId !== null;
   const canSend =
-    !sending && Boolean(model.trim()) && (input.trim().length > 0 || images.length > 0);
+    !sending && !editingActive && Boolean(model.trim()) && (input.trim().length > 0 || images.length > 0);
   const composerActive = composerFocused || Boolean(input.trim()) || images.length > 0;
 
   const pushToast = useCallback((kind: ToastKind, message: string) => {
@@ -1105,6 +1225,10 @@ export default function ChatPage() {
 
   const handleComposerPaste = useCallback(
     (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+      if (editingActive) {
+        return;
+      }
+
       const pastedImages: File[] = [];
       const seenPastedSignatures = new Set<string>();
       const addPastedImage = (file: File): boolean => {
@@ -1151,7 +1275,7 @@ export default function ChatPage() {
         appendImages(pastedImages);
       }
     },
-    [appendImages],
+    [appendImages, editingActive],
   );
 
   const adjustComposerHeight = useCallback(() => {
@@ -1317,8 +1441,16 @@ export default function ChatPage() {
     seenMessageIdsRef.current = new Set();
     seededMessageIdsRef.current = false;
     setAnimatingMessageIds([]);
+    setGenerationActive(false);
     setStreamingAssistantId(null);
     setStreamingAssistantContent('');
+    setRegeneratingAssistantId(null);
+    setEditingMessageId(null);
+    setEditDraftText('');
+    setEditDraftAttachments([]);
+    setEditSavePending(false);
+    latestAssistantTextRef.current = '';
+    stopRequestedRef.current = false;
 
     if (!selectedThreadId) {
       setMessages([]);
@@ -1384,6 +1516,11 @@ export default function ChatPage() {
   }, [messages]);
 
   const animatingMessageIdSet = useMemo(() => new Set(animatingMessageIds), [animatingMessageIds]);
+  const latestUserMessage = useMemo(() => findLatestUserMessage(messages), [messages]);
+  const latestAssistantWithSourceUser = useMemo(
+    () => findLatestAssistantWithSourceUser(messages),
+    [messages],
+  );
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -1437,13 +1574,6 @@ export default function ChatPage() {
     writeStoredChatModelId(nextModelId);
   }, []);
 
-  const stopStreaming = () => {
-    if (!activeAbortController) {
-      return;
-    }
-    activeAbortController.abort();
-  };
-
   const updateMessageContent = useCallback((messageId: string, nextContent: string) => {
     setMessages((previous) => {
       const targetIndex = previous.findIndex((message) => message.id === messageId);
@@ -1465,251 +1595,536 @@ export default function ChatPage() {
     });
   }, []);
 
-  const sendMessage = async () => {
-    const promptText = input.trim();
-    const composedImages = images;
-    if (sending || (!promptText && composedImages.length === 0)) {
+  const stopStreaming = () => {
+    if (!activeAbortController) {
       return;
     }
 
-    if (!model.trim()) {
-      pushToast('error', 'Select a model from the allowlist');
-      return;
+    stopRequestedRef.current = true;
+    setGenerationActive(false);
+    const stoppedText = latestAssistantTextRef.current || streamingAssistantContent;
+    if (streamingAssistantId && stoppedText.trim()) {
+      updateMessageContent(streamingAssistantId, stoppedText.trim());
     }
+    activeAbortController.abort();
+  };
 
-    setSending(true);
-    const requestAbortController = new AbortController();
-    setActiveAbortController(requestAbortController);
-
-    const optimisticMessageIds: string[] = [];
-    let latestThreadId = selectedThreadId;
-
-    try {
-      const uploadedAttachments: MessageAttachment[] = [];
-      for (const image of composedImages) {
-        const formData = new FormData();
-        formData.append('file', image);
-        formData.append('purpose', 'vision');
-
-        const uploadRes = await fetch('/api/v1/files', {
-          method: 'POST',
-          body: formData,
-          credentials: 'include',
-          signal: requestAbortController.signal,
-        });
-
-        if (!uploadRes.ok) {
-          const uploadBody = (await uploadRes.json().catch(() => null)) as unknown;
-          throw new Error(parseErrorMessage(uploadBody, 'Image upload failed'));
-        }
-
-        const uploadBody = (await uploadRes.json()) as { id: string };
-        uploadedAttachments.push({
-          file_id: uploadBody.id,
-          filename: image.name || 'image',
-          mime_type: image.type || 'image/*',
-          content_url: `/api/v1/files/${uploadBody.id}/content`,
-        });
-      }
-
-      const content: Array<Record<string, unknown>> = [];
-      if (promptText) {
-        content.push({
-          type: 'input_text',
-          text: promptText,
-        });
-      }
-      for (const attachment of uploadedAttachments) {
-        content.push({
-          type: 'input_image',
-          file_id: attachment.file_id,
-        });
-      }
-
-      const body: Record<string, unknown> = {
-        input: [
-          {
-            role: 'user',
-            content,
-          },
-        ],
-        stream: streamResponses,
-        model: model.trim(),
-      };
-
-      if (selectedThreadId) {
-        body.thread_id = selectedThreadId;
-      }
-
-      const optimisticUserId = makeLocalMessageId('local-user');
-      const optimisticAssistantId = makeLocalMessageId('local-assistant');
-      optimisticMessageIds.push(optimisticUserId, optimisticAssistantId);
-      setStreamingAssistantId(optimisticAssistantId);
-      setStreamingAssistantContent('');
-
-      const optimisticAttachments: MessageAttachment[] = uploadedAttachments;
-
-      setMessages((previous) => [
-        ...previous,
-        {
-          id: optimisticUserId,
-          role: 'user',
-          content: promptText || (uploadedAttachments.length > 1 ? '[images]' : '[image]'),
-          created_at: new Date().toISOString(),
-          attachments: optimisticAttachments,
-        },
-        {
-          id: optimisticAssistantId,
-          role: 'assistant',
-          content: '',
-          created_at: new Date().toISOString(),
-          attachments: [],
-        },
-      ]);
-
-      setInput('');
-      clearImages();
-
-      const res = await fetch('/api/v1/responses', {
+  const truncateThreadFromMessage = useCallback(
+    async (threadId: string, fromMessageId: string): Promise<number> => {
+      const response = await fetch(`/api/me/threads/${threadId}/truncate`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(body),
         credentials: 'include',
-        signal: requestAbortController.signal,
+        body: JSON.stringify({
+          from_message_id: fromMessageId,
+        }),
       });
 
-      if (!res.ok) {
-        const errorBody = (await res.json().catch(() => null)) as unknown;
-        throw new Error(parseErrorMessage(errorBody, 'Request failed'));
+      if (response.status === 401) {
+        router.replace('/login');
+        throw new Error('Your session expired. Please log in again.');
       }
 
-      const responseThreadId = res.headers.get('x-thread-id');
-      if (responseThreadId) {
-        latestThreadId = responseThreadId;
-        selectThread(responseThreadId);
+      const payload = (await response.json().catch(() => null)) as
+        | { deleted_count?: unknown }
+        | null
+        | unknown;
+      if (!response.ok) {
+        throw new Error(parseErrorMessage(payload, 'Failed to truncate thread'));
       }
 
-      if (streamResponses) {
-        const reader = res.body?.getReader();
-        if (!reader) {
-          throw new Error('Streaming response body missing');
+      const record = (payload ?? {}) as { deleted_count?: unknown };
+      return typeof record.deleted_count === 'number' ? record.deleted_count : 0;
+    },
+    [router],
+  );
+
+  const sendPreparedInput = useCallback(
+    async (params: {
+      threadId: string | null;
+      promptText: string;
+      imageFiles?: File[];
+      existingAttachments?: MessageAttachment[];
+      clearComposerOnStart?: boolean;
+    }): Promise<void> => {
+      const normalizedPromptText = params.promptText.trim();
+      const imageFiles = params.imageFiles ?? [];
+      const preloadedAttachments = params.existingAttachments ?? [];
+      if (sending || (!normalizedPromptText && imageFiles.length === 0 && preloadedAttachments.length === 0)) {
+        return;
+      }
+
+      if (!model.trim()) {
+        pushToast('error', 'Select a model from the allowlist');
+        return;
+      }
+
+      setSending(true);
+      stopRequestedRef.current = false;
+      latestAssistantTextRef.current = '';
+
+      const requestAbortController = new AbortController();
+      setActiveAbortController(requestAbortController);
+
+      const optimisticMessageIds: string[] = [];
+      let optimisticAssistantId: string | null = null;
+      let latestThreadId = params.threadId;
+
+      try {
+        const uploadedAttachments: MessageAttachment[] = [...preloadedAttachments];
+        for (const image of imageFiles) {
+          const formData = new FormData();
+          formData.append('file', image);
+          formData.append('purpose', 'vision');
+
+          const uploadRes = await fetch('/api/v1/files', {
+            method: 'POST',
+            body: formData,
+            credentials: 'include',
+            signal: requestAbortController.signal,
+          });
+
+          if (!uploadRes.ok) {
+            const uploadBody = (await uploadRes.json().catch(() => null)) as unknown;
+            throw new Error(parseErrorMessage(uploadBody, 'Image upload failed'));
+          }
+
+          const uploadBody = (await uploadRes.json()) as { id: string };
+          uploadedAttachments.push({
+            file_id: uploadBody.id,
+            filename: image.name || 'image',
+            mime_type: image.type || 'image/*',
+            content_url: `/api/v1/files/${uploadBody.id}/content`,
+          });
         }
 
-        let parserBuffer = '';
-        let assistantText = '';
-        let renderedAssistantText = '';
-        let streamFlushFrameId: number | null = null;
-        let lastStreamFlushAt = 0;
-        const decoder = new TextDecoder();
-        const streamFlushIntervalMs = 64;
+        const content: Array<Record<string, unknown>> = [];
+        if (normalizedPromptText) {
+          content.push({
+            type: 'input_text',
+            text: normalizedPromptText,
+          });
+        }
 
-        const flushAssistantContent = (force: boolean) => {
-          if (!force && assistantText === renderedAssistantText) {
-            return;
-          }
-          renderedAssistantText = assistantText;
-          lastStreamFlushAt = Date.now();
-          setStreamingAssistantContent((previous) =>
-            previous === renderedAssistantText ? previous : renderedAssistantText,
-          );
+        for (const attachment of uploadedAttachments) {
+          content.push({
+            type: 'input_image',
+            file_id: attachment.file_id,
+          });
+        }
+
+        if (content.length === 0) {
+          throw new Error('Message cannot be empty');
+        }
+
+        const body: Record<string, unknown> = {
+          input: [
+            {
+              role: 'user',
+              content,
+            },
+          ],
+          stream: streamResponses,
+          model: model.trim(),
         };
 
-        const scheduleAssistantFlush = () => {
-          if (streamFlushFrameId !== null) {
-            return;
+        if (params.threadId) {
+          body.thread_id = params.threadId;
+        }
+
+        const optimisticUserId = makeLocalMessageId('local-user');
+        const optimisticAssistantMessageId = makeLocalMessageId('local-assistant');
+        optimisticAssistantId = optimisticAssistantMessageId;
+        optimisticMessageIds.push(optimisticUserId, optimisticAssistantMessageId);
+        setGenerationActive(true);
+        setStreamingAssistantId(optimisticAssistantMessageId);
+        setStreamingAssistantContent('');
+
+        setMessages((previous) => [
+          ...previous,
+          {
+            id: optimisticUserId,
+            role: 'user',
+            content: buildUserMessagePreview(normalizedPromptText, uploadedAttachments.length),
+            created_at: new Date().toISOString(),
+            attachments: uploadedAttachments,
+          },
+          {
+            id: optimisticAssistantMessageId,
+            role: 'assistant',
+            content: '',
+            created_at: new Date().toISOString(),
+            attachments: [],
+          },
+        ]);
+
+        if (params.clearComposerOnStart) {
+          setInput('');
+          clearImages();
+        }
+
+        const res = await fetch('/api/v1/responses', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(body),
+          credentials: 'include',
+          signal: requestAbortController.signal,
+        });
+
+        if (!res.ok) {
+          const errorBody = (await res.json().catch(() => null)) as unknown;
+          throw new Error(parseErrorMessage(errorBody, 'Request failed'));
+        }
+
+        const responseThreadId = res.headers.get('x-thread-id');
+        if (responseThreadId) {
+          latestThreadId = responseThreadId;
+          selectThread(responseThreadId);
+        }
+
+        if (streamResponses) {
+          const reader = res.body?.getReader();
+          if (!reader) {
+            throw new Error('Streaming response body missing');
           }
 
-          const flushFrame = () => {
-            if (Date.now() - lastStreamFlushAt < streamFlushIntervalMs) {
-              streamFlushFrameId = window.requestAnimationFrame(flushFrame);
+          let parserBuffer = '';
+          let assistantText = '';
+          let renderedAssistantText = '';
+          let streamFlushFrameId: number | null = null;
+          let lastStreamFlushAt = 0;
+          const decoder = new TextDecoder();
+          const streamFlushIntervalMs = 64;
+
+          const flushAssistantContent = (force: boolean) => {
+            if (!force && assistantText === renderedAssistantText) {
               return;
             }
-            streamFlushFrameId = null;
-            flushAssistantContent(false);
+            renderedAssistantText = assistantText;
+            latestAssistantTextRef.current = renderedAssistantText;
+            lastStreamFlushAt = Date.now();
+            setStreamingAssistantContent((previous) =>
+              previous === renderedAssistantText ? previous : renderedAssistantText,
+            );
           };
 
-          streamFlushFrameId = window.requestAnimationFrame(flushFrame);
-        };
-
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-              break;
+          const scheduleAssistantFlush = () => {
+            if (streamFlushFrameId !== null) {
+              return;
             }
 
-            const chunk = decoder.decode(value, { stream: true });
-            parserBuffer += chunk;
+            const flushFrame = () => {
+              if (Date.now() - lastStreamFlushAt < streamFlushIntervalMs) {
+                streamFlushFrameId = window.requestAnimationFrame(flushFrame);
+                return;
+              }
+              streamFlushFrameId = null;
+              flushAssistantContent(false);
+            };
 
-            const parsed = parseResponsesSseBuffer(parserBuffer);
-            parserBuffer = parsed.remaining;
-            if (!parsed.assistantDelta) {
-              continue;
+            streamFlushFrameId = window.requestAnimationFrame(flushFrame);
+          };
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) {
+                break;
+              }
+
+              const chunk = decoder.decode(value, { stream: true });
+              parserBuffer += chunk;
+
+              const parsed = parseResponsesSseBuffer(parserBuffer);
+              parserBuffer = parsed.remaining;
+              if (!parsed.assistantDelta) {
+                continue;
+              }
+
+              assistantText += parsed.assistantDelta;
+              latestAssistantTextRef.current = assistantText;
+              scheduleAssistantFlush();
             }
 
-            assistantText += parsed.assistantDelta;
-            scheduleAssistantFlush();
-          }
+            const tail = decoder.decode();
+            if (tail) {
+              parserBuffer += tail;
+              const parsedTail = parseResponsesSseBuffer(parserBuffer);
+              assistantText += parsedTail.assistantDelta;
+            }
 
-          const tail = decoder.decode();
-          if (tail) {
-            parserBuffer += tail;
-            const parsedTail = parseResponsesSseBuffer(parserBuffer);
-            assistantText += parsedTail.assistantDelta;
+            flushAssistantContent(true);
+            const finalizedAssistantText = assistantText || '[stream ended without text]';
+            latestAssistantTextRef.current = finalizedAssistantText;
+            setStreamingAssistantContent(finalizedAssistantText);
+            updateMessageContent(optimisticAssistantMessageId, finalizedAssistantText);
+          } finally {
+            if (streamFlushFrameId !== null) {
+              window.cancelAnimationFrame(streamFlushFrameId);
+              streamFlushFrameId = null;
+            }
           }
+        } else {
+          const payload = (await res.json()) as unknown;
+          const assistantText = extractAssistantText(payload) || '[empty response]';
+          latestAssistantTextRef.current = assistantText;
+          updateMessageContent(optimisticAssistantMessageId, assistantText);
+        }
 
-          flushAssistantContent(true);
-          const finalizedAssistantText = assistantText || '[stream ended without text]';
-          setStreamingAssistantContent(finalizedAssistantText);
-          updateMessageContent(optimisticAssistantId, finalizedAssistantText);
-        } finally {
-          if (streamFlushFrameId !== null) {
-            window.cancelAnimationFrame(streamFlushFrameId);
-            streamFlushFrameId = null;
+        await refreshThreads(latestThreadId);
+        if (latestThreadId) {
+          const nextMessages = await loadMessages(latestThreadId);
+          if (nextMessages) {
+            setMessages(nextMessages);
           }
         }
-      } else {
-        const payload = (await res.json()) as unknown;
-        const assistantText = extractAssistantText(payload);
-        updateMessageContent(optimisticAssistantId, assistantText || '[empty response]');
-      }
 
-      await refreshThreads(latestThreadId);
-      if (latestThreadId) {
-        const nextMessages = await loadMessages(latestThreadId);
-        if (nextMessages) {
-          setMessages(nextMessages);
+        pushToast('success', 'Response received');
+      } catch (requestError) {
+        const isAbortError = requestError instanceof Error && requestError.name === 'AbortError';
+        if (isAbortError) {
+          const stoppedText = (latestAssistantTextRef.current || streamingAssistantContent).trim();
+          if (optimisticAssistantId && stoppedText) {
+            updateMessageContent(optimisticAssistantId, stoppedText);
+          } else if (optimisticAssistantId) {
+            setMessages((previous) =>
+              previous.filter((message) => message.id !== optimisticAssistantId),
+            );
+          }
+
+          await refreshThreads(latestThreadId);
+          pushToast('info', 'Generation stopped');
+        } else {
+          setMessages((previous) =>
+            previous.filter((message) => !optimisticMessageIds.includes(message.id)),
+          );
+
+          await refreshThreads(latestThreadId);
+          if (latestThreadId) {
+            const nextMessages = await loadMessages(latestThreadId);
+            if (nextMessages) {
+              setMessages(nextMessages);
+            }
+          }
+
+          pushToast(
+            'error',
+            requestError instanceof Error ? requestError.message : 'Failed to send message',
+          );
         }
+      } finally {
+        setSending(false);
+        setGenerationActive(false);
+        setActiveAbortController(null);
+        setStreamingAssistantId(null);
+        setStreamingAssistantContent('');
+        stopRequestedRef.current = false;
+        latestAssistantTextRef.current = '';
       }
+    },
+    [
+      clearImages,
+      loadMessages,
+      model,
+      pushToast,
+      refreshThreads,
+      selectThread,
+      sending,
+      streamResponses,
+      streamingAssistantContent,
+      updateMessageContent,
+    ],
+  );
 
-      pushToast('success', 'Response received');
-    } catch (requestError) {
-      setMessages((previous) => previous.filter((message) => !optimisticMessageIds.includes(message.id)));
-
-      await refreshThreads(latestThreadId);
-      if (latestThreadId) {
-        const nextMessages = await loadMessages(latestThreadId);
-        if (nextMessages) {
-          setMessages(nextMessages);
-        }
-      }
-
-      if (requestError instanceof Error && requestError.name === 'AbortError') {
-        pushToast('info', 'Generation stopped');
-      } else {
-        pushToast('error', requestError instanceof Error ? requestError.message : 'Failed to send message');
-      }
-    } finally {
-      setSending(false);
-      setActiveAbortController(null);
-      setStreamingAssistantId(null);
-      setStreamingAssistantContent('');
+  const sendMessage = async () => {
+    if (editingActive) {
+      return;
     }
+
+    await sendPreparedInput({
+      threadId: selectedThreadId,
+      promptText: input,
+      imageFiles: images,
+      clearComposerOnStart: true,
+    });
   };
 
+  const startEditingUserMessage = useCallback(
+    (message: MessageItem) => {
+      if (sending || !selectedThreadId) {
+        return;
+      }
+
+      if (!latestUserMessage || latestUserMessage.id !== message.id) {
+        return;
+      }
+
+      const draftText = normalizeUserMessageTextForInput(message.content);
+      setEditingMessageId(message.id);
+      setEditDraftText(draftText);
+      setEditDraftAttachments(message.attachments);
+      setInput(draftText);
+      clearImages();
+
+      window.requestAnimationFrame(() => {
+        composerInputRef.current?.focus();
+      });
+    },
+    [clearImages, latestUserMessage, selectedThreadId, sending],
+  );
+
+  const cancelEditMode = useCallback(() => {
+    setEditingMessageId(null);
+    setEditDraftText('');
+    setEditDraftAttachments([]);
+    setInput('');
+    clearImages();
+  }, [clearImages]);
+
+  const regenerateLatestAssistant = useCallback(
+    async (assistantMessage: MessageItem) => {
+      if (sending || !selectedThreadId) {
+        return;
+      }
+
+      setRegeneratingAssistantId(assistantMessage.id);
+
+      try {
+        let sourceUser =
+          latestAssistantWithSourceUser?.assistant.id === assistantMessage.id
+            ? latestAssistantWithSourceUser.sourceUser
+            : null;
+        if (!sourceUser) {
+          sourceUser = latestUserMessage;
+        }
+
+        if (!sourceUser || !isPersistedUuid(sourceUser.id)) {
+          const refreshedMessages = await loadMessages(selectedThreadId);
+          if (refreshedMessages === null) {
+            throw new Error('Failed to refresh messages before regenerating');
+          }
+
+          setMessages(refreshedMessages);
+          const refreshedPair = findLatestAssistantWithSourceUser(refreshedMessages);
+          sourceUser = refreshedPair?.sourceUser ?? findLatestUserMessage(refreshedMessages);
+        }
+
+        if (!sourceUser || !isPersistedUuid(sourceUser.id)) {
+          throw new Error('Could not resolve a saved user message to regenerate from');
+        }
+
+        const sourceText = normalizeUserMessageTextForInput(sourceUser.content);
+        const sourceAttachments = sourceUser.attachments;
+
+        await truncateThreadFromMessage(selectedThreadId, sourceUser.id);
+
+        const reloadedMessages = await loadMessages(selectedThreadId);
+        if (reloadedMessages === null) {
+          throw new Error('Failed to reload messages after truncate');
+        }
+        setMessages(reloadedMessages);
+
+        await sendPreparedInput({
+          threadId: selectedThreadId,
+          promptText: sourceText,
+          existingAttachments: sourceAttachments,
+          clearComposerOnStart: false,
+        });
+      } catch (error) {
+        pushToast('error', error instanceof Error ? error.message : 'Failed to regenerate response');
+      } finally {
+        setRegeneratingAssistantId(null);
+      }
+    },
+    [
+      latestAssistantWithSourceUser,
+      latestUserMessage,
+      loadMessages,
+      pushToast,
+      selectedThreadId,
+      sendPreparedInput,
+      sending,
+      truncateThreadFromMessage,
+    ],
+  );
+
+  const saveEditedMessageAndRegenerate = useCallback(async () => {
+    if (!selectedThreadId || !editingMessageId || sending || editSavePending) {
+      return;
+    }
+
+    const normalizedDraftText = editDraftText.trim();
+    if (!normalizedDraftText && editDraftAttachments.length === 0) {
+      pushToast('error', 'Message cannot be empty');
+      return;
+    }
+
+    setEditSavePending(true);
+
+    try {
+      let targetUserMessage =
+        messages.find((message) => message.id === editingMessageId && message.role === 'user') ?? null;
+      if (!targetUserMessage || !isPersistedUuid(targetUserMessage.id)) {
+        const refreshedMessages = await loadMessages(selectedThreadId);
+        if (refreshedMessages === null) {
+          throw new Error('Failed to refresh messages before saving edit');
+        }
+
+        setMessages(refreshedMessages);
+        targetUserMessage = findLatestUserMessage(refreshedMessages);
+      }
+
+      if (!targetUserMessage || !isPersistedUuid(targetUserMessage.id)) {
+        throw new Error('Could not resolve the latest saved user message for editing');
+      }
+
+      await truncateThreadFromMessage(selectedThreadId, targetUserMessage.id);
+
+      const reloadedMessages = await loadMessages(selectedThreadId);
+      if (reloadedMessages === null) {
+        throw new Error('Failed to reload messages after truncate');
+      }
+      setMessages(reloadedMessages);
+
+      setEditingMessageId(null);
+      setEditDraftText('');
+      setEditDraftAttachments([]);
+
+      await sendPreparedInput({
+        threadId: selectedThreadId,
+        promptText: normalizedDraftText,
+        existingAttachments: editDraftAttachments,
+        clearComposerOnStart: true,
+      });
+    } catch (error) {
+      pushToast(
+        'error',
+        error instanceof Error ? error.message : 'Failed to save edit and regenerate',
+      );
+    } finally {
+      setEditSavePending(false);
+    }
+  }, [
+    editDraftAttachments,
+    editDraftText,
+    editingMessageId,
+    editSavePending,
+    loadMessages,
+    messages,
+    pushToast,
+    selectedThreadId,
+    sendPreparedInput,
+    sending,
+    truncateThreadFromMessage,
+  ]);
+
   const showHomeState = !selectedThreadId || (!messagesLoading && messages.length === 0);
+  const latestAssistantId = latestAssistantWithSourceUser?.assistant.id ?? null;
+  const canRegenerateLatestAssistant = Boolean(latestAssistantWithSourceUser?.sourceUser);
 
   const chatHeaderControls = (
     <div className="chat-header-controls">
@@ -1753,7 +2168,12 @@ export default function ChatPage() {
             <span className="chat-image-preview-meta">
               {images.length}/{maxComposerImages} selected
             </span>
-            <button className="ghost" type="button" onClick={clearImages} disabled={sending}>
+            <button
+              className="ghost"
+              type="button"
+              onClick={clearImages}
+              disabled={sending || editingActive}
+            >
               Clear images
             </button>
           </div>
@@ -1781,7 +2201,7 @@ export default function ChatPage() {
           type="file"
           accept="image/*"
           multiple
-          disabled={sending}
+          disabled={sending || editingActive}
           onChange={(event) => {
             appendImages(Array.from(event.target.files ?? []));
           }}
@@ -1791,12 +2211,14 @@ export default function ChatPage() {
           type="button"
           className="chat-attach-button"
           onClick={() => fileInputRef.current?.click()}
-          disabled={sending || images.length >= maxComposerImages}
+          disabled={sending || editingActive || images.length >= maxComposerImages}
           aria-label="Attach image"
           title={
             images.length >= maxComposerImages
               ? `Maximum ${maxComposerImages} images`
-              : 'Attach image'
+              : editingActive
+                ? 'Editing uses the original attachments'
+                : 'Attach image'
           }
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1811,7 +2233,13 @@ export default function ChatPage() {
           className="chat-composer-input"
           rows={1}
           value={input}
-          onChange={(event) => setInput(event.target.value)}
+          onChange={(event) => {
+            const nextValue = event.target.value;
+            setInput(nextValue);
+            if (editingActive) {
+              setEditDraftText(nextValue);
+            }
+          }}
           onPaste={handleComposerPaste}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -1821,12 +2249,12 @@ export default function ChatPage() {
               }
             }
           }}
-          placeholder="ask anything"
+          placeholder={editingActive ? 'edit your message' : 'ask anything'}
           disabled={sending}
         />
 
         <div className="chat-composer-action-group">
-          {sending ? (
+          {generationActive ? (
             <button
               className="chat-stop-button"
               type="button"
@@ -1856,12 +2284,39 @@ export default function ChatPage() {
         </div>
       </form>
 
-      {sending ? (
+      {generationActive ? (
         <div className="chat-composer-status">
           <span className="chat-streaming-indicator" role="status" aria-live="polite">
             <span className="chat-streaming-dot" />
             Generating response
           </span>
+        </div>
+      ) : null}
+
+      {editingActive ? (
+        <div className="chat-edit-region">
+          <p className="chat-edit-label">Editing last user message</p>
+          {editDraftAttachments.length > 0 ? (
+            <p className="chat-edit-note">Editing will resend with the same attachments.</p>
+          ) : null}
+          <div className="chat-edit-actions">
+            <button
+              type="button"
+              className="ghost"
+              onClick={cancelEditMode}
+              disabled={sending || editSavePending}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => void saveEditedMessageAndRegenerate()}
+              disabled={sending || editSavePending}
+            >
+              {editSavePending ? 'Saving...' : 'Save & regenerate'}
+            </button>
+          </div>
         </div>
       ) : null}
     </div>
@@ -1901,8 +2356,17 @@ export default function ChatPage() {
 
               {messages.map((message) => {
                 const isEntering = animatingMessageIdSet.has(message.id);
-                const isStreaming = sending && message.id === streamingAssistantId;
+                const isStreaming = generationActive && message.id === streamingAssistantId;
                 const rowStreamingContent = isStreaming && streamResponses ? streamingAssistantContent : null;
+                const showRegenerateAction =
+                  message.role === 'assistant' &&
+                  message.id === latestAssistantId &&
+                  canRegenerateLatestAssistant;
+                const showEditAction =
+                  message.role === 'user' &&
+                  Boolean(selectedThreadId) &&
+                  message.id === latestUserMessage?.id;
+                const regenerateBusy = regeneratingAssistantId === message.id;
 
                 return (
                   <ChatMessageRow
@@ -1912,6 +2376,18 @@ export default function ChatPage() {
                     isStreaming={isStreaming}
                     streamingContent={rowStreamingContent}
                     onCopyAssistantMessage={handleCopyAssistantMessage}
+                    showRegenerateAction={showRegenerateAction}
+                    regenerateDisabled={sending || regenerateBusy || editSavePending}
+                    regenerateBusy={regenerateBusy}
+                    onRegenerateAssistantMessage={regenerateLatestAssistant}
+                    showEditAction={showEditAction}
+                    editDisabled={
+                      sending ||
+                      editSavePending ||
+                      regeneratingAssistantId !== null ||
+                      editingActive
+                    }
+                    onEditUserMessage={startEditingUserMessage}
                   />
                 );
               })}

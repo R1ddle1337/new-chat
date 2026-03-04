@@ -548,6 +548,8 @@ function shortHash(value: string): string {
   return crypto.createHash('sha1').update(value).digest('hex').slice(0, 16);
 }
 
+const auditMetadataAllowedSensitiveKeys = new Set(['from_message_id']);
+
 function sanitizeAuditMetadata(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.slice(0, 20).map((item) => sanitizeAuditMetadata(item));
@@ -558,12 +560,13 @@ function sanitizeAuditMetadata(value: unknown): unknown {
     for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
       const lower = key.toLowerCase();
       if (
-        lower.includes('key') ||
-        lower.includes('prompt') ||
-        lower.includes('input') ||
-        lower.includes('message') ||
-        lower.includes('content') ||
-        lower.includes('authorization')
+        !auditMetadataAllowedSensitiveKeys.has(lower) &&
+        (lower.includes('key') ||
+          lower.includes('prompt') ||
+          lower.includes('input') ||
+          lower.includes('message') ||
+          lower.includes('content') ||
+          lower.includes('authorization'))
       ) {
         continue;
       }
@@ -4182,6 +4185,93 @@ async function setupServer(): Promise<void> {
           attachments,
         };
       }),
+    });
+  });
+
+  app.post('/me/threads/:threadId/truncate', { preHandler: [requireAuth] }, async (request, reply) => {
+    const user = request.authUser!;
+    const params = request.params as { threadId?: unknown };
+    const body = (request.body ?? {}) as { from_message_id?: unknown };
+
+    const threadId = typeof params.threadId === 'string' ? params.threadId : '';
+    if (!uuidPattern.test(threadId)) {
+      reply.code(400).send({ error: 'threadId must be a valid UUID' });
+      return;
+    }
+
+    const fromMessageId =
+      typeof body.from_message_id === 'string' ? body.from_message_id.trim() : '';
+    if (!uuidPattern.test(fromMessageId)) {
+      reply.code(400).send({ error: 'from_message_id must be a valid UUID' });
+      return;
+    }
+
+    const client = await pool.connect();
+    let deletedCount = 0;
+
+    try {
+      await client.query('BEGIN');
+
+      const targetResult = await client.query<{ id: string; created_at: string }>(
+        `SELECT id, created_at
+         FROM messages
+         WHERE id = $1
+           AND thread_id = $2
+           AND user_id = $3`,
+        [fromMessageId, threadId, user.id],
+      );
+
+      if (!targetResult.rowCount) {
+        await client.query('ROLLBACK');
+        reply.code(404).send({ error: 'Message not found' });
+        return;
+      }
+
+      const target = targetResult.rows[0]!;
+      const deleted = await client.query<{ id: string }>(
+        `DELETE FROM messages
+         WHERE thread_id = $1
+           AND user_id = $2
+           AND (
+             created_at > $3::timestamptz
+             OR (created_at = $3::timestamptz AND id >= $4::uuid)
+           )
+         RETURNING id`,
+        [threadId, user.id, target.created_at, target.id],
+      );
+
+      deletedCount = deleted.rowCount ?? 0;
+
+      await client.query(
+        `UPDATE threads
+         SET updated_at = now()
+         WHERE id = $1
+           AND user_id = $2`,
+        [threadId, user.id],
+      );
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    await writeAuditEvent({
+      eventType: 'threads.truncated',
+      request,
+      userId: user.id,
+      metadata: {
+        thread_id: threadId,
+        from_message_id: fromMessageId,
+        deleted_count: deletedCount,
+      },
+    });
+
+    reply.send({
+      ok: true,
+      deleted_count: deletedCount,
     });
   });
 
