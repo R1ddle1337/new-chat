@@ -36,7 +36,7 @@ export default function AdminAuditPage() {
     });
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as unknown;
-      throw new Error(parseError(body, 'Failed to load users'));
+      throw new Error(parseError(body, '加载用户失败'));
     }
 
     const payload = (await res.json()) as { data: AdminUserItem[] };
@@ -56,14 +56,14 @@ export default function AdminAuditPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, `Failed to load abuse events for user ${user.id}`));
+        setError(parseError(body, `加载用户 ${user.id} 的风控事件失败`));
         return;
       }
 
       const payload = body as { data?: AbuseEventItem[] };
       setSelectedUser(user);
       setEvents(Array.isArray(payload.data) ? payload.data : []);
-      setStatus(`Loaded abuse events for ${user.email}`);
+      setStatus(`已加载 ${user.email} 的风控事件`);
     } finally {
       setBusy(null);
     }
@@ -92,7 +92,7 @@ export default function AdminAuditPage() {
         if (!active) {
           return;
         }
-        setError(requestError instanceof Error ? requestError.message : 'Failed to load audit page');
+        setError(requestError instanceof Error ? requestError.message : '加载审计页面失败');
       }
     };
 
@@ -110,9 +110,9 @@ export default function AdminAuditPage() {
 
     try {
       await loadUsers(usersQuery);
-      setStatus('User list updated');
+      setStatus('用户列表已更新');
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Failed to search users');
+      setError(requestError instanceof Error ? requestError.message : '搜索用户失败');
     } finally {
       setBusy(null);
     }
@@ -121,7 +121,7 @@ export default function AdminAuditPage() {
   return (
     <>
       <div className="card">
-        <h2>Audit Events</h2>
+        <h2>审计事件</h2>
 
         <form
           className="admin-user-search"
@@ -131,15 +131,15 @@ export default function AdminAuditPage() {
           }}
         >
           <label>
-            Search users
+            搜索用户
             <input
               value={usersQuery}
               onChange={(event) => setUsersQuery(event.target.value)}
-              placeholder="Search by email"
+              placeholder="按邮箱搜索"
             />
           </label>
           <button type="submit" className="secondary" disabled={busy !== null}>
-            {busy === 'users-search' ? 'Searching...' : 'Search'}
+            {busy === 'users-search' ? '搜索中...' : '搜索'}
           </button>
           <button
             type="button"
@@ -152,17 +152,17 @@ export default function AdminAuditPage() {
               setBusy('users-search');
               void loadUsers('')
                 .then(() => {
-                  setStatus('User list updated');
+                  setStatus('用户列表已更新');
                 })
                 .catch((requestError: unknown) => {
-                  setError(requestError instanceof Error ? requestError.message : 'Failed to load users');
+                  setError(requestError instanceof Error ? requestError.message : '加载用户失败');
                 })
                 .finally(() => {
                   setBusy(null);
                 });
             }}
           >
-            Clear
+            清空
           </button>
         </form>
 
@@ -170,10 +170,10 @@ export default function AdminAuditPage() {
           <table className="admin-users-table">
             <thead>
               <tr>
-                <th>Email</th>
-                <th>Status</th>
-                <th>Last Seen</th>
-                <th>Action</th>
+                <th>邮箱</th>
+                <th>状态</th>
+                <th>最近活跃</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
@@ -184,7 +184,7 @@ export default function AdminAuditPage() {
                     <td>{user.email}</td>
                     <td>
                       <span className={`admin-status-pill ${user.status}`}>
-                        {user.status === 'active' ? 'active' : 'banned'}
+                        {user.status === 'active' ? '正常' : '封禁'}
                       </span>
                     </td>
                     <td>
@@ -198,7 +198,7 @@ export default function AdminAuditPage() {
                         disabled={busy !== null}
                         onClick={() => void viewAbuseEvents({ id: user.id, email: user.email })}
                       >
-                        {rowBusy ? 'Loading...' : 'View events'}
+                        {rowBusy ? '加载中...' : '查看事件'}
                       </button>
                     </td>
                   </tr>
@@ -207,7 +207,7 @@ export default function AdminAuditPage() {
               {users.length === 0 ? (
                 <tr>
                   <td colSpan={4} className="notice">
-                    No users found
+                    未找到用户
                   </td>
                 </tr>
               ) : null}
@@ -220,7 +220,7 @@ export default function AdminAuditPage() {
         <div className="card">
           <div className="admin-events-panel">
             <div className="card-title-row">
-              <strong>Recent Events for {selectedUser.email}</strong>
+              <strong>{selectedUser.email} 的最近事件</strong>
               <button
                 type="button"
                 className="ghost"
@@ -230,7 +230,7 @@ export default function AdminAuditPage() {
                   setEvents([]);
                 }}
               >
-                Close
+                关闭
               </button>
             </div>
             <div className="allowlist-preview admin-audit-events-list">
@@ -239,11 +239,11 @@ export default function AdminAuditPage() {
                   <div className="mono">
                     {event.event_type} @ {formatDateTime(event.created_at)}
                   </div>
-                  <div className="notice">IP: {event.ip ?? '-'}</div>
+                  <div className="notice">IP：{event.ip ?? '-'}</div>
                   <pre className="admin-event-metadata">{JSON.stringify(event.metadata ?? {}, null, 2)}</pre>
                 </div>
               ))}
-              {events.length === 0 ? <div className="notice">No events found</div> : null}
+              {events.length === 0 ? <div className="notice">未找到事件</div> : null}
             </div>
           </div>
         </div>

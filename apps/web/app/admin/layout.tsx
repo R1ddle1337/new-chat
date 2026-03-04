@@ -7,13 +7,13 @@ import MainHeader from '../components/main-header';
 import type { MePayload } from './_components/types';
 
 const adminNavItems: Array<{ href: string; label: string; exact?: boolean }> = [
-  { href: '/admin', label: 'Dashboard', exact: true },
-  { href: '/admin/users', label: 'Users' },
-  { href: '/admin/chat', label: 'Chat' },
-  { href: '/admin/providers', label: 'Providers' },
-  { href: '/admin/models', label: 'Models' },
-  { href: '/admin/rate-limits', label: 'Rate Limits' },
-  { href: '/admin/audit', label: 'Audit' },
+  { href: '/admin', label: '概览', exact: true },
+  { href: '/admin/users', label: '用户' },
+  { href: '/admin/chat', label: '聊天' },
+  { href: '/admin/providers', label: '提供商' },
+  { href: '/admin/models', label: '模型' },
+  { href: '/admin/rate-limits', label: '速率限制' },
+  { href: '/admin/audit', label: '审计' },
 ];
 
 function isNavItemActive(pathname: string, href: string, exact = false): boolean {
@@ -49,7 +49,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
           return;
         }
         setAuthorized(false);
-        setSessionError('Failed to load session');
+        setSessionError('加载会话失败');
         setLoading(false);
         return;
       }
@@ -78,20 +78,20 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
 
   const subtitle = useMemo(() => {
     const activeItem = adminNavItems.find((item) => isNavItemActive(pathname, item.href, item.exact));
-    return activeItem ? `${activeItem.label} controls` : 'Operations console';
+    return activeItem ? `${activeItem.label}页面` : '运营控制台';
   }, [pathname]);
 
   if (loading) {
-    return <section className="panel page-loading">Loading admin console...</section>;
+    return <section className="panel page-loading">正在加载管理后台...</section>;
   }
 
   if (!authorized) {
     return (
       <section className="admin-page app-page">
-        <MainHeader title="Admin" subtitle="Not Found" />
+        <MainHeader title="管理后台" subtitle="未找到" />
         <div className="page-stack">
           <div className="card">
-            <p className="error">404 Not Found.</p>
+            <p className="error">404 未找到。</p>
             {sessionError ? <p className="error">{sessionError}</p> : null}
           </div>
         </div>
@@ -101,10 +101,10 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
 
   return (
     <section className="admin-page app-page">
-      <MainHeader title="Admin" subtitle={subtitle} />
+      <MainHeader title="管理后台" subtitle={subtitle} />
 
       <div className="page-stack">
-        <nav className="admin-subnav" aria-label="Admin sections">
+        <nav className="admin-subnav" aria-label="管理分区">
           {adminNavItems.map((item) => {
             const active = isNavItemActive(pathname, item.href, item.exact);
             return (

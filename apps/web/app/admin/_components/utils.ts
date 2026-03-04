@@ -22,10 +22,10 @@ export function parseError(payload: unknown, fallback: string): string {
 
 export function formatDateTime(value: string | null): string {
   if (!value) {
-    return 'Never';
+    return '从未';
   }
 
-  return new Date(value).toLocaleString();
+  return new Date(value).toLocaleString('zh-CN');
 }
 
 export function normalizeProviderCode(value: string): string {
@@ -60,7 +60,7 @@ export function normalizeProviderBaseUrl(value: string): string | null {
 
 export function summarizeRuleHits(ruleHits: AbuseRuleHit[]): string {
   if (!Array.isArray(ruleHits) || ruleHits.length === 0) {
-    return 'No rule hits';
+    return '无命中规则';
   }
 
   return ruleHits

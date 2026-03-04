@@ -55,7 +55,7 @@ export default function AdminDashboardPage() {
     for (const res of responses) {
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as unknown;
-        throw new Error(parseError(body, 'Failed to load admin overview'));
+        throw new Error(parseError(body, '加载管理概览失败'));
       }
     }
 
@@ -95,7 +95,7 @@ export default function AdminDashboardPage() {
         if (!active) {
           return;
         }
-        setError(requestError instanceof Error ? requestError.message : 'Failed to load admin overview');
+        setError(requestError instanceof Error ? requestError.message : '加载管理概览失败');
       } finally {
         if (active) {
           setLoading(false);
@@ -114,7 +114,7 @@ export default function AdminDashboardPage() {
     <>
       <div className="card">
         <div className="card-title-row">
-          <h2>Overview</h2>
+          <h2>概览</h2>
           <button
             type="button"
             className="secondary"
@@ -125,7 +125,7 @@ export default function AdminDashboardPage() {
                   setError(
                     requestError instanceof Error
                       ? requestError.message
-                      : 'Failed to reload admin overview',
+                      : '重新加载管理概览失败',
                   );
                 })
                 .finally(() => {
@@ -134,63 +134,63 @@ export default function AdminDashboardPage() {
             }}
             disabled={loading}
           >
-            {loading ? 'Refreshing...' : 'Refresh'}
+            {loading ? '刷新中...' : '刷新'}
           </button>
         </div>
 
         <div className="admin-dashboard-grid">
           <div className="admin-kpi-card">
-            <div className="notice">Providers</div>
+            <div className="notice">提供商</div>
             <strong>{stats.providers}</strong>
-            <div className="notice">Enabled: {stats.enabledProviders}</div>
+            <div className="notice">已启用：{stats.enabledProviders}</div>
           </div>
 
           <div className="admin-kpi-card">
-            <div className="notice">Models</div>
+            <div className="notice">模型</div>
             <strong>{stats.models}</strong>
-            <div className="notice">Enabled: {stats.enabledModels}</div>
+            <div className="notice">已启用：{stats.enabledModels}</div>
           </div>
 
           <div className="admin-kpi-card">
-            <div className="notice">Users</div>
+            <div className="notice">用户</div>
             <strong>{stats.users}</strong>
-            <div className="notice">Suspicious: {stats.suspiciousUsers}</div>
+            <div className="notice">可疑：{stats.suspiciousUsers}</div>
           </div>
 
           <div className="admin-kpi-card">
-            <div className="notice">Global limits</div>
+            <div className="notice">全局限制</div>
             <strong className="mono">
               {stats.rpmLimit ?? '-'} RPM / {stats.tpmLimit ?? '-'} TPM
             </strong>
             <div className="notice">
               {stats.limitsUpdatedAt
-                ? `Updated ${new Date(stats.limitsUpdatedAt).toLocaleString()}`
-                : 'No update timestamp'}
+                ? `更新时间：${new Date(stats.limitsUpdatedAt).toLocaleString('zh-CN')}`
+                : '暂无更新时间'}
             </div>
           </div>
         </div>
       </div>
 
       <div className="card">
-        <h2>Shortcuts</h2>
+        <h2>快捷入口</h2>
         <div className="admin-shortcuts">
           <Link href="/admin/users" className="admin-shortcut-link">
-            Manage users, suspicious activity, and overrides
+            管理用户、可疑行为与限流覆盖
           </Link>
           <Link href="/admin/chat" className="admin-shortcut-link">
-            Inspect user chat threads, messages, and attachments
+            查看用户聊天会话、消息与附件
           </Link>
           <Link href="/admin/providers" className="admin-shortcut-link">
-            Create providers, edit config, and rotate API keys
+            创建提供商、编辑配置并轮换 API Key
           </Link>
           <Link href="/admin/models" className="admin-shortcut-link">
-            Import upstream models and publish catalog entries
+            导入上游模型并发布到模型目录
           </Link>
           <Link href="/admin/rate-limits" className="admin-shortcut-link">
-            Update global RPM/TPM defaults
+            更新全局 RPM/TPM 默认值
           </Link>
           <Link href="/admin/audit" className="admin-shortcut-link">
-            View recent abuse/audit events by user
+            按用户查看最近风控/审计事件
           </Link>
         </div>
       </div>

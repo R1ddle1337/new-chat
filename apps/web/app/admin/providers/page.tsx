@@ -32,7 +32,7 @@ export default function AdminProvidersPage() {
     const res = await fetch('/api/admin/providers', { credentials: 'include' });
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as unknown;
-      throw new Error(parseError(body, 'Failed to load providers'));
+      throw new Error(parseError(body, '加载提供商失败'));
     }
 
     const payload = (await res.json()) as { data: ProviderItem[] };
@@ -63,7 +63,7 @@ export default function AdminProvidersPage() {
         if (!active) {
           return;
         }
-        setError(requestError instanceof Error ? requestError.message : 'Failed to load providers');
+        setError(requestError instanceof Error ? requestError.message : '加载提供商失败');
       }
     };
 
@@ -77,7 +77,7 @@ export default function AdminProvidersPage() {
   const validateProviderDraft = (draft: ProviderDraft, providerId?: number) => {
     const code = normalizeProviderCode(draft.code);
     if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(code)) {
-      setError('Provider ID must be 1-64 chars: lowercase letters, numbers, "_" or "-"');
+      setError('Provider ID 必须为 1-64 位，仅支持小写字母、数字、"_" 或 "-"');
       return null;
     }
 
@@ -88,19 +88,19 @@ export default function AdminProvidersPage() {
       return provider.code.toLowerCase() === code;
     });
     if (duplicate) {
-      setError(`Provider ID "${code}" already exists`);
+      setError(`Provider ID "${code}" 已存在`);
       return null;
     }
 
     const name = draft.name.trim();
     if (!name || name.length > 120) {
-      setError('Display name must be non-empty and at most 120 characters');
+      setError('显示名称不能为空，且长度不能超过 120 个字符');
       return null;
     }
 
     const baseUrl = normalizeProviderBaseUrl(draft.base_url);
     if (!baseUrl) {
-      setError('Base URL must be a valid http(s) URL without query string or fragment');
+      setError('基础 URL 必须是合法的 http(s) URL，且不能包含查询参数或片段');
       return null;
     }
 
@@ -138,19 +138,19 @@ export default function AdminProvidersPage() {
 
       const body = (await res.json().catch(() => null)) as { data?: { id?: unknown } } | null;
       if (!res.ok) {
-        setError(parseError(body, 'Failed to create provider'));
+        setError(parseError(body, '创建提供商失败'));
         return;
       }
 
       const providerId =
         typeof body?.data?.id === 'number' && Number.isInteger(body.data.id) ? body.data.id : null;
-      let providerStatus = `Provider "${payload.code}" created`;
+      let providerStatus = `提供商 "${payload.code}" 已创建`;
       let providerError: string | null = null;
 
       if (apiKey) {
         if (!providerId) {
           providerError =
-            'Provider was created, but API key was not saved because the provider ID was missing from the create response';
+            '提供商已创建，但创建响应中缺少 provider ID，API Key 未保存';
         } else {
           const secretRes = await fetch(`/api/admin/providers/${providerId}/secret`, {
             method: 'POST',
@@ -161,9 +161,9 @@ export default function AdminProvidersPage() {
           const secretBody = (await secretRes.json().catch(() => null)) as unknown;
 
           if (!secretRes.ok) {
-            providerError = `Provider was created, but API key save failed: ${parseError(secretBody, 'Failed to update provider secret')}`;
+            providerError = `提供商已创建，但保存 API Key 失败：${parseError(secretBody, '更新提供商密钥失败')}`;
           } else {
-            providerStatus = `Provider "${payload.code}" created and API key saved`;
+            providerStatus = `提供商 "${payload.code}" 已创建并保存 API Key`;
           }
         }
       }
@@ -202,11 +202,11 @@ export default function AdminProvidersPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, 'Failed to update provider'));
+        setError(parseError(body, '更新提供商失败'));
         return;
       }
 
-      setStatus(`Provider "${payload.code}" updated`);
+      setStatus(`提供商 "${payload.code}" 已更新`);
       await loadProviders();
     } finally {
       setBusy(null);
@@ -228,11 +228,11 @@ export default function AdminProvidersPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, 'Failed to toggle provider'));
+        setError(parseError(body, '切换提供商状态失败'));
         return;
       }
 
-      setStatus(`Provider "${provider.code}" ${provider.enabled ? 'disabled' : 'enabled'}`);
+      setStatus(`提供商 "${provider.code}" 已${provider.enabled ? '禁用' : '启用'}`);
       await loadProviders();
     } finally {
       setBusy(null);
@@ -242,7 +242,7 @@ export default function AdminProvidersPage() {
   const saveProviderSecret = async (providerId: number) => {
     const apiKey = (providerSecretDrafts[providerId] ?? '').trim();
     if (!apiKey) {
-      setError('API key is required');
+      setError('必须填写 API Key');
       return;
     }
 
@@ -260,12 +260,12 @@ export default function AdminProvidersPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, 'Failed to update provider secret'));
+        setError(parseError(body, '更新提供商密钥失败'));
         return;
       }
 
       setProviderSecretDrafts((previous) => ({ ...previous, [providerId]: '' }));
-      setStatus('Provider API key saved');
+      setStatus('提供商 API Key 已保存');
       await loadProviders();
     } finally {
       setBusy(null);
@@ -275,7 +275,7 @@ export default function AdminProvidersPage() {
   return (
     <>
       <div className="card">
-        <h2>Providers</h2>
+        <h2>提供商</h2>
 
         <form
           onSubmit={(event) => {
@@ -284,11 +284,11 @@ export default function AdminProvidersPage() {
           }}
         >
           <div className="stack-tight">
-            <div className="notice">Create provider</div>
+            <div className="notice">创建提供商</div>
 
             <label>
-              Provider ID (code)
-              <div className="notice">Stable unique machine identifier.</div>
+              Provider ID（唯一标识）
+              <div className="notice">系统内稳定且唯一的机器标识。</div>
               <input
                 value={createProviderDraft.code}
                 disabled={createProviderBusy}
@@ -303,7 +303,7 @@ export default function AdminProvidersPage() {
             </label>
 
             <label>
-              Display name
+              显示名称
               <input
                 value={createProviderDraft.name}
                 disabled={createProviderBusy}
@@ -318,7 +318,7 @@ export default function AdminProvidersPage() {
             </label>
 
             <label>
-              Base URL
+              基础 URL
               <input
                 value={createProviderDraft.base_url}
                 disabled={createProviderBusy}
@@ -333,7 +333,7 @@ export default function AdminProvidersPage() {
             </label>
 
             <label>
-              API key (optional)
+              API Key（可选）
               <input
                 type="password"
                 value={createProviderDraft.api_key}
@@ -361,18 +361,18 @@ export default function AdminProvidersPage() {
                   }))
                 }
               />
-              Enabled
+              已启用
             </label>
 
             <button className="primary" type="submit" disabled={createProviderBusy}>
-              {createProviderBusy ? 'Creating...' : 'Create provider'}
+              {createProviderBusy ? '创建中...' : '创建提供商'}
             </button>
           </div>
         </form>
       </div>
 
       <div className="card">
-        <h2>Existing providers</h2>
+        <h2>现有提供商</h2>
 
         <div className="stack-tight">
           {providers.map((provider) => {
@@ -386,18 +386,18 @@ export default function AdminProvidersPage() {
             return (
               <div key={provider.id} className="admin-item">
                 <div className="mono admin-item-title">
-                  {provider.code} ({provider.enabled ? 'enabled' : 'disabled'})
+                  {provider.code}（{provider.enabled ? '已启用' : '已禁用'}）
                 </div>
                 <div className="notice">
-                  Secret configured: {provider.has_secret ? 'yes' : 'no'}
+                  密钥已配置：{provider.has_secret ? '是' : '否'}
                   {provider.secret_updated_at
-                    ? ` (updated ${new Date(provider.secret_updated_at).toLocaleString()})`
+                    ? `（更新于 ${new Date(provider.secret_updated_at).toLocaleString('zh-CN')}）`
                     : ''}
                 </div>
 
                 <label>
-                  Provider ID (code)
-                  <div className="notice">Stable unique machine identifier.</div>
+                  Provider ID（唯一标识）
+                  <div className="notice">系统内稳定且唯一的机器标识。</div>
                   <input
                     value={draft.code}
                     onChange={(event) =>
@@ -413,7 +413,7 @@ export default function AdminProvidersPage() {
                 </label>
 
                 <label>
-                  Display name
+                  显示名称
                   <input
                     value={draft.name}
                     onChange={(event) =>
@@ -429,7 +429,7 @@ export default function AdminProvidersPage() {
                 </label>
 
                 <label>
-                  Base URL
+                  基础 URL
                   <input
                     value={draft.base_url}
                     onChange={(event) =>
@@ -458,7 +458,7 @@ export default function AdminProvidersPage() {
                       }))
                     }
                   />
-                  Enabled
+                  已启用
                 </label>
 
                 <div className="button-row">
@@ -468,7 +468,7 @@ export default function AdminProvidersPage() {
                     onClick={() => void saveProvider(provider.id)}
                     disabled={busy !== null}
                   >
-                    {busy === `provider-${provider.id}` ? 'Saving...' : 'Save provider'}
+                    {busy === `provider-${provider.id}` ? '保存中...' : '保存提供商'}
                   </button>
 
                   <button
@@ -478,15 +478,15 @@ export default function AdminProvidersPage() {
                     disabled={busy !== null}
                   >
                     {busy === `provider-toggle-${provider.id}`
-                      ? 'Saving...'
+                      ? '保存中...'
                       : provider.enabled
-                        ? 'Disable'
-                        : 'Enable'}
+                        ? '禁用'
+                        : '启用'}
                   </button>
                 </div>
 
                 <label>
-                  API key
+                  API Key
                   <input
                     type="password"
                     value={secretDraft}
@@ -507,12 +507,12 @@ export default function AdminProvidersPage() {
                   onClick={() => void saveProviderSecret(provider.id)}
                   disabled={busy !== null || !secretDraft.trim()}
                 >
-                  {busy === `provider-secret-${provider.id}` ? 'Saving...' : 'Save API key'}
+                  {busy === `provider-secret-${provider.id}` ? '保存中...' : '保存 API Key'}
                 </button>
               </div>
             );
           })}
-          {providers.length === 0 ? <div className="notice">No providers found.</div> : null}
+          {providers.length === 0 ? <div className="notice">未找到提供商。</div> : null}
         </div>
       </div>
 

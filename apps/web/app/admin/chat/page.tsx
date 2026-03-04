@@ -44,7 +44,7 @@ export default function AdminChatPage() {
     });
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as unknown;
-      throw new Error(parseError(body, 'Failed to load users'));
+      throw new Error(parseError(body, '加载用户失败'));
     }
 
     const payload = (await res.json()) as { data: AdminUserItem[] };
@@ -59,7 +59,7 @@ export default function AdminChatPage() {
 
     const body = (await res.json().catch(() => null)) as unknown;
     if (!res.ok) {
-      throw new Error(parseError(body, `Failed to load threads for user ${userId}`));
+      throw new Error(parseError(body, `加载用户 ${userId} 的会话失败`));
     }
 
     const payload = body as { data?: AdminThreadItem[] };
@@ -87,7 +87,7 @@ export default function AdminChatPage() {
 
     const body = (await res.json().catch(() => null)) as unknown;
     if (!res.ok) {
-      throw new Error(parseError(body, `Failed to load messages for thread ${params.threadId}`));
+      throw new Error(parseError(body, `加载会话 ${params.threadId} 的消息失败`));
     }
 
     const payload = body as {
@@ -115,9 +115,9 @@ export default function AdminChatPage() {
 
     try {
       await loadUserThreads(user.id);
-      setStatus(`Loaded chat threads for ${user.email}`);
+      setStatus(`已加载 ${user.email} 的聊天会话`);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Failed to load user chats');
+      setError(requestError instanceof Error ? requestError.message : '加载用户聊天失败');
       setSelectedChatUser(null);
       setChatThreads([]);
     } finally {
@@ -135,9 +135,9 @@ export default function AdminChatPage() {
 
     try {
       await loadThreadMessages({ userId, threadId, append: false });
-      setStatus('Loaded thread messages');
+      setStatus('会话消息已加载');
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Failed to load thread messages');
+      setError(requestError instanceof Error ? requestError.message : '加载会话消息失败');
     } finally {
       setBusy(null);
     }
@@ -160,7 +160,7 @@ export default function AdminChatPage() {
         append: true,
       });
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Failed to load more messages');
+      setError(requestError instanceof Error ? requestError.message : '加载更多消息失败');
     } finally {
       setBusy(null);
     }
@@ -189,7 +189,7 @@ export default function AdminChatPage() {
         if (!active) {
           return;
         }
-        setError(requestError instanceof Error ? requestError.message : 'Failed to load chat viewer');
+        setError(requestError instanceof Error ? requestError.message : '加载聊天查看器失败');
       }
     };
 
@@ -207,9 +207,9 @@ export default function AdminChatPage() {
 
     try {
       await loadUsers(usersQuery);
-      setStatus('User list updated');
+      setStatus('用户列表已更新');
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Failed to search users');
+      setError(requestError instanceof Error ? requestError.message : '搜索用户失败');
     } finally {
       setBusy(null);
     }
@@ -218,7 +218,7 @@ export default function AdminChatPage() {
   return (
     <>
       <div className="card">
-        <h2>Chat Viewer</h2>
+        <h2>聊天查看器</h2>
 
         <form
           className="admin-user-search"
@@ -228,15 +228,15 @@ export default function AdminChatPage() {
           }}
         >
           <label>
-            Search users
+            搜索用户
             <input
               value={usersQuery}
               onChange={(event) => setUsersQuery(event.target.value)}
-              placeholder="Search by email"
+              placeholder="按邮箱搜索"
             />
           </label>
           <button type="submit" className="secondary" disabled={busy !== null}>
-            {busy === 'users-search' ? 'Searching...' : 'Search'}
+            {busy === 'users-search' ? '搜索中...' : '搜索'}
           </button>
           <button
             type="button"
@@ -249,17 +249,17 @@ export default function AdminChatPage() {
               setBusy('users-search');
               void loadUsers('')
                 .then(() => {
-                  setStatus('User list updated');
+                  setStatus('用户列表已更新');
                 })
                 .catch((requestError: unknown) => {
-                  setError(requestError instanceof Error ? requestError.message : 'Failed to load users');
+                  setError(requestError instanceof Error ? requestError.message : '加载用户失败');
                 })
                 .finally(() => {
                   setBusy(null);
                 });
             }}
           >
-            Clear
+            清空
           </button>
         </form>
 
@@ -267,10 +267,10 @@ export default function AdminChatPage() {
           <table className="admin-users-table">
             <thead>
               <tr>
-                <th>Email</th>
-                <th>Status</th>
-                <th>Last Seen</th>
-                <th>Action</th>
+                <th>邮箱</th>
+                <th>状态</th>
+                <th>最近活跃</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
@@ -281,10 +281,10 @@ export default function AdminChatPage() {
                     <td>{user.email}</td>
                     <td>
                       <span className={`admin-status-pill ${user.status}`}>
-                        {user.status === 'active' ? 'active' : 'banned'}
+                        {user.status === 'active' ? '正常' : '封禁'}
                       </span>
                       {user.deleted_at ? (
-                        <div className="notice">soft-deleted {formatDateTime(user.deleted_at)}</div>
+                        <div className="notice">软删除于 {formatDateTime(user.deleted_at)}</div>
                       ) : null}
                     </td>
                     <td>
@@ -298,7 +298,7 @@ export default function AdminChatPage() {
                         disabled={busy !== null}
                         onClick={() => void openUserChats({ id: user.id, email: user.email })}
                       >
-                        {rowBusy ? 'Loading...' : 'View chats'}
+                        {rowBusy ? '加载中...' : '查看聊天'}
                       </button>
                     </td>
                   </tr>
@@ -307,7 +307,7 @@ export default function AdminChatPage() {
               {users.length === 0 ? (
                 <tr>
                   <td colSpan={4} className="notice">
-                    No users found
+                    未找到用户
                   </td>
                 </tr>
               ) : null}
@@ -320,7 +320,7 @@ export default function AdminChatPage() {
         <div className="card">
           <div className="admin-chat-viewer">
             <div className="card-title-row">
-              <strong>Chat Records for {selectedChatUser.email}</strong>
+              <strong>{selectedChatUser.email} 的聊天记录</strong>
               <button
                 type="button"
                 className="ghost"
@@ -333,7 +333,7 @@ export default function AdminChatPage() {
                   setChatMessagesNextCursor(null);
                 }}
               >
-                Close
+                关闭
               </button>
             </div>
 
@@ -348,18 +348,18 @@ export default function AdminChatPage() {
                     onClick={() => void openThreadMessages(selectedChatUser.id, thread.id)}
                   >
                     <span>{thread.title}</span>
-                    <span className="notice">messages: {thread.msg_count}</span>
-                    <span className="notice">updated: {formatDateTime(thread.updated_at)}</span>
+                    <span className="notice">消息数：{thread.msg_count}</span>
+                    <span className="notice">更新于：{formatDateTime(thread.updated_at)}</span>
                   </button>
                 ))}
                 {chatThreads.length === 0 ? (
-                  <div className="notice admin-chat-empty">No threads found for this user.</div>
+                  <div className="notice admin-chat-empty">该用户暂无聊天会话。</div>
                 ) : null}
               </div>
 
               <div className="admin-chat-messages">
                 {!selectedChatThreadId ? (
-                  <div className="notice admin-chat-empty">Select a thread to view messages.</div>
+                  <div className="notice admin-chat-empty">请选择会话以查看消息。</div>
                 ) : (
                   <>
                     <div className="admin-chat-message-list">
@@ -388,7 +388,7 @@ export default function AdminChatPage() {
                         </div>
                       ))}
                       {chatMessages.length === 0 ? (
-                        <div className="notice admin-chat-empty">No messages found for this thread.</div>
+                        <div className="notice admin-chat-empty">该会话暂无消息。</div>
                       ) : null}
                     </div>
 
@@ -399,7 +399,7 @@ export default function AdminChatPage() {
                         disabled={busy !== null}
                         onClick={() => void loadMoreThreadMessages()}
                       >
-                        {busy === `chat-messages-more-${selectedChatThreadId}` ? 'Loading...' : 'Load more'}
+                        {busy === `chat-messages-more-${selectedChatThreadId}` ? '加载中...' : '加载更多'}
                       </button>
                     ) : null}
                   </>

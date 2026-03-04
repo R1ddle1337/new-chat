@@ -16,7 +16,7 @@ export default function AdminRateLimitsPage() {
     const res = await fetch('/api/admin/rate-limits', { credentials: 'include' });
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as unknown;
-      throw new Error(parseError(body, 'Failed to load rate limits'));
+      throw new Error(parseError(body, '加载速率限制失败'));
     }
 
     const payload = (await res.json()) as { data: RateLimitsPayload };
@@ -35,7 +35,7 @@ export default function AdminRateLimitsPage() {
         if (!active) {
           return;
         }
-        setError(requestError instanceof Error ? requestError.message : 'Failed to load rate limits');
+        setError(requestError instanceof Error ? requestError.message : '加载速率限制失败');
       }
     };
 
@@ -51,7 +51,7 @@ export default function AdminRateLimitsPage() {
     const tpm = Number(tpmLimit);
 
     if (!Number.isInteger(rpm) || rpm <= 0 || !Number.isInteger(tpm) || tpm <= 0) {
-      setError('RPM and TPM must both be positive integers');
+      setError('RPM 和 TPM 都必须是正整数');
       return;
     }
 
@@ -72,13 +72,13 @@ export default function AdminRateLimitsPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, 'Failed to update rate limits'));
+        setError(parseError(body, '更新速率限制失败'));
         return;
       }
 
       const payload = body as { data?: RateLimitsPayload };
       setRateLimitsUpdatedAt(payload.data?.updated_at ?? null);
-      setStatus('Rate limits updated');
+      setStatus('速率限制已更新');
     } finally {
       setBusy(false);
     }
@@ -87,7 +87,7 @@ export default function AdminRateLimitsPage() {
   return (
     <>
       <div className="card">
-        <h2>Rate Limits</h2>
+        <h2>速率限制</h2>
 
         <form
           onSubmit={(event) => {
@@ -96,7 +96,7 @@ export default function AdminRateLimitsPage() {
           }}
         >
           <label>
-            Requests per minute (RPM) per user
+            每位用户每分钟请求数（RPM）
             <input
               type="number"
               min={1}
@@ -107,7 +107,7 @@ export default function AdminRateLimitsPage() {
           </label>
 
           <label>
-            Tokens per minute (TPM) per user
+            每位用户每分钟 Token 数（TPM）
             <input
               type="number"
               min={1}
@@ -118,12 +118,14 @@ export default function AdminRateLimitsPage() {
           </label>
 
           <button className="primary" type="submit" disabled={busy}>
-            {busy ? 'Saving...' : 'Save rate limits'}
+            {busy ? '保存中...' : '保存速率限制'}
           </button>
         </form>
 
         {rateLimitsUpdatedAt ? (
-          <div className="notice">Last updated: {new Date(rateLimitsUpdatedAt).toLocaleString()}</div>
+          <div className="notice">
+            最后更新：{new Date(rateLimitsUpdatedAt).toLocaleString('zh-CN')}
+          </div>
         ) : null}
       </div>
 

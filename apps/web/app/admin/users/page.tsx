@@ -38,7 +38,7 @@ export default function AdminUsersPage() {
     });
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as unknown;
-      throw new Error(parseError(body, 'Failed to load users'));
+      throw new Error(parseError(body, '加载用户失败'));
     }
 
     const payload = (await res.json()) as { data: AdminUserItem[] };
@@ -71,7 +71,7 @@ export default function AdminUsersPage() {
     );
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as unknown;
-      throw new Error(parseError(body, 'Failed to load suspicious users'));
+      throw new Error(parseError(body, '加载可疑用户失败'));
     }
 
     const payload = (await res.json()) as { data: SuspiciousUserItem[] };
@@ -101,7 +101,7 @@ export default function AdminUsersPage() {
         if (!active) {
           return;
         }
-        setError(requestError instanceof Error ? requestError.message : 'Failed to load users page');
+        setError(requestError instanceof Error ? requestError.message : '加载用户页面失败');
       }
     };
 
@@ -119,9 +119,9 @@ export default function AdminUsersPage() {
 
     try {
       await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
-      setStatus('User list updated');
+      setStatus('用户列表已更新');
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Failed to search users');
+      setError(requestError instanceof Error ? requestError.message : '搜索用户失败');
     } finally {
       setBusy(null);
     }
@@ -142,11 +142,11 @@ export default function AdminUsersPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, `Failed to update user ${userId}`));
+        setError(parseError(body, `更新用户 ${userId} 失败`));
         return;
       }
 
-      setStatus(userStatus === 'banned' ? 'User banned' : 'User reactivated');
+      setStatus(userStatus === 'banned' ? '用户已封禁' : '用户已解封');
       await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
     } finally {
       setBusy(null);
@@ -169,7 +169,7 @@ export default function AdminUsersPage() {
       (rpm !== null && (!Number.isInteger(rpm) || rpm <= 0)) ||
       (tpm !== null && (!Number.isInteger(tpm) || tpm <= 0))
     ) {
-      setError('User override limits must be positive integers or blank');
+      setError('用户覆盖限制必须为正整数或留空');
       return;
     }
 
@@ -190,11 +190,11 @@ export default function AdminUsersPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, `Failed to update limits for user ${userId}`));
+        setError(parseError(body, `更新用户 ${userId} 的限制失败`));
         return;
       }
 
-      setStatus('User limits updated');
+      setStatus('用户限制已更新');
       await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
     } finally {
       setBusy(null);
@@ -219,11 +219,11 @@ export default function AdminUsersPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, `Failed to clear limits for user ${userId}`));
+        setError(parseError(body, `清除用户 ${userId} 的限制失败`));
         return;
       }
 
-      setStatus('User limit overrides cleared');
+      setStatus('用户限制覆盖已清除');
       await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
     } finally {
       setBusy(null);
@@ -248,7 +248,7 @@ export default function AdminUsersPage() {
       !Number.isInteger(durationMinutes) ||
       durationMinutes <= 0
     ) {
-      setError('Throttle override requires positive RPM, TPM, and duration minutes');
+      setError('限流覆盖要求 RPM、TPM 和持续时间（分钟）均为正整数');
       return;
     }
 
@@ -270,11 +270,11 @@ export default function AdminUsersPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, `Failed to set throttle override for user ${userId}`));
+        setError(parseError(body, `为用户 ${userId} 设置限流覆盖失败`));
         return;
       }
 
-      setStatus('Throttle override set');
+      setStatus('限流覆盖已设置');
       await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
     } finally {
       setBusy(null);
@@ -294,11 +294,11 @@ export default function AdminUsersPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, `Failed to clear throttle override for user ${userId}`));
+        setError(parseError(body, `清除用户 ${userId} 的限流覆盖失败`));
         return;
       }
 
-      setStatus('Throttle override cleared');
+      setStatus('限流覆盖已清除');
       await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
     } finally {
       setBusy(null);
@@ -307,7 +307,7 @@ export default function AdminUsersPage() {
 
   const deleteUser = async (user: AdminUserItem) => {
     const confirmation = window.prompt(
-      `Type "${user.email}" or "${user.id}" to confirm deleting this account`,
+      `请输入 "${user.email}" 或 "${user.id}" 以确认删除该账号`,
       '',
     );
     if (confirmation === null) {
@@ -316,7 +316,7 @@ export default function AdminUsersPage() {
 
     const typed = confirmation.trim().toLowerCase();
     if (typed !== user.email.toLowerCase() && typed !== user.id.toLowerCase()) {
-      setError('Confirmation mismatch. Deletion canceled.');
+      setError('确认信息不匹配，已取消删除。');
       return;
     }
 
@@ -332,7 +332,7 @@ export default function AdminUsersPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, `Failed to delete user ${user.id}`));
+        setError(parseError(body, `删除用户 ${user.id} 失败`));
         return;
       }
 
@@ -340,7 +340,7 @@ export default function AdminUsersPage() {
       const revokedSessionCount =
         typeof payload.data?.revoked_session_count === 'number' ? payload.data.revoked_session_count : 0;
 
-      setStatus(`User soft-deleted. Revoked ${revokedSessionCount} active sessions.`);
+      setStatus(`用户已软删除。已撤销 ${revokedSessionCount} 个活跃会话。`);
       await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
     } finally {
       setBusy(null);
@@ -360,11 +360,11 @@ export default function AdminUsersPage() {
 
       const body = (await res.json().catch(() => null)) as unknown;
       if (!res.ok) {
-        setError(parseError(body, `Failed to restore user ${user.id}`));
+        setError(parseError(body, `恢复用户 ${user.id} 失败`));
         return;
       }
 
-      setStatus('User restored');
+      setStatus('用户已恢复');
       await Promise.all([loadUsers(usersQuery), loadSuspiciousUsers(usersQuery)]);
     } finally {
       setBusy(null);
@@ -374,7 +374,7 @@ export default function AdminUsersPage() {
   return (
     <>
       <div className="card">
-        <h2>Users</h2>
+        <h2>用户</h2>
 
         <form
           className="admin-user-search"
@@ -384,15 +384,15 @@ export default function AdminUsersPage() {
           }}
         >
           <label>
-            Search users
+            搜索用户
             <input
               value={usersQuery}
               onChange={(event) => setUsersQuery(event.target.value)}
-              placeholder="Search by email"
+              placeholder="按邮箱搜索"
             />
           </label>
           <button type="submit" className="secondary" disabled={busy !== null}>
-            {busy === 'users-search' ? 'Searching...' : 'Search'}
+            {busy === 'users-search' ? '搜索中...' : '搜索'}
           </button>
           <button
             type="button"
@@ -405,17 +405,17 @@ export default function AdminUsersPage() {
               setBusy('users-search');
               void Promise.all([loadUsers(''), loadSuspiciousUsers('')])
                 .then(() => {
-                  setStatus('User list updated');
+                  setStatus('用户列表已更新');
                 })
                 .catch((requestError: unknown) => {
-                  setError(requestError instanceof Error ? requestError.message : 'Failed to load users');
+                  setError(requestError instanceof Error ? requestError.message : '加载用户失败');
                 })
                 .finally(() => {
                   setBusy(null);
                 });
             }}
           >
-            Clear
+            清空
           </button>
         </form>
 
@@ -423,14 +423,14 @@ export default function AdminUsersPage() {
           <table className="admin-users-table">
             <thead>
               <tr>
-                <th>Email</th>
-                <th>Status</th>
-                <th>Created</th>
-                <th>Last Login</th>
-                <th>Last Login IP</th>
+                <th>邮箱</th>
+                <th>状态</th>
+                <th>创建时间</th>
+                <th>最近登录</th>
+                <th>最近登录 IP</th>
                 <th>RPM</th>
                 <th>TPM</th>
-                <th>Actions</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
@@ -447,14 +447,14 @@ export default function AdminUsersPage() {
                     <td>{user.email}</td>
                     <td>
                       <span className={`admin-status-pill ${user.status}`}>
-                        {user.status === 'active' ? 'active' : 'banned'}
+                        {user.status === 'active' ? '正常' : '封禁'}
                       </span>
                       {user.ban_expires_at ? (
-                        <div className="notice">until {formatDateTime(user.ban_expires_at)}</div>
+                        <div className="notice">截至 {formatDateTime(user.ban_expires_at)}</div>
                       ) : null}
                       {user.deleted_at ? (
                         <div className="notice">
-                          soft-deleted {formatDateTime(user.deleted_at)} ({user.deleted_reason ?? 'admin_delete'})
+                          软删除于 {formatDateTime(user.deleted_at)}（{user.deleted_reason ?? 'admin_delete'}）
                         </div>
                       ) : null}
                     </td>
@@ -464,13 +464,13 @@ export default function AdminUsersPage() {
                     <td className="mono">
                       {user.rpm_effective}
                       <div className="notice">
-                        {user.rpm_override === null ? 'default' : `override ${user.rpm_override}`}
+                        {user.rpm_override === null ? '默认' : `覆盖 ${user.rpm_override}`}
                       </div>
                     </td>
                     <td className="mono">
                       {user.tpm_effective}
                       <div className="notice">
-                        {user.tpm_override === null ? 'default' : `override ${user.tpm_override}`}
+                        {user.tpm_override === null ? '默认' : `覆盖 ${user.tpm_override}`}
                       </div>
                     </td>
                     <td>
@@ -485,10 +485,10 @@ export default function AdminUsersPage() {
                             }
                           >
                             {rowBusy && busy === `user-status-${user.id}`
-                              ? 'Saving...'
+                              ? '保存中...'
                               : user.status === 'banned'
-                                ? 'Unban'
-                                : 'Ban'}
+                                ? '解封'
+                                : '封禁'}
                           </button>
                           <button
                             type="button"
@@ -496,7 +496,7 @@ export default function AdminUsersPage() {
                             disabled={busy !== null || user.deleted_at !== null}
                             onClick={() => void deleteUser(user)}
                           >
-                            {rowBusy && busy === `user-delete-${user.id}` ? 'Deleting...' : 'Delete'}
+                            {rowBusy && busy === `user-delete-${user.id}` ? '删除中...' : '删除'}
                           </button>
                           <button
                             type="button"
@@ -504,7 +504,7 @@ export default function AdminUsersPage() {
                             disabled={busy !== null || user.deleted_at === null}
                             onClick={() => void restoreUser(user)}
                           >
-                            {rowBusy && busy === `user-restore-${user.id}` ? 'Restoring...' : 'Restore'}
+                            {rowBusy && busy === `user-restore-${user.id}` ? '恢复中...' : '恢复'}
                           </button>
                           <button
                             type="button"
@@ -516,7 +516,7 @@ export default function AdminUsersPage() {
                               )
                             }
                           >
-                            View chats
+                            查看聊天
                           </button>
                         </div>
 
@@ -525,7 +525,7 @@ export default function AdminUsersPage() {
                             type="number"
                             min={1}
                             step={1}
-                            placeholder="RPM override"
+                            placeholder="RPM 覆盖值"
                             value={draft.rpm_limit}
                             onChange={(event) =>
                               setUserLimitDrafts((previous) => ({
@@ -541,7 +541,7 @@ export default function AdminUsersPage() {
                             type="number"
                             min={1}
                             step={1}
-                            placeholder="TPM override"
+                            placeholder="TPM 覆盖值"
                             value={draft.tpm_limit}
                             onChange={(event) =>
                               setUserLimitDrafts((previous) => ({
@@ -562,7 +562,7 @@ export default function AdminUsersPage() {
                             disabled={busy !== null}
                             onClick={() => void saveUserLimits(user.id)}
                           >
-                            {rowBusy && busy === `user-limits-${user.id}` ? 'Saving...' : 'Save'}
+                            {rowBusy && busy === `user-limits-${user.id}` ? '保存中...' : '保存'}
                           </button>
                           <button
                             type="button"
@@ -570,7 +570,7 @@ export default function AdminUsersPage() {
                             disabled={busy !== null}
                             onClick={() => void clearUserLimits(user.id)}
                           >
-                            Clear override
+                            清除覆盖
                           </button>
                         </div>
                       </div>
@@ -581,7 +581,7 @@ export default function AdminUsersPage() {
               {users.length === 0 ? (
                 <tr>
                   <td colSpan={8} className="notice">
-                    No users found
+                    未找到用户
                   </td>
                 </tr>
               ) : null}
@@ -591,22 +591,21 @@ export default function AdminUsersPage() {
       </div>
 
       <div className="card">
-        <h2>Suspicious Users</h2>
+        <h2>可疑用户</h2>
         <div className="notice">
-          Suspicious users are scored by rule hits (RPM/TPM spikes, login brute force, stream abuse, IP/UA
-          churn, and high error rates).
+          可疑用户根据规则命中评分（RPM/TPM 激增、登录暴力尝试、流式接口滥用、IP/UA 频繁变化以及高错误率）。
         </div>
 
         <div className="admin-users-table-wrap">
           <table className="admin-users-table admin-abuse-table">
             <thead>
               <tr>
-                <th>User</th>
-                <th>Score</th>
-                <th>Rules</th>
-                <th>Last Seen</th>
-                <th>Action</th>
-                <th>Controls</th>
+                <th>用户</th>
+                <th>评分</th>
+                <th>规则</th>
+                <th>最近活跃</th>
+                <th>动作</th>
+                <th>控制</th>
               </tr>
             </thead>
             <tbody>
@@ -625,9 +624,9 @@ export default function AdminUsersPage() {
                       <div>{user.email}</div>
                       <div className="notice">
                         <span className={`admin-status-pill ${user.status}`}>
-                          {user.status === 'active' ? 'active' : 'banned'}
+                          {user.status === 'active' ? '正常' : '封禁'}
                         </span>
-                        {user.ban_expires_at ? ` until ${formatDateTime(user.ban_expires_at)}` : ''}
+                        {user.ban_expires_at ? ` 截至 ${formatDateTime(user.ban_expires_at)}` : ''}
                       </div>
                     </td>
                     <td className="mono">{user.anomaly_score}</td>
@@ -648,12 +647,12 @@ export default function AdminUsersPage() {
                       <div className="notice">{formatDateTime(user.last_seen_at)}</div>
                     </td>
                     <td>
-                      <div>{user.last_action ?? 'none'}</div>
+                      <div>{user.last_action ?? '无'}</div>
                       <div className="notice">{formatDateTime(user.last_action_at)}</div>
                       <div className="notice">
                         {user.throttle_source === 'none'
-                          ? 'throttle: none'
-                          : `throttle ${user.throttle_source} until ${formatDateTime(user.throttle_expires_at)}`}
+                          ? '限流：无'
+                          : `限流 ${user.throttle_source}，截至 ${formatDateTime(user.throttle_expires_at)}`}
                       </div>
                     </td>
                     <td>
@@ -664,7 +663,7 @@ export default function AdminUsersPage() {
                           disabled={busy !== null || user.status !== 'banned'}
                           onClick={() => void saveUserStatus(user.id, 'active')}
                         >
-                          {rowBusy && busy === `user-status-${user.id}` ? 'Saving...' : 'Unban'}
+                          {rowBusy && busy === `user-status-${user.id}` ? '保存中...' : '解封'}
                         </button>
 
                         <div className="admin-throttle-inputs">
@@ -672,7 +671,7 @@ export default function AdminUsersPage() {
                             type="number"
                             min={1}
                             step={1}
-                            placeholder="Throttle RPM"
+                            placeholder="限流 RPM"
                             value={draft.rpm_limit}
                             onChange={(event) =>
                               setThrottleOverrideDrafts((previous) => ({
@@ -692,7 +691,7 @@ export default function AdminUsersPage() {
                             type="number"
                             min={1}
                             step={1}
-                            placeholder="Throttle TPM"
+                            placeholder="限流 TPM"
                             value={draft.tpm_limit}
                             onChange={(event) =>
                               setThrottleOverrideDrafts((previous) => ({
@@ -712,7 +711,7 @@ export default function AdminUsersPage() {
                             type="number"
                             min={1}
                             step={1}
-                            placeholder="Duration (min)"
+                            placeholder="时长（分钟）"
                             value={draft.duration_minutes}
                             onChange={(event) =>
                               setThrottleOverrideDrafts((previous) => ({
@@ -737,7 +736,7 @@ export default function AdminUsersPage() {
                             disabled={busy !== null}
                             onClick={() => void setThrottleOverride(user.id)}
                           >
-                            {rowBusy && busy === `throttle-override-${user.id}` ? 'Saving...' : 'Set throttle'}
+                            {rowBusy && busy === `throttle-override-${user.id}` ? '保存中...' : '设置限流'}
                           </button>
                           <button
                             type="button"
@@ -745,7 +744,7 @@ export default function AdminUsersPage() {
                             disabled={busy !== null}
                             onClick={() => void clearThrottleOverride(user.id)}
                           >
-                            Clear throttle
+                            清除限流
                           </button>
                           <button
                             type="button"
@@ -757,7 +756,7 @@ export default function AdminUsersPage() {
                               )
                             }
                           >
-                            View events
+                            查看事件
                           </button>
                         </div>
                       </div>
@@ -768,7 +767,7 @@ export default function AdminUsersPage() {
               {suspiciousUsers.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="notice">
-                    No suspicious users right now
+                    当前无可疑用户
                   </td>
                 </tr>
               ) : null}
