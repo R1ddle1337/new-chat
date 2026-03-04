@@ -2,12 +2,15 @@ export type MePayload = {
   is_admin: boolean;
 };
 
+export type ProviderApiType = 'openai_chat' | 'openai_responses' | 'anthropic_messages';
+
 export type ProviderItem = {
   id: number;
   code: string;
   name: string;
   base_url: string;
   enabled: boolean;
+  api_type: ProviderApiType;
   has_secret: boolean;
   secret_updated_at: string | null;
 };
@@ -41,6 +44,7 @@ export type ProviderDraft = {
   name: string;
   base_url: string;
   enabled: boolean;
+  api_type: ProviderApiType;
 };
 
 export type CreateProviderDraft = ProviderDraft & {

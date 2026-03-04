@@ -19,12 +19,15 @@ type DbUser = {
   ban_expires_at: string | null;
 };
 
+type ProviderApiType = 'openai_chat' | 'openai_responses' | 'anthropic_messages';
+
 type ProviderRow = {
   id: number;
   code: string;
   name: string;
   base_url: string;
   enabled: boolean;
+  api_type: ProviderApiType;
 };
 
 type ProviderSecretRow = {
@@ -61,6 +64,7 @@ type ModelCatalogRow = {
   provider_id: number;
   provider_code: string;
   provider_base_url: string;
+  provider_api_type: ProviderApiType;
   model_id: string;
   public_id: string;
   display_name: string;
@@ -262,6 +266,11 @@ const oauthRegistry = createOAuthRegistry({
 });
 
 const stateChangingMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const providerApiTypes = ['openai_chat', 'openai_responses', 'anthropic_messages'] as const;
+const providerApiTypeSet = new Set<ProviderApiType>(providerApiTypes);
+const DEFAULT_PROVIDER_API_TYPE: ProviderApiType = 'openai_chat';
+const ANTHROPIC_VERSION = '2023-06-01';
+const ANTHROPIC_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_RAW_CONTENT_JSON_BYTES = 200 * 1024;
 const RATE_LIMIT_WINDOW_SECONDS = 60;
 const TPM_WINDOW_MS = RATE_LIMIT_WINDOW_SECONDS * 1000;
@@ -378,6 +387,19 @@ function normalizeProviderBaseUrl(raw: string): string | null {
   const cleanedPath = parsed.pathname.replace(/\/+$/, '');
   const pathname = cleanedPath ? cleanedPath : '';
   return `${parsed.origin}${pathname}`;
+}
+
+function normalizeProviderApiType(value: unknown): ProviderApiType | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const candidate = value.trim().toLowerCase();
+  if (!providerApiTypeSet.has(candidate as ProviderApiType)) {
+    return null;
+  }
+
+  return candidate as ProviderApiType;
 }
 
 function isUniqueViolation(error: unknown): boolean {
@@ -1924,7 +1946,7 @@ async function upsertUserIdentity(params: {
 
 async function getProviderByCode(code: string): Promise<ProviderRow | null> {
   const result = await pool.query<ProviderRow>(
-    'SELECT id, code, name, base_url, enabled FROM providers WHERE code = $1',
+    'SELECT id, code, name, base_url, enabled, api_type FROM providers WHERE code = $1',
     [code],
   );
   return result.rowCount ? result.rows[0]! : null;
@@ -1932,7 +1954,7 @@ async function getProviderByCode(code: string): Promise<ProviderRow | null> {
 
 async function getProviderById(providerId: number): Promise<ProviderRow | null> {
   const result = await pool.query<ProviderRow>(
-    'SELECT id, code, name, base_url, enabled FROM providers WHERE id = $1',
+    'SELECT id, code, name, base_url, enabled, api_type FROM providers WHERE id = $1',
     [providerId],
   );
   return result.rowCount ? result.rows[0]! : null;
@@ -1940,7 +1962,7 @@ async function getProviderById(providerId: number): Promise<ProviderRow | null> 
 
 async function getAllProviders(): Promise<ProviderRow[]> {
   const result = await pool.query<ProviderRow>(
-    'SELECT id, code, name, base_url, enabled FROM providers ORDER BY id ASC',
+    'SELECT id, code, name, base_url, enabled, api_type FROM providers ORDER BY id ASC',
   );
   return result.rows;
 }
@@ -1968,6 +1990,7 @@ async function listCatalogModels(params?: { includeDisabled?: boolean }): Promis
             m.provider_id,
             p.code AS provider_code,
             p.base_url AS provider_base_url,
+            p.api_type AS provider_api_type,
             m.model_id,
             m.public_id,
             m.display_name,
@@ -1997,6 +2020,7 @@ async function findCatalogModelByPublicId(
             m.provider_id,
             p.code AS provider_code,
             p.base_url AS provider_base_url,
+            p.api_type AS provider_api_type,
             m.model_id,
             m.public_id,
             m.display_name,
@@ -2401,6 +2425,502 @@ async function hydrateChatMessages(messages: unknown, userId: string): Promise<u
   return hydrated;
 }
 
+type ChatCompletionsRole = 'user' | 'assistant' | 'system';
+type ChatCompletionsContentPart = {
+  type: 'text';
+  text: string;
+} | {
+  type: 'image_url';
+  image_url: {
+    url: string;
+  };
+};
+
+type ChatCompletionsMessage = {
+  role: ChatCompletionsRole;
+  content: string | ChatCompletionsContentPart[];
+};
+
+type AnthropicMessageRole = 'user' | 'assistant';
+type AnthropicContentBlock = {
+  type: 'text';
+  text: string;
+} | {
+  type: 'image';
+  source: {
+    type: 'base64';
+    media_type: string;
+    data: string;
+  };
+};
+
+type AnthropicMessage = {
+  role: AnthropicMessageRole;
+  content: AnthropicContentBlock[];
+};
+
+type SseEventBlock = {
+  event: string | null;
+  data: string;
+};
+
+class RequestConversionError extends Error {
+  readonly statusCode: number;
+
+  constructor(message: string, statusCode = 400) {
+    super(message);
+    this.name = 'RequestConversionError';
+    this.statusCode = statusCode;
+  }
+}
+
+function isRequestConversionError(error: unknown): error is RequestConversionError {
+  return error instanceof RequestConversionError;
+}
+
+function normalizeInputMessageRole(value: unknown): ChatCompletionsRole | null {
+  if (value === 'user' || value === 'assistant' || value === 'system') {
+    return value;
+  }
+  return null;
+}
+
+function extractTextFromInputContentPart(part: Record<string, unknown>): string | null {
+  if (typeof part.text !== 'string') {
+    return null;
+  }
+
+  const type = typeof part.type === 'string' ? part.type : '';
+  if (type === 'input_text' || type === 'output_text' || type === 'text' || !type) {
+    return part.text;
+  }
+
+  return null;
+}
+
+function resolveImageUrlFromContentPart(part: Record<string, unknown>): string | null {
+  const type = typeof part.type === 'string' ? part.type : '';
+  if (type !== 'input_image' && type !== 'image_url') {
+    return null;
+  }
+
+  if (typeof part.image_url === 'string') {
+    return part.image_url;
+  }
+
+  if (part.image_url && typeof part.image_url === 'object') {
+    const nested = part.image_url as Record<string, unknown>;
+    if (typeof nested.url === 'string') {
+      return nested.url;
+    }
+  }
+
+  return null;
+}
+
+function normalizeResponsesInputItems(input: unknown): unknown[] {
+  if (Array.isArray(input)) {
+    return input;
+  }
+
+  if (typeof input === 'string') {
+    return [
+      {
+        role: 'user',
+        content: input,
+      },
+    ];
+  }
+
+  if (typeof input === 'undefined' || input === null) {
+    return [];
+  }
+
+  return [input];
+}
+
+function convertResponsesContentToChatContent(
+  content: unknown,
+  role: ChatCompletionsRole,
+): string | ChatCompletionsContentPart[] | null {
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  const textChunks: string[] = [];
+  const richParts: ChatCompletionsContentPart[] = [];
+  const allowImages = role === 'user';
+  let hasImageParts = false;
+
+  for (const part of content) {
+    if (!part || typeof part !== 'object') {
+      continue;
+    }
+
+    const record = part as Record<string, unknown>;
+    const text = extractTextFromInputContentPart(record);
+    if (typeof text === 'string') {
+      textChunks.push(text);
+      richParts.push({
+        type: 'text',
+        text,
+      });
+      continue;
+    }
+
+    if (!allowImages) {
+      continue;
+    }
+
+    const imageUrl = resolveImageUrlFromContentPart(record);
+    if (!imageUrl) {
+      continue;
+    }
+
+    hasImageParts = true;
+    richParts.push({
+      type: 'image_url',
+      image_url: {
+        url: imageUrl,
+      },
+    });
+  }
+
+  if (hasImageParts) {
+    return richParts;
+  }
+
+  if (textChunks.length === 0) {
+    return null;
+  }
+
+  return textChunks.join('\n');
+}
+
+function convertResponsesInputToChatMessages(input: unknown): ChatCompletionsMessage[] {
+  const items = normalizeResponsesInputItems(input);
+  const messages: ChatCompletionsMessage[] = [];
+
+  for (const item of items) {
+    if (typeof item === 'string') {
+      if (!item.trim()) {
+        continue;
+      }
+      messages.push({ role: 'user', content: item });
+      continue;
+    }
+
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+
+    const record = item as Record<string, unknown>;
+    const role = normalizeInputMessageRole(record.role) ?? 'user';
+    const content = convertResponsesContentToChatContent(record.content, role);
+    if (content === null) {
+      continue;
+    }
+
+    if (typeof content === 'string' && !content.trim()) {
+      continue;
+    }
+
+    if (Array.isArray(content) && content.length === 0) {
+      continue;
+    }
+
+    messages.push({ role, content });
+  }
+
+  return messages;
+}
+
+function parsePositiveInteger(value: unknown): number | null {
+  const parsed = parseNumberField(value);
+  if (parsed === null) {
+    return null;
+  }
+
+  const normalized = Math.floor(parsed);
+  if (!Number.isFinite(normalized) || normalized <= 0) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function buildChatCompletionsRequestFromResponses(
+  requestBody: Record<string, unknown>,
+): Record<string, unknown> {
+  const messages = convertResponsesInputToChatMessages(requestBody.input);
+  if (messages.length === 0) {
+    throw new RequestConversionError('input is required');
+  }
+
+  const upstreamBody: Record<string, unknown> = {
+    model: requestBody.model,
+    messages,
+    stream: requestBody.stream === true,
+  };
+
+  const maxTokens =
+    parsePositiveInteger(requestBody.max_tokens) ??
+    parsePositiveInteger(requestBody.max_completion_tokens) ??
+    parsePositiveInteger(requestBody.max_output_tokens);
+  if (maxTokens !== null) {
+    upstreamBody.max_tokens = maxTokens;
+  }
+
+  const passthroughKeys = [
+    'temperature',
+    'top_p',
+    'n',
+    'stop',
+    'presence_penalty',
+    'frequency_penalty',
+    'logit_bias',
+    'user',
+    'tools',
+    'tool_choice',
+    'parallel_tool_calls',
+    'response_format',
+  ];
+  for (const key of passthroughKeys) {
+    if (Object.prototype.hasOwnProperty.call(requestBody, key)) {
+      upstreamBody[key] = requestBody[key];
+    }
+  }
+
+  return upstreamBody;
+}
+
+function parseBase64ImageDataUrl(
+  value: string,
+): { mediaType: string; data: string; sizeBytes: number } | null {
+  const match = /^data:([^;,]+)(;[^,]*)?,(.+)$/i.exec(value.trim());
+  if (!match) {
+    return null;
+  }
+
+  const mediaType = (match[1] ?? '').trim().toLowerCase();
+  if (!mediaType || !mediaType.startsWith('image/')) {
+    return null;
+  }
+
+  const parameters = (match[2] ?? '').toLowerCase();
+  if (!parameters.includes(';base64')) {
+    return null;
+  }
+
+  const data = (match[3] ?? '').replace(/\s+/g, '');
+  if (!data || !/^[A-Za-z0-9+/=]+$/.test(data)) {
+    return null;
+  }
+
+  const paddingBytes = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+  const sizeBytes = Math.max(0, Math.floor((data.length * 3) / 4) - paddingBytes);
+  return {
+    mediaType,
+    data,
+    sizeBytes,
+  };
+}
+
+function convertResponsesContentToAnthropicBlocks(params: {
+  content: unknown;
+  role: ChatCompletionsRole;
+}): AnthropicContentBlock[] {
+  const { content, role } = params;
+
+  if (typeof content === 'string') {
+    if (!content.trim()) {
+      return [];
+    }
+    return [{ type: 'text', text: content }];
+  }
+
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  const allowImages = role === 'user';
+  const blocks: AnthropicContentBlock[] = [];
+
+  for (const part of content) {
+    if (!part || typeof part !== 'object') {
+      continue;
+    }
+
+    const record = part as Record<string, unknown>;
+    const text = extractTextFromInputContentPart(record);
+    if (typeof text === 'string' && text.trim()) {
+      blocks.push({
+        type: 'text',
+        text,
+      });
+      continue;
+    }
+
+    if (!allowImages) {
+      continue;
+    }
+
+    const imageUrl = resolveImageUrlFromContentPart(record);
+    if (!imageUrl) {
+      continue;
+    }
+
+    const parsedDataUrl = parseBase64ImageDataUrl(imageUrl);
+    if (!parsedDataUrl) {
+      throw new RequestConversionError('Invalid image input for upstream');
+    }
+
+    if (parsedDataUrl.sizeBytes > ANTHROPIC_MAX_IMAGE_BYTES) {
+      throw new RequestConversionError('Image too large for upstream');
+    }
+
+    blocks.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: parsedDataUrl.mediaType,
+        data: parsedDataUrl.data,
+      },
+    });
+  }
+
+  return blocks;
+}
+
+function convertResponsesInputToAnthropicMessages(input: unknown): {
+  messages: AnthropicMessage[];
+  systemPrompt: string | null;
+} {
+  const items = normalizeResponsesInputItems(input);
+  const messages: AnthropicMessage[] = [];
+  const systemChunks: string[] = [];
+
+  for (const item of items) {
+    if (typeof item === 'string') {
+      if (!item.trim()) {
+        continue;
+      }
+      messages.push({
+        role: 'user',
+        content: [{ type: 'text', text: item }],
+      });
+      continue;
+    }
+
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+
+    const record = item as Record<string, unknown>;
+    const role = normalizeInputMessageRole(record.role) ?? 'user';
+    const blocks = convertResponsesContentToAnthropicBlocks({
+      content: record.content,
+      role,
+    });
+
+    if (role === 'system') {
+      const systemText = blocks
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n')
+        .trim();
+      if (systemText) {
+        systemChunks.push(systemText);
+      }
+      continue;
+    }
+
+    if (blocks.length === 0) {
+      continue;
+    }
+
+    messages.push({
+      role: role as AnthropicMessageRole,
+      content: blocks,
+    });
+  }
+
+  const systemPrompt = systemChunks.join('\n').trim();
+  return {
+    messages,
+    systemPrompt: systemPrompt || null,
+  };
+}
+
+function buildAnthropicMessagesRequestFromResponses(
+  requestBody: Record<string, unknown>,
+): Record<string, unknown> {
+  const converted = convertResponsesInputToAnthropicMessages(requestBody.input);
+  if (converted.messages.length === 0) {
+    throw new RequestConversionError('input is required');
+  }
+
+  const maxTokens =
+    parsePositiveInteger(requestBody.max_tokens) ??
+    parsePositiveInteger(requestBody.max_output_tokens) ??
+    1024;
+
+  const upstreamBody: Record<string, unknown> = {
+    model: requestBody.model,
+    stream: requestBody.stream === true,
+    max_tokens: maxTokens,
+    messages: converted.messages,
+  };
+
+  if (converted.systemPrompt) {
+    upstreamBody.system = converted.systemPrompt;
+  }
+
+  if (typeof requestBody.temperature === 'number' && Number.isFinite(requestBody.temperature)) {
+    upstreamBody.temperature = requestBody.temperature;
+  }
+
+  if (typeof requestBody.top_p === 'number' && Number.isFinite(requestBody.top_p)) {
+    upstreamBody.top_p = requestBody.top_p;
+  }
+
+  const topK = parsePositiveInteger(requestBody.top_k);
+  if (topK !== null) {
+    upstreamBody.top_k = topK;
+  }
+
+  if (Array.isArray(requestBody.stop)) {
+    const stopSequences = requestBody.stop.filter((item): item is string => typeof item === 'string');
+    if (stopSequences.length > 0) {
+      upstreamBody.stop_sequences = stopSequences;
+    }
+  } else if (typeof requestBody.stop === 'string' && requestBody.stop.trim()) {
+    upstreamBody.stop_sequences = [requestBody.stop];
+  }
+
+  return upstreamBody;
+}
+
+function buildResponsesPayloadFromAssistantText(assistantText: string): Record<string, unknown> {
+  return {
+    output_text: assistantText,
+    output: [
+      {
+        content: [
+          {
+            type: 'output_text',
+            text: assistantText,
+          },
+        ],
+      },
+    ],
+  };
+}
+
 function extractAssistantTextFromResponses(responseBody: unknown): string {
   if (!responseBody || typeof responseBody !== 'object') {
     return '';
@@ -2479,6 +2999,31 @@ function extractAssistantTextFromChatCompletions(responseBody: unknown): string 
   return '';
 }
 
+function extractAssistantTextFromAnthropicMessages(responseBody: unknown): string {
+  if (!responseBody || typeof responseBody !== 'object') {
+    return '';
+  }
+
+  const payload = responseBody as Record<string, unknown>;
+  if (!Array.isArray(payload.content)) {
+    return '';
+  }
+
+  const chunks: string[] = [];
+  for (const part of payload.content) {
+    if (!part || typeof part !== 'object') {
+      continue;
+    }
+
+    const record = part as Record<string, unknown>;
+    if (record.type === 'text' && typeof record.text === 'string') {
+      chunks.push(record.text);
+    }
+  }
+
+  return chunks.join('\n').trim();
+}
+
 function findSseBoundary(input: string): { index: number; length: number } | null {
   const idxLf = input.indexOf('\n\n');
   const idxCrLf = input.indexOf('\r\n\r\n');
@@ -2500,6 +3045,138 @@ function findSseBoundary(input: string): { index: number; length: number } | nul
   }
 
   return { index: idxCrLf, length: 4 };
+}
+
+function parseSseEventBlocks(buffer: string): { remaining: string; events: SseEventBlock[] } {
+  let remaining = buffer;
+  const events: SseEventBlock[] = [];
+
+  while (true) {
+    const boundary = findSseBoundary(remaining);
+    if (!boundary) {
+      break;
+    }
+
+    const block = remaining.slice(0, boundary.index);
+    remaining = remaining.slice(boundary.index + boundary.length);
+
+    let eventName: string | null = null;
+    const dataLines: string[] = [];
+
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith('event:')) {
+        eventName = line.slice(6).trim() || null;
+      } else if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+
+    if (dataLines.length === 0) {
+      continue;
+    }
+
+    events.push({
+      event: eventName,
+      data: dataLines.join('\n'),
+    });
+  }
+
+  return {
+    remaining,
+    events,
+  };
+}
+
+function extractChatDeltaFromSseEventData(eventData: string): string {
+  if (!eventData || eventData === '[DONE]') {
+    return '';
+  }
+
+  try {
+    const parsed = JSON.parse(eventData) as Record<string, unknown>;
+    const choices = parsed.choices;
+    if (!Array.isArray(choices) || choices.length === 0) {
+      return '';
+    }
+
+    let deltaText = '';
+    for (const choice of choices) {
+      if (!choice || typeof choice !== 'object') {
+        continue;
+      }
+
+      const delta = (choice as Record<string, unknown>).delta;
+      if (!delta || typeof delta !== 'object') {
+        continue;
+      }
+
+      const deltaRecord = delta as Record<string, unknown>;
+      if (typeof deltaRecord.content === 'string') {
+        deltaText += deltaRecord.content;
+        continue;
+      }
+
+      if (!Array.isArray(deltaRecord.content)) {
+        continue;
+      }
+
+      for (const item of deltaRecord.content) {
+        if (!item || typeof item !== 'object') {
+          continue;
+        }
+
+        const part = item as Record<string, unknown>;
+        if (typeof part.text === 'string') {
+          deltaText += part.text;
+        }
+      }
+    }
+
+    return deltaText;
+  } catch {
+    return '';
+  }
+}
+
+function extractAnthropicDeltaFromSseBlock(block: SseEventBlock): string {
+  const data = block.data.trim();
+  if (!data || data === '[DONE]') {
+    return '';
+  }
+
+  try {
+    const parsed = JSON.parse(data) as Record<string, unknown>;
+    const eventType =
+      typeof parsed.type === 'string' ? parsed.type : typeof block.event === 'string' ? block.event : '';
+
+    if (eventType === 'content_block_delta') {
+      const delta = parsed.delta;
+      if (delta && typeof delta === 'object') {
+        const deltaRecord = delta as Record<string, unknown>;
+        if (typeof deltaRecord.text === 'string') {
+          return deltaRecord.text;
+        }
+      }
+    }
+
+    if (eventType === 'content_block_start') {
+      const contentBlock = parsed.content_block;
+      if (contentBlock && typeof contentBlock === 'object') {
+        const contentRecord = contentBlock as Record<string, unknown>;
+        if (contentRecord.type === 'text' && typeof contentRecord.text === 'string') {
+          return contentRecord.text;
+        }
+      }
+    }
+
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+function formatResponsesDeltaSseEvent(delta: string): string {
+  return `data: ${JSON.stringify({ type: 'response.output_text.delta', delta })}\n\n`;
 }
 
 function parseSseAssistantDelta(params: {
@@ -3535,6 +4212,7 @@ async function setupServer(): Promise<void> {
               p.name,
               p.base_url,
               p.enabled,
+              p.api_type,
               (ps.provider_id IS NOT NULL) AS has_secret,
               ps.updated_at AS secret_updated_at
        FROM providers p
@@ -3549,6 +4227,7 @@ async function setupServer(): Promise<void> {
         name: provider.name,
         base_url: provider.base_url,
         enabled: provider.enabled,
+        api_type: provider.api_type,
         has_secret: provider.has_secret,
         secret_updated_at: provider.secret_updated_at,
       })),
@@ -3562,6 +4241,7 @@ async function setupServer(): Promise<void> {
       name?: unknown;
       base_url?: unknown;
       enabled?: unknown;
+      api_type?: unknown;
     };
 
     const code = normalizeProviderCode(body.code);
@@ -3595,13 +4275,23 @@ async function setupServer(): Promise<void> {
     }
     const enabled = typeof body.enabled === 'boolean' ? body.enabled : true;
 
+    const apiType = Object.prototype.hasOwnProperty.call(body, 'api_type')
+      ? normalizeProviderApiType(body.api_type)
+      : DEFAULT_PROVIDER_API_TYPE;
+    if (!apiType) {
+      reply.code(400).send({
+        error: `api_type must be one of: ${providerApiTypes.join(', ')}`,
+      });
+      return;
+    }
+
     let inserted: { rows: ProviderRow[]; rowCount: number | null };
     try {
       inserted = await pool.query<ProviderRow>(
-        `INSERT INTO providers (code, name, base_url, enabled, updated_at)
-         VALUES ($1, $2, $3, $4, now())
-         RETURNING id, code, name, base_url, enabled`,
-        [code, name, normalizedBaseUrl, enabled],
+        `INSERT INTO providers (code, name, base_url, enabled, api_type, updated_at)
+         VALUES ($1, $2, $3, $4, $5, now())
+         RETURNING id, code, name, base_url, enabled, api_type`,
+        [code, name, normalizedBaseUrl, enabled, apiType],
       );
     } catch (error) {
       if (isUniqueViolation(error)) {
@@ -3617,7 +4307,12 @@ async function setupServer(): Promise<void> {
       eventType: 'admin.providers.created',
       request,
       userId: user.id,
-      metadata: { provider_id: provider.id, provider: provider.code, enabled: provider.enabled },
+      metadata: {
+        provider_id: provider.id,
+        provider: provider.code,
+        enabled: provider.enabled,
+        api_type: provider.api_type,
+      },
     });
 
     reply.code(201).send({
@@ -3627,6 +4322,7 @@ async function setupServer(): Promise<void> {
         name: provider.name,
         base_url: provider.base_url,
         enabled: provider.enabled,
+        api_type: provider.api_type,
         has_secret: false,
         secret_updated_at: null,
       },
@@ -3641,6 +4337,7 @@ async function setupServer(): Promise<void> {
       name?: unknown;
       base_url?: unknown;
       enabled?: unknown;
+      api_type?: unknown;
     };
     const id = Number(params.id);
 
@@ -3707,8 +4404,24 @@ async function setupServer(): Promise<void> {
       updatedFields.push('enabled');
     }
 
+    if (Object.prototype.hasOwnProperty.call(body, 'api_type')) {
+      const apiType = normalizeProviderApiType(body.api_type);
+      if (!apiType) {
+        reply.code(400).send({
+          error: `api_type must be one of: ${providerApiTypes.join(', ')}`,
+        });
+        return;
+      }
+
+      updates.push(`api_type = $${values.length + 1}`);
+      values.push(apiType);
+      updatedFields.push('api_type');
+    }
+
     if (updates.length === 0) {
-      reply.code(400).send({ error: 'At least one of code, name, base_url, enabled must be provided' });
+      reply
+        .code(400)
+        .send({ error: 'At least one of code, name, base_url, enabled, api_type must be provided' });
       return;
     }
 
@@ -3720,7 +4433,7 @@ async function setupServer(): Promise<void> {
         `UPDATE providers
          SET ${updates.join(', ')}
          WHERE id = $1
-         RETURNING id, code, name, base_url, enabled`,
+         RETURNING id, code, name, base_url, enabled, api_type`,
         values,
       );
     } catch (error) {
@@ -3741,7 +4454,12 @@ async function setupServer(): Promise<void> {
       eventType: 'admin.providers.updated',
       request,
       userId: user.id,
-      metadata: { provider_id: provider.id, provider: provider.code, updated_fields: updatedFields },
+      metadata: {
+        provider_id: provider.id,
+        provider: provider.code,
+        api_type: provider.api_type,
+        updated_fields: updatedFields,
+      },
     });
 
     reply.send({
@@ -3751,6 +4469,7 @@ async function setupServer(): Promise<void> {
         name: provider.name,
         base_url: provider.base_url,
         enabled: provider.enabled,
+        api_type: provider.api_type,
       },
     });
   });
@@ -4121,6 +4840,7 @@ async function setupServer(): Promise<void> {
                  m.provider_id,
                  p.code AS provider_code,
                  p.base_url AS provider_base_url,
+                 p.api_type AS provider_api_type,
                  m.model_id,
                  m.public_id,
                  m.display_name,
@@ -5626,6 +6346,42 @@ async function setupServer(): Promise<void> {
     }
 
     try {
+      let upstreamPath: '/responses' | '/chat/completions' | '/messages';
+      let upstreamRequestBody: Record<string, unknown>;
+      let upstreamHeaders: Record<string, string>;
+
+      try {
+        if (selectedModel.provider_api_type === 'openai_responses') {
+          upstreamPath = '/responses';
+          upstreamRequestBody = requestBody;
+          upstreamHeaders = {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          };
+        } else if (selectedModel.provider_api_type === 'openai_chat') {
+          upstreamPath = '/chat/completions';
+          upstreamRequestBody = buildChatCompletionsRequestFromResponses(requestBody);
+          upstreamHeaders = {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          };
+        } else {
+          upstreamPath = '/messages';
+          upstreamRequestBody = buildAnthropicMessagesRequestFromResponses(requestBody);
+          upstreamHeaders = {
+            'content-type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': ANTHROPIC_VERSION,
+          };
+        }
+      } catch (error) {
+        if (isRequestConversionError(error)) {
+          reply.code(error.statusCode).send({ error: error.message });
+          return;
+        }
+        throw error;
+      }
+
       const started = Date.now();
 
       await writeAuditEvent({
@@ -5635,6 +6391,8 @@ async function setupServer(): Promise<void> {
         metadata: {
           endpoint: '/responses',
           provider: selectedModel.provider_code,
+          provider_api_type: selectedModel.provider_api_type,
+          upstream_path: upstreamPath,
           stream,
           has_model: Boolean(effectiveModel),
           history_items_used: contextMessagesUsed,
@@ -5642,13 +6400,10 @@ async function setupServer(): Promise<void> {
         },
       });
 
-      const upstream = await fetch(`${selectedModel.provider_base_url}/responses`, {
+      const upstream = await fetch(`${selectedModel.provider_base_url}${upstreamPath}`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(requestBody),
+        headers: upstreamHeaders,
+        body: JSON.stringify(upstreamRequestBody),
       });
 
       await writeAuditEvent({
@@ -5658,6 +6413,8 @@ async function setupServer(): Promise<void> {
         metadata: {
           endpoint: '/responses',
           provider: selectedModel.provider_code,
+          provider_api_type: selectedModel.provider_api_type,
+          upstream_path: upstreamPath,
           status: upstream.status,
           duration_ms: Date.now() - started,
           stream,
@@ -5702,7 +6459,10 @@ async function setupServer(): Promise<void> {
 
         reply.hijack();
         reply.raw.writeHead(200, {
-          'Content-Type': upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8',
+          'Content-Type':
+            selectedModel.provider_api_type === 'openai_responses'
+              ? (upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8')
+              : 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache, no-transform',
           Connection: 'keep-alive',
           'X-Thread-Id': targetThreadId,
@@ -5711,6 +6471,7 @@ async function setupServer(): Promise<void> {
 
         let parserBuffer = '';
         let assistantText = '';
+        let doneSent = false;
         const decoder = new TextDecoder();
 
         while (true) {
@@ -5720,12 +6481,45 @@ async function setupServer(): Promise<void> {
           }
 
           const chunk = decoder.decode(value, { stream: true });
-          reply.raw.write(chunk);
+          if (selectedModel.provider_api_type === 'openai_responses') {
+            reply.raw.write(chunk);
+
+            parserBuffer += chunk;
+            const parsed = parseSseAssistantDelta({ streamKind: 'responses', buffer: parserBuffer });
+            parserBuffer = parsed.remaining;
+            assistantText += parsed.assistantDelta;
+            continue;
+          }
 
           parserBuffer += chunk;
-          const parsed = parseSseAssistantDelta({ streamKind: 'responses', buffer: parserBuffer });
+          const parsed = parseSseEventBlocks(parserBuffer);
           parserBuffer = parsed.remaining;
-          assistantText += parsed.assistantDelta;
+
+          for (const block of parsed.events) {
+            const data = block.data.trim();
+            if (!data) {
+              continue;
+            }
+
+            if (data === '[DONE]') {
+              if (!doneSent) {
+                doneSent = true;
+                reply.raw.write('data: [DONE]\n\n');
+              }
+              continue;
+            }
+
+            const delta =
+              selectedModel.provider_api_type === 'openai_chat'
+                ? extractChatDeltaFromSseEventData(data)
+                : extractAnthropicDeltaFromSseBlock(block);
+            if (!delta) {
+              continue;
+            }
+
+            assistantText += delta;
+            reply.raw.write(formatResponsesDeltaSseEvent(delta));
+          }
         }
 
         const tail = decoder.decode();
@@ -5733,8 +6527,41 @@ async function setupServer(): Promise<void> {
           parserBuffer += tail;
         }
 
-        const parsedTail = parseSseAssistantDelta({ streamKind: 'responses', buffer: parserBuffer });
-        assistantText += parsedTail.assistantDelta;
+        if (selectedModel.provider_api_type === 'openai_responses') {
+          const parsedTail = parseSseAssistantDelta({ streamKind: 'responses', buffer: parserBuffer });
+          assistantText += parsedTail.assistantDelta;
+        } else {
+          const parsedTail = parseSseEventBlocks(parserBuffer);
+          for (const block of parsedTail.events) {
+            const data = block.data.trim();
+            if (!data) {
+              continue;
+            }
+
+            if (data === '[DONE]') {
+              if (!doneSent) {
+                doneSent = true;
+                reply.raw.write('data: [DONE]\n\n');
+              }
+              continue;
+            }
+
+            const delta =
+              selectedModel.provider_api_type === 'openai_chat'
+                ? extractChatDeltaFromSseEventData(data)
+                : extractAnthropicDeltaFromSseBlock(block);
+            if (!delta) {
+              continue;
+            }
+
+            assistantText += delta;
+            reply.raw.write(formatResponsesDeltaSseEvent(delta));
+          }
+
+          if (!doneSent) {
+            reply.raw.write('data: [DONE]\n\n');
+          }
+        }
 
         await persistMessage({
           threadId: targetThreadId,
@@ -5756,14 +6583,23 @@ async function setupServer(): Promise<void> {
       }
 
       const payload = (await upstream.json()) as Record<string, unknown>;
-      const assistantText = extractAssistantTextFromResponses(payload);
+      const assistantText =
+        selectedModel.provider_api_type === 'openai_responses'
+          ? extractAssistantTextFromResponses(payload)
+          : selectedModel.provider_api_type === 'openai_chat'
+            ? extractAssistantTextFromChatCompletions(payload)
+            : extractAssistantTextFromAnthropicMessages(payload);
+      const downstreamPayload =
+        selectedModel.provider_api_type === 'openai_responses'
+          ? payload
+          : buildResponsesPayloadFromAssistantText(assistantText);
 
       await persistMessage({
         threadId: targetThreadId,
         userId: user.id,
         role: 'assistant',
         content: assistantText || '[empty response]',
-        rawContent: payload,
+        rawContent: downstreamPayload,
       });
 
       await maybeAutoRenameThread({
@@ -5781,7 +6617,7 @@ async function setupServer(): Promise<void> {
 
       reply.header('X-Thread-Id', targetThreadId);
       reply.header('X-Context-Messages-Used', String(contextMessagesUsed));
-      reply.send(payload);
+      reply.send(downstreamPayload);
     } finally {
       await releaseUserStreamLease(streamLease);
     }
@@ -5814,6 +6650,13 @@ async function setupServer(): Promise<void> {
       });
     } catch (error) {
       reply.code(400).send({ error: error instanceof Error ? error.message : 'Invalid model selection' });
+      return;
+    }
+
+    if (selectedModel.provider_api_type !== 'openai_chat') {
+      reply.code(400).send({
+        error: `/v1/chat/completions is only supported when provider api_type is "openai_chat" (current: "${selectedModel.provider_api_type}")`,
+      });
       return;
     }
 
@@ -5942,6 +6785,7 @@ async function setupServer(): Promise<void> {
         metadata: {
           endpoint: '/chat/completions',
           provider: selectedModel.provider_code,
+          provider_api_type: selectedModel.provider_api_type,
           stream,
           has_model: Boolean(effectiveModel),
           history_items_used: contextMessagesUsed,
@@ -5965,6 +6809,7 @@ async function setupServer(): Promise<void> {
         metadata: {
           endpoint: '/chat/completions',
           provider: selectedModel.provider_code,
+          provider_api_type: selectedModel.provider_api_type,
           status: upstream.status,
           duration_ms: Date.now() - started,
           stream,

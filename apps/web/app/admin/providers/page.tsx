@@ -1,7 +1,12 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import type { CreateProviderDraft, ProviderDraft, ProviderItem } from '../_components/types';
+import type {
+  CreateProviderDraft,
+  ProviderApiType,
+  ProviderDraft,
+  ProviderItem,
+} from '../_components/types';
 import {
   normalizeProviderBaseUrl,
   normalizeProviderCode,
@@ -13,7 +18,20 @@ const initialCreateProviderDraft: CreateProviderDraft = {
   name: '',
   base_url: '',
   enabled: true,
+  api_type: 'openai_chat',
   api_key: '',
+};
+
+const apiTypeOptions: Array<{ value: ProviderApiType; label: string }> = [
+  { value: 'openai_chat', label: 'OpenAI Chat' },
+  { value: 'openai_responses', label: 'OpenAI Responses' },
+  { value: 'anthropic_messages', label: 'Claude (Anthropic Messages)' },
+];
+
+const apiTypeLabels: Record<ProviderApiType, string> = {
+  openai_chat: 'OpenAI Chat',
+  openai_responses: 'OpenAI Responses',
+  anthropic_messages: 'Claude (Anthropic Messages)',
 };
 
 export default function AdminProvidersPage() {
@@ -46,6 +64,7 @@ export default function AdminProvidersPage() {
             name: item.name,
             base_url: item.base_url,
             enabled: item.enabled,
+            api_type: item.api_type,
           },
         ]),
       ),
@@ -104,11 +123,18 @@ export default function AdminProvidersPage() {
       return null;
     }
 
+    const apiType = draft.api_type;
+    if (!apiTypeOptions.some((option) => option.value === apiType)) {
+      setError('API 协议类型无效');
+      return null;
+    }
+
     return {
       code,
       name,
       base_url: baseUrl,
       enabled: draft.enabled,
+      api_type: apiType,
     };
   };
 
@@ -333,6 +359,26 @@ export default function AdminProvidersPage() {
             </label>
 
             <label>
+              API Protocol
+              <select
+                value={createProviderDraft.api_type}
+                disabled={createProviderBusy}
+                onChange={(event) =>
+                  setCreateProviderDraft((previous) => ({
+                    ...previous,
+                    api_type: event.target.value as ProviderApiType,
+                  }))
+                }
+              >
+                {apiTypeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
               API Key（可选）
               <input
                 type="password"
@@ -381,6 +427,7 @@ export default function AdminProvidersPage() {
               name: provider.name,
               base_url: provider.base_url,
               enabled: provider.enabled,
+              api_type: provider.api_type,
             };
             const secretDraft = providerSecretDrafts[provider.id] ?? '';
             return (
@@ -388,6 +435,7 @@ export default function AdminProvidersPage() {
                 <div className="mono admin-item-title">
                   {provider.code}（{provider.enabled ? '已启用' : '已禁用'}）
                 </div>
+                <div className="notice">API Protocol：{apiTypeLabels[provider.api_type]}</div>
                 <div className="notice">
                   密钥已配置：{provider.has_secret ? '是' : '否'}
                   {provider.secret_updated_at
@@ -442,6 +490,28 @@ export default function AdminProvidersPage() {
                       }))
                     }
                   />
+                </label>
+
+                <label>
+                  API Protocol
+                  <select
+                    value={draft.api_type}
+                    onChange={(event) =>
+                      setProviderDrafts((previous) => ({
+                        ...previous,
+                        [provider.id]: {
+                          ...draft,
+                          api_type: event.target.value as ProviderApiType,
+                        },
+                      }))
+                    }
+                  >
+                    {apiTypeOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
                 </label>
 
                 <label className="checkbox-row">
