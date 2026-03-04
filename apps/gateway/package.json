@@ -17,6 +17,7 @@
     "fastify": "^4.29.0",
     "ioredis": "^5.4.1",
     "minio": "^8.0.5",
+    "pdf-parse": "^1.1.1",
     "pg": "^8.13.0"
   },
   "devDependencies": {

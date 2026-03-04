@@ -303,7 +303,7 @@ const MAX_RAW_CONTENT_JSON_BYTES = 200 * 1024;
 const MAX_EXTRACTED_FILE_TEXT_CHARS = 200_000;
 const MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_STREAMED_TEXT_CAPTURE_BYTES = MAX_EXTRACTED_FILE_TEXT_CHARS * 4;
-const MAX_INLINE_PDF_EXTRACTION_BYTES = 25 * 1024 * 1024;
+const MAX_INLINE_PDF_EXTRACTION_BYTES = 100 * 1024 * 1024;
 const supportedDocumentUploadMimeTypes = new Set(['text/plain', 'text/markdown', 'application/pdf']);
 const RATE_LIMIT_WINDOW_SECONDS = 60;
 const TPM_WINDOW_MS = RATE_LIMIT_WINDOW_SECONDS * 1000;
@@ -2397,6 +2397,8 @@ type PdfParseResult = {
 type PdfParseFunction = (buffer: Buffer) => Promise<PdfParseResult>;
 
 let pdfParseFunction: PdfParseFunction | null | undefined;
+let pdfParseMissingWarningLogged = false;
+let pdfParseRuntimeWarningLogged = false;
 
 function resolvePdfParseFunction(): PdfParseFunction | null {
   if (typeof pdfParseFunction !== 'undefined') {
@@ -2410,8 +2412,21 @@ function resolvePdfParseFunction(): PdfParseFunction | null {
       return pdfParseFunction;
     }
     pdfParseFunction = typeof loaded.default === 'function' ? loaded.default : null;
-  } catch {
+    if (!pdfParseFunction && !pdfParseMissingWarningLogged) {
+      pdfParseMissingWarningLogged = true;
+      app.log.warn('pdf-parse export is not a function; falling back to built-in PDF extractor');
+    }
+  } catch (error) {
     pdfParseFunction = null;
+    if (!pdfParseMissingWarningLogged) {
+      pdfParseMissingWarningLogged = true;
+      app.log.warn(
+        {
+          err: error,
+        },
+        'pdf-parse module unavailable; falling back to built-in PDF extractor',
+      );
+    }
   }
 
   return pdfParseFunction;
@@ -2607,7 +2622,16 @@ async function extractTextFromPdfBuffer(buffer: Buffer): Promise<string> {
       if (typeof parsed.text === 'string') {
         return parsed.text;
       }
-    } catch {
+    } catch (error) {
+      if (!pdfParseRuntimeWarningLogged) {
+        pdfParseRuntimeWarningLogged = true;
+        app.log.warn(
+          {
+            err: error,
+          },
+          'pdf-parse failed while extracting PDF text; falling back to built-in PDF extractor',
+        );
+      }
       // Fall back to the lightweight parser below.
     }
   }
@@ -6755,7 +6779,8 @@ async function setupServer(): Promise<void> {
         if (isPlainTextUploadMimeType(uploadMimeType)) {
           extractedText = normalizeExtractedFileText(Buffer.concat(capturedTextChunks).toString('utf8'));
         } else if (uploadMimeType === 'application/pdf') {
-          if (bytes <= MAX_INLINE_PDF_EXTRACTION_BYTES) {
+          const maxInlinePdfExtractionBytes = Math.min(MAX_INLINE_PDF_EXTRACTION_BYTES, MAX_UPLOAD_FILE_BYTES);
+          if (bytes <= maxInlinePdfExtractionBytes) {
             const objectStream = await getMinioObjectStream(config.minioBucket, objectKey);
             const pdfBuffer = await streamToBuffer(objectStream);
             extractedText = await extractTextFromUploadedBuffer(pdfBuffer, uploadMimeType);
@@ -6766,7 +6791,7 @@ async function setupServer(): Promise<void> {
                 userId: user.id,
                 mimeType: uploadMimeType,
                 sizeBytes: bytes,
-                thresholdBytes: MAX_INLINE_PDF_EXTRACTION_BYTES,
+                thresholdBytes: maxInlinePdfExtractionBytes,
               },
               'Skipped PDF extraction due to size',
             );
