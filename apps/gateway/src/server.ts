@@ -5695,14 +5695,23 @@ async function setupServer(): Promise<void> {
       });
 
       const file = fileResult.rows[0]!;
-      const stream = await getMinioObjectStream(file.bucket, file.object_key);
+      let buffer: Buffer;
+      try {
+        const stream = await getMinioObjectStream(file.bucket, file.object_key);
+        buffer = await streamToBuffer(stream);
+      } catch (error) {
+        request.log.error(
+          { err: error, fileId: file.id, bucket: file.bucket, objectKey: file.object_key },
+          'Failed to load admin file content from object storage',
+        );
+        reply.code(502).send({ error: 'Upstream storage error' });
+        return;
+      }
 
       reply.header('Content-Type', file.mime_type);
       reply.header('Cache-Control', 'private, max-age=300');
-      if (typeof file.size_bytes === 'number') {
-        reply.header('Content-Length', String(file.size_bytes));
-      }
-      reply.send(stream);
+      reply.header('Content-Length', String(buffer.length));
+      reply.send(buffer);
     },
   );
 
@@ -6216,14 +6225,23 @@ async function setupServer(): Promise<void> {
     }
 
     const file = fileResult.rows[0]!;
-    const stream = await getMinioObjectStream(file.bucket, file.object_key);
+    let buffer: Buffer;
+    try {
+      const stream = await getMinioObjectStream(file.bucket, file.object_key);
+      buffer = await streamToBuffer(stream);
+    } catch (error) {
+      request.log.error(
+        { err: error, fileId: file.id, userId: user.id, bucket: file.bucket, objectKey: file.object_key },
+        'Failed to load file content from object storage',
+      );
+      reply.code(502).send({ error: 'Upstream storage error' });
+      return;
+    }
 
     reply.header('Content-Type', file.mime_type);
     reply.header('Cache-Control', 'private, max-age=300');
-    if (typeof file.size_bytes === 'number') {
-      reply.header('Content-Length', String(file.size_bytes));
-    }
-    reply.send(stream);
+    reply.header('Content-Length', String(buffer.length));
+    reply.send(buffer);
   });
 
   app.post('/v1/responses', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
