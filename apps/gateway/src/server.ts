@@ -280,7 +280,7 @@ const app = Fastify({
   logger: {
     level: process.env.LOG_LEVEL ?? 'info',
   },
-  bodyLimit: 20 * 1024 * 1024,
+  bodyLimit: 120 * 1024 * 1024,
 });
 
 const oauthRegistry = createOAuthRegistry({
@@ -3943,7 +3943,7 @@ async function setupServer(): Promise<void> {
   await app.register(cookie);
   await app.register(multipart, {
     limits: {
-      fileSize: 10 * 1024 * 1024,
+      fileSize: 100 * 1024 * 1024,
       files: 1,
     },
   });
