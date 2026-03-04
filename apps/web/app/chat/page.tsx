@@ -1107,21 +1107,23 @@ export default function ChatPage() {
     (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
       const pastedImages: File[] = [];
       const seenPastedSignatures = new Set<string>();
-      const addPastedImage = (file: File) => {
+      const addPastedImage = (file: File): boolean => {
         if (!isImageFile(file)) {
-          return;
+          return false;
         }
 
         const normalized = normalizePastedImageFile(file);
         const signature = `${normalized.name}:${normalized.size}:${normalized.lastModified}:${normalized.type}`;
         if (seenPastedSignatures.has(signature)) {
-          return;
+          return false;
         }
 
         seenPastedSignatures.add(signature);
         pastedImages.push(normalized);
+        return true;
       };
 
+      let addedImageFromItems = false;
       const clipboardItems = event.clipboardData?.items;
       if (clipboardItems?.length) {
         for (const item of Array.from(clipboardItems)) {
@@ -1132,12 +1134,14 @@ export default function ChatPage() {
           if (!rawFile) {
             continue;
           }
-          addPastedImage(rawFile);
+          if (addPastedImage(rawFile)) {
+            addedImageFromItems = true;
+          }
         }
       }
 
       const clipboardFiles = event.clipboardData?.files;
-      if (clipboardFiles?.length) {
+      if (!addedImageFromItems && clipboardFiles?.length) {
         for (const file of Array.from(clipboardFiles)) {
           addPastedImage(file);
         }
