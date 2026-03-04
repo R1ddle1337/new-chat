@@ -50,6 +50,10 @@ type ProviderDraft = {
   enabled: boolean;
 };
 
+type CreateProviderDraft = ProviderDraft & {
+  api_key: string;
+};
+
 type RateLimitsPayload = {
   rpm_limit: number;
   tpm_limit: number;
@@ -230,11 +234,12 @@ export default function AdminPage() {
   const [providers, setProviders] = useState<ProviderItem[]>([]);
   const [providerDrafts, setProviderDrafts] = useState<Record<number, ProviderDraft>>({});
   const [providerSecretDrafts, setProviderSecretDrafts] = useState<Record<number, string>>({});
-  const [createProviderDraft, setCreateProviderDraft] = useState<ProviderDraft>({
+  const [createProviderDraft, setCreateProviderDraft] = useState<CreateProviderDraft>({
     code: '',
     name: '',
     base_url: '',
     enabled: true,
+    api_key: '',
   });
 
   const [models, setModels] = useState<ModelItem[]>([]);
@@ -266,6 +271,7 @@ export default function AdminPage() {
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [createProviderBusy, setCreateProviderBusy] = useState(false);
 
   const filteredImportedModels = useMemo(() => {
     const query = importSearch.trim().toLowerCase();
@@ -511,14 +517,20 @@ export default function AdminPage() {
   };
 
   const createProvider = async () => {
+    if (createProviderBusy) {
+      return;
+    }
+
     const payload = validateProviderDraft(createProviderDraft);
     if (!payload) {
       return;
     }
 
+    const apiKey = createProviderDraft.api_key.trim();
+
     setStatus(null);
     setError(null);
-    setBusy('provider-create');
+    setCreateProviderBusy(true);
 
     try {
       const res = await fetch('/api/admin/providers', {
@@ -528,10 +540,36 @@ export default function AdminPage() {
         body: JSON.stringify(payload),
       });
 
-      const body = (await res.json().catch(() => null)) as unknown;
+      const body = (await res.json().catch(() => null)) as { data?: { id?: unknown } } | null;
       if (!res.ok) {
         setError(parseError(body, 'Failed to create provider'));
         return;
+      }
+
+      const providerId =
+        typeof body?.data?.id === 'number' && Number.isInteger(body.data.id) ? body.data.id : null;
+      let providerStatus = `Provider "${payload.code}" created`;
+      let providerError: string | null = null;
+
+      if (apiKey) {
+        if (!providerId) {
+          providerError =
+            'Provider was created, but API key was not saved because the provider ID was missing from the create response';
+        } else {
+          const secretRes = await fetch(`/api/admin/providers/${providerId}/secret`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ api_key: apiKey }),
+          });
+          const secretBody = (await secretRes.json().catch(() => null)) as unknown;
+
+          if (!secretRes.ok) {
+            providerError = `Provider was created, but API key save failed: ${parseError(secretBody, 'Failed to update provider secret')}`;
+          } else {
+            providerStatus = `Provider "${payload.code}" created and API key saved`;
+          }
+        }
       }
 
       setCreateProviderDraft({
@@ -539,11 +577,13 @@ export default function AdminPage() {
         name: '',
         base_url: '',
         enabled: true,
+        api_key: '',
       });
-      setStatus(`Provider "${payload.code}" created`);
+      setStatus(providerStatus);
+      setError(providerError);
       await loadProviders();
     } finally {
-      setBusy(null);
+      setCreateProviderBusy(false);
     }
   };
 
@@ -1258,6 +1298,7 @@ export default function AdminPage() {
                 Code
                 <input
                   value={createProviderDraft.code}
+                  disabled={createProviderBusy}
                   onChange={(event) =>
                     setCreateProviderDraft((previous) => ({
                       ...previous,
@@ -1272,6 +1313,7 @@ export default function AdminPage() {
                 Name
                 <input
                   value={createProviderDraft.name}
+                  disabled={createProviderBusy}
                   onChange={(event) =>
                     setCreateProviderDraft((previous) => ({
                       ...previous,
@@ -1286,6 +1328,7 @@ export default function AdminPage() {
                 Base URL
                 <input
                   value={createProviderDraft.base_url}
+                  disabled={createProviderBusy}
                   onChange={(event) =>
                     setCreateProviderDraft((previous) => ({
                       ...previous,
@@ -1296,10 +1339,28 @@ export default function AdminPage() {
                 />
               </label>
 
+              <label>
+                API key (optional)
+                <input
+                  type="password"
+                  value={createProviderDraft.api_key}
+                  disabled={createProviderBusy}
+                  onChange={(event) =>
+                    setCreateProviderDraft((previous) => ({
+                      ...previous,
+                      api_key: event.target.value,
+                    }))
+                  }
+                  autoComplete="off"
+                  placeholder="sk-..."
+                />
+              </label>
+
               <label className="checkbox-row">
                 <input
                   type="checkbox"
                   checked={createProviderDraft.enabled}
+                  disabled={createProviderBusy}
                   onChange={(event) =>
                     setCreateProviderDraft((previous) => ({
                       ...previous,
@@ -1310,8 +1371,8 @@ export default function AdminPage() {
                 Enabled
               </label>
 
-              <button className="primary" type="submit" disabled={busy !== null}>
-                {busy === 'provider-create' ? 'Creating...' : 'Create provider'}
+              <button className="primary" type="submit" disabled={createProviderBusy}>
+                {createProviderBusy ? 'Creating...' : 'Create provider'}
               </button>
             </div>
           </form>

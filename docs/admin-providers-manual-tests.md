@@ -18,9 +18,19 @@
    - `name`: `OpenAI Alt`
    - `base_url`: `https://api.openai.com/v1/` (with trailing slash)
    - `enabled`: checked
+   - `API key (optional)`: `sk-test-123`
 2. Expected:
    - provider is created.
    - list shows normalized base URL without trailing slash: `https://api.openai.com/v1`.
+   - if API key was provided, `has_secret` becomes `true` and `secret_updated_at` is populated.
+   - API key value is never shown in API responses/UI after save.
+
+## 3b) Create button usability (not blocked by unrelated busy state)
+1. Trigger any other admin action that shows a loading state (for example: model import, user search, or abuse events load).
+2. While that action is loading, confirm `Create provider` form remains editable.
+3. Expected:
+   - `Create provider` button is still clickable unless provider creation itself is running.
+   - button switches to `Creating...` only during provider creation.
 
 ## 4) Validation checks
 1. Try creating provider with duplicate `code` (existing code).
@@ -55,6 +65,14 @@
    - `has_secret` is `true`.
    - `secret_updated_at` is populated.
    - secret value is still never returned.
+
+## 7b) Partial failure behavior when API key save fails after create
+1. Simulate a failure for `POST /api/admin/providers/:id/secret` (for example, block that request in devtools or force a server error).
+2. Create a new provider with `API key (optional)` filled in.
+3. Expected:
+   - provider is still created and appears in the list.
+   - UI shows success status for provider creation plus a clear error that API key save failed.
+   - API key value is not displayed.
 
 ## 8) Gateway upstream base URL + secret usage
 1. Configure provider base URL + secret.
