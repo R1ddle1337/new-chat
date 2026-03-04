@@ -250,9 +250,23 @@ const minio = new MinioClient({
 });
 
 async function getMinioObjectStream(bucket: string, objectKey: string): Promise<Readable> {
-  // MinIO SDK (v8) supports promise API when no callback is provided.
-  // Use the promise-returning form; it returns a Node Readable stream.
-  return (await minio.getObject(bucket, objectKey)) as unknown as Readable;
+  const callbackClient = minio as unknown as {
+    getObject(
+      bucketName: string,
+      objectName: string,
+      callback: (err: Error | null, stream?: Readable) => void,
+    ): void;
+  };
+
+  return await new Promise<Readable>((resolve, reject) => {
+    callbackClient.getObject(bucket, objectKey, (err: Error | null, stream?: Readable) => {
+      if (err || !stream) {
+        reject(err ?? new Error('minio stream missing'));
+        return;
+      }
+      resolve(stream);
+    });
+  });
 }
 
 const app = Fastify({
