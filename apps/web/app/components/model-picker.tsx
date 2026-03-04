@@ -13,16 +13,33 @@ import {
 
 const mobileBreakpointPx = 980;
 
+function detectCoarsePointerPreference(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  return (
+    window.matchMedia('(pointer: coarse)').matches ||
+    window.matchMedia('(hover: none) and (pointer: coarse)').matches
+  );
+}
+
 function detectBottomSheetPreference(): boolean {
   if (typeof window === 'undefined') {
     return false;
   }
 
-  const pointerCoarse =
-    window.matchMedia('(pointer: coarse)').matches ||
-    window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+  const pointerCoarse = detectCoarsePointerPreference();
   const narrow = window.matchMedia(`(max-width: ${mobileBreakpointPx}px)`).matches;
   return pointerCoarse || narrow;
+}
+
+function detectBottomSheetPreferenceAtOpen(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  return detectCoarsePointerPreference() || window.innerWidth <= mobileBreakpointPx;
 }
 
 export type ModelPickerOption = {
@@ -50,6 +67,7 @@ function getSecondaryLabel(option: ModelPickerOption): string | null {
 function ModelPickerComponent({ options, value, onChange, disabled = false }: ModelPickerProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [useBottomSheet, setUseBottomSheet] = useState(() => detectBottomSheetPreference());
+  const [hasCoarsePointer, setHasCoarsePointer] = useState(() => detectCoarsePointerPreference());
   const [search, setSearch] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
 
@@ -98,6 +116,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
     const syncUseBottomSheet = () => {
       const pointerCoarse =
         pointerCoarseQuery.matches || hoverNoneAndPointerCoarseQuery.matches;
+      setHasCoarsePointer(pointerCoarse);
       setUseBottomSheet(pointerCoarse || narrowQuery.matches);
     };
 
@@ -211,7 +230,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
   }, [activeIndex, filteredOptions.length, isOpen]);
 
   useEffect(() => {
-    if (!isOpen || !useBottomSheet) {
+    if (!isOpen || !(useBottomSheet || hasCoarsePointer)) {
       return;
     }
 
@@ -220,7 +239,20 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
     return () => {
       document.body.style.overflow = previousOverflow;
     };
-  }, [isOpen, useBottomSheet]);
+  }, [hasCoarsePointer, isOpen, useBottomSheet]);
+
+  const handleTriggerClick = useCallback(() => {
+    if (isDisabled) {
+      return;
+    }
+
+    if (!isOpen) {
+      setHasCoarsePointer(detectCoarsePointerPreference());
+      setUseBottomSheet(detectBottomSheetPreferenceAtOpen());
+    }
+
+    setIsOpen((current) => !current);
+  }, [isDisabled, isOpen]);
 
   const closePicker = useCallback((focusTrigger: boolean) => {
     setIsOpen(false);
@@ -318,6 +350,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
 
   const activeOptionId =
     filteredOptions.length > 0 ? `${listboxId}-option-${activeIndex}` : undefined;
+  const shouldRenderBottomSheet = useBottomSheet || (isOpen && hasCoarsePointer);
 
   const optionsPanel = (
     <div className="chat-model-panel" onKeyDown={handlePanelKeyDown}>
@@ -394,12 +427,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
         ref={triggerRef}
         type="button"
         className={`chat-model-pill${isOpen ? ' is-open' : ''}`}
-        onClick={() => {
-          if (isDisabled) {
-            return;
-          }
-          setIsOpen((current) => !current);
-        }}
+        onClick={handleTriggerClick}
         disabled={isDisabled}
         aria-label="Select model"
         aria-haspopup="listbox"
@@ -417,7 +445,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
       </button>
 
       {isOpen ? (
-        useBottomSheet ? (
+        shouldRenderBottomSheet ? (
           <>
             <button
               type="button"

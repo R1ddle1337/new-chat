@@ -1374,7 +1374,7 @@ code {
 .chat-model-sheet-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 44;
+  z-index: 62;
   border: 0;
   background: rgba(17, 24, 39, 0.4);
   padding: 0;
@@ -1385,15 +1385,16 @@ code {
   left: 0;
   right: 0;
   bottom: 0;
-  z-index: 45;
+  z-index: 63;
   border-top: 1px solid #e0e5ef;
   border-radius: 18px 18px 0 0;
   background: #ffffff;
   box-shadow: 0 -12px 28px rgba(15, 23, 42, 0.18);
-  max-height: min(72vh, 520px);
+  max-height: min(70vh, 520px);
+  overflow: hidden;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  padding-bottom: max(0.58rem, env(safe-area-inset-bottom));
+  padding-bottom: calc(0.58rem + env(safe-area-inset-bottom));
 }
 
 .chat-model-sheet-header {
@@ -1422,6 +1423,21 @@ code {
 .chat-model-sheet-close:focus-visible {
   background: #eff3f9;
   border-color: #c8d1df;
+}
+
+.chat-model-sheet .chat-model-panel {
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.chat-model-sheet .chat-model-options {
+  max-height: none;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
 }
 
 .chat-header-error {
