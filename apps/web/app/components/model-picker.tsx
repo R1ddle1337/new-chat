@@ -168,6 +168,10 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
       return;
     }
 
+    if (shouldRenderBottomSheet) {
+      return;
+    }
+
     const frame = window.requestAnimationFrame(() => {
       searchInputRef.current?.focus();
     });
@@ -175,7 +179,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
     return () => {
       window.cancelAnimationFrame(frame);
     };
-  }, [isOpen]);
+  }, [isOpen, shouldRenderBottomSheet]);
 
   useEffect(() => {
     if (!isOpen || shouldRenderBottomSheet) {
