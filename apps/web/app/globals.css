@@ -1374,10 +1374,12 @@ code {
 .chat-model-sheet-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 62;
+  z-index: 1200;
   border: 0;
   background: rgba(17, 24, 39, 0.4);
   padding: 0;
+  pointer-events: auto;
+  touch-action: none;
 }
 
 .chat-model-sheet {
@@ -1385,16 +1387,19 @@ code {
   left: 0;
   right: 0;
   bottom: 0;
-  z-index: 63;
+  z-index: 1201;
   border-top: 1px solid #e0e5ef;
   border-radius: 18px 18px 0 0;
   background: #ffffff;
   box-shadow: 0 -12px 28px rgba(15, 23, 42, 0.18);
   max-height: min(70vh, 520px);
+  max-height: min(70dvh, 520px, calc(100dvh - env(safe-area-inset-top) - 0.5rem));
   overflow: hidden;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   padding-bottom: calc(0.58rem + env(safe-area-inset-bottom));
+  pointer-events: auto;
+  overscroll-behavior: contain;
 }
 
 .chat-model-sheet-header {
@@ -1438,6 +1443,8 @@ code {
   overflow-y: auto;
   overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
 }
 
 .chat-header-error {

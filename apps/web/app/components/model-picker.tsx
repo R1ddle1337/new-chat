@@ -10,6 +10,7 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
+import { createPortal } from 'react-dom';
 
 const mobileBreakpointPx = 980;
 
@@ -68,6 +69,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
   const [isOpen, setIsOpen] = useState(false);
   const [useBottomSheet, setUseBottomSheet] = useState(() => detectBottomSheetPreference());
   const [hasCoarsePointer, setHasCoarsePointer] = useState(() => detectCoarsePointerPreference());
+  const [portalRoot, setPortalRoot] = useState<HTMLElement | null>(null);
   const [search, setSearch] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
 
@@ -81,6 +83,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
 
   const hasOptions = options.length > 0;
   const isDisabled = disabled || !hasOptions;
+  const shouldRenderBottomSheet = useBottomSheet || (isOpen && hasCoarsePointer);
 
   const selectedOption = useMemo(() => {
     return options.find((option) => option.id === value) ?? null;
@@ -152,6 +155,14 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
   }, []);
 
   useEffect(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+
+    setPortalRoot(document.body);
+  }, []);
+
+  useEffect(() => {
     if (!isOpen) {
       setSearch('');
       return;
@@ -167,7 +178,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
   }, [isOpen]);
 
   useEffect(() => {
-    if (!isOpen) {
+    if (!isOpen || shouldRenderBottomSheet) {
       return;
     }
 
@@ -200,7 +211,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
       window.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [isOpen]);
+  }, [isOpen, shouldRenderBottomSheet]);
 
   useEffect(() => {
     if (isDisabled && isOpen) {
@@ -230,7 +241,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
   }, [activeIndex, filteredOptions.length, isOpen]);
 
   useEffect(() => {
-    if (!isOpen || !(useBottomSheet || hasCoarsePointer)) {
+    if (!isOpen || !shouldRenderBottomSheet) {
       return;
     }
 
@@ -239,7 +250,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
     return () => {
       document.body.style.overflow = previousOverflow;
     };
-  }, [hasCoarsePointer, isOpen, useBottomSheet]);
+  }, [isOpen, shouldRenderBottomSheet]);
 
   const handleTriggerClick = useCallback(() => {
     if (isDisabled) {
@@ -350,7 +361,6 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
 
   const activeOptionId =
     filteredOptions.length > 0 ? `${listboxId}-option-${activeIndex}` : undefined;
-  const shouldRenderBottomSheet = useBottomSheet || (isOpen && hasCoarsePointer);
 
   const optionsPanel = (
     <div className="chat-model-panel" onKeyDown={handlePanelKeyDown}>
@@ -421,6 +431,26 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
     </div>
   );
 
+  const bottomSheetContent = (
+    <>
+      <button
+        type="button"
+        className="chat-model-sheet-backdrop"
+        onClick={() => closePicker(true)}
+        aria-label="Close model picker"
+      />
+      <section className="chat-model-sheet" role="dialog" aria-modal="true" aria-label="Select model">
+        <header className="chat-model-sheet-header">
+          <strong>Select model</strong>
+          <button type="button" className="chat-model-sheet-close" onClick={() => closePicker(true)}>
+            Done
+          </button>
+        </header>
+        {optionsPanel}
+      </section>
+    </>
+  );
+
   return (
     <div className="chat-model-picker" ref={rootRef}>
       <button
@@ -446,32 +476,9 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
 
       {isOpen ? (
         shouldRenderBottomSheet ? (
-          <>
-            <button
-              type="button"
-              className="chat-model-sheet-backdrop"
-              onClick={() => closePicker(true)}
-              aria-label="Close model picker"
-            />
-            <section
-              className="chat-model-sheet"
-              role="dialog"
-              aria-modal="true"
-              aria-label="Select model"
-            >
-              <header className="chat-model-sheet-header">
-                <strong>Select model</strong>
-                <button
-                  type="button"
-                  className="chat-model-sheet-close"
-                  onClick={() => closePicker(true)}
-                >
-                  Done
-                </button>
-              </header>
-              {optionsPanel}
-            </section>
-          </>
+          portalRoot
+            ? createPortal(bottomSheetContent, portalRoot)
+            : bottomSheetContent
         ) : (
           <div className="chat-model-popover">{optionsPanel}</div>
         )
