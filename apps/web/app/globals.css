@@ -195,6 +195,8 @@ code {
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
+  position: relative;
+  z-index: 1;
 }
 
 .sidebar-brand {
@@ -232,6 +234,10 @@ code {
   background: transparent;
   border-color: var(--border);
   color: var(--muted);
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+  touch-action: manipulation;
 }
 
 .sidebar-new-chat {
@@ -2223,6 +2229,7 @@ code {
     transform: translateX(calc(-100% - 14px));
     transition: transform var(--motion-duration-slow) var(--motion-ease);
     box-shadow: 8px 0 28px rgba(16, 24, 40, 0.16);
+    z-index: 40;
   }
 
   .app-shell.mobile-open .app-sidebar {
@@ -2248,7 +2255,7 @@ code {
     border: 0;
     padding: 0;
     background: rgba(17, 17, 17, 0.42);
-    z-index: 26;
+    z-index: 35;
     opacity: 0;
     visibility: hidden;
     pointer-events: none;

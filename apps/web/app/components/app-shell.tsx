@@ -14,6 +14,15 @@ function AppShellChrome({ children }: AppShellProps) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
 
+  const handleSidebarToggle = () => {
+    if (window.matchMedia('(max-width: 980px)').matches) {
+      setMobileOpen(false);
+      return;
+    }
+
+    setSidebarCollapsed((current) => !current);
+  };
+
   useEffect(() => {
     setMobileOpen(false);
   }, [pathname]);
@@ -44,7 +53,7 @@ function AppShellChrome({ children }: AppShellProps) {
         mobileOpen={mobileOpen}
         onOpenMobile={() => setMobileOpen(true)}
         onCloseMobile={() => setMobileOpen(false)}
-        onToggleCollapse={() => setSidebarCollapsed((current) => !current)}
+        onToggleCollapse={handleSidebarToggle}
       />
 
       <div className="app-main">
