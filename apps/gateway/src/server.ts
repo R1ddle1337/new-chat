@@ -3606,6 +3606,16 @@ function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
+function normalizeReadableText(value: string): string {
+  return value
+    .replace(/\r/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t\f\v]+/g, ' ')
+    .replace(/[ \t]*\n[ \t]*/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function decodeHtmlEntities(value: string): string {
   const named: Record<string, string> = {
     amp: '&',
@@ -3646,18 +3656,297 @@ function stripHtmlToText(html: string, maxChars = AGENT_MAX_HTML_TO_TEXT_CHARS):
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ');
   const withoutComments = withoutScriptAndStyle.replace(/<!--[\s\S]*?-->/g, ' ');
-  const withBreakHints = withoutComments.replace(
-    /<\/(p|div|li|h1|h2|h3|h4|h5|h6|tr|section|article|br)>/gi,
-    '\n',
-  );
+  const withBreakHints = withoutComments
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|h1|h2|h3|h4|h5|h6|tr|section|article|main|blockquote|pre|ul|ol|table)>/gi, '\n');
   const plain = withBreakHints.replace(/<[^>]+>/g, ' ');
   const decoded = decodeHtmlEntities(plain);
-  const collapsed = decoded
-    .replace(/\r/g, '\n')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  const collapsed = normalizeReadableText(decoded);
   return truncateText(collapsed, maxChars);
+}
+
+type HtmlReadableExtraction = {
+  text: string;
+  source: 'main_candidate' | 'paragraph_fallback' | 'body_fallback' | 'no_content';
+};
+
+type HtmlContentCandidate = {
+  score: number;
+  text: string;
+};
+
+const htmlNoiseHintPattern =
+  /\b(nav|menu|footer|header|sidebar|cookie|consent|banner|modal|popup|subscribe|newsletter|social|share|comment|breadcrumb|related|recommend|promo|sponsor|advert|ads?|toolbar|pagination|pager)\b/i;
+const htmlPositiveHintPattern =
+  /\b(article|content|main|post|entry|story|body|text|read|markdown|prose)\b/i;
+const htmlPositiveHintGlobalPattern =
+  /\b(article|content|main|post|entry|story|body|text|read|markdown|prose)\b/gi;
+const htmlNegativeHintGlobalPattern =
+  /\b(nav|menu|footer|header|sidebar|cookie|consent|banner|modal|popup|subscribe|newsletter|social|share|comment|breadcrumb|related|recommend|promo|sponsor|advert|ads?|toolbar|pagination|pager)\b/gi;
+
+function parseHtmlAttributes(raw: string): Record<string, string> {
+  const attributes: Record<string, string> = {};
+  const pattern = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*("([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+  let match = pattern.exec(raw);
+  while (match) {
+    const key = (match[1] ?? '').toLowerCase();
+    const value = match[3] ?? match[4] ?? match[5] ?? '';
+    if (key) {
+      attributes[key] = decodeHtmlEntities(value).trim();
+    }
+    match = pattern.exec(raw);
+  }
+  return attributes;
+}
+
+function extractDocumentTitle(html: string): string {
+  const metaPattern = /<meta\b([^>]*)>/gi;
+  let metaMatch = metaPattern.exec(html);
+  while (metaMatch) {
+    const attrs = parseHtmlAttributes(metaMatch[1] ?? '');
+    const label = (attrs.property ?? attrs.name ?? '').trim().toLowerCase();
+    if ((label === 'og:title' || label === 'twitter:title') && attrs.content) {
+      const title = normalizeWhitespace(attrs.content);
+      if (title) {
+        return title;
+      }
+    }
+    metaMatch = metaPattern.exec(html);
+  }
+
+  const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  if (!titleMatch?.[1]) {
+    return '';
+  }
+
+  return normalizeWhitespace(stripHtmlToText(titleMatch[1], 280));
+}
+
+function stripNonContentHtml(html: string): string {
+  let cleaned = html
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(
+      /<(script|style|noscript|template|svg|canvas|iframe|object|embed|picture|source|video|audio|form|button|input|select|textarea)\b[^>]*>[\s\S]*?<\/\1>/gi,
+      ' ',
+    )
+    .replace(
+      /<(script|style|noscript|template|svg|canvas|iframe|object|embed|picture|source|video|audio|form|button|input|select|textarea)\b[^>]*\/>/gi,
+      ' ',
+    )
+    .replace(/<(nav|footer|header|aside)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ');
+
+  const noisyContainerPattern = /<(div|section|aside|nav|footer|header|ul|ol)\b([^>]*)>[\s\S]*?<\/\1>/gi;
+  for (let pass = 0; pass < 3; pass += 1) {
+    const next = cleaned.replace(noisyContainerPattern, (full, _tag: string, attrsRaw: string) => {
+      const attrsLower = (attrsRaw ?? '').toLowerCase();
+      if (htmlNoiseHintPattern.test(attrsLower) && !htmlPositiveHintPattern.test(attrsLower)) {
+        return ' ';
+      }
+      return full;
+    });
+    if (next === cleaned) {
+      break;
+    }
+    cleaned = next;
+  }
+
+  return cleaned;
+}
+
+function extractLinkTextLength(html: string): number {
+  const links = html.match(/<a\b[^>]*>[\s\S]*?<\/a>/gi);
+  if (!links?.length) {
+    return 0;
+  }
+  return stripHtmlToText(links.join('\n'), AGENT_MAX_HTML_TO_TEXT_CHARS).length;
+}
+
+function scoreHtmlContentCandidate(tag: string, attrsRaw: string, innerHtml: string): HtmlContentCandidate | null {
+  const text = stripHtmlToText(innerHtml, AGENT_MAX_HTML_TO_TEXT_CHARS);
+  if (text.length < 120) {
+    return null;
+  }
+
+  const attrsLower = attrsRaw.toLowerCase();
+  const positiveHints = attrsLower.match(htmlPositiveHintGlobalPattern)?.length ?? 0;
+  const negativeHints = attrsLower.match(htmlNegativeHintGlobalPattern)?.length ?? 0;
+  const linkTextLength = extractLinkTextLength(innerHtml);
+  const linkDensity = linkTextLength / Math.max(text.length, 1);
+  const sentenceCount = text.match(/[.!?](?:\s|$)/g)?.length ?? 0;
+  const paragraphCount = text.split(/\n{2,}/).filter((line) => line.trim().length > 0).length;
+
+  let score = 0;
+  if (tag === 'article') {
+    score += 80;
+  } else if (tag === 'main') {
+    score += 70;
+  } else if (tag === 'section') {
+    score += 24;
+  } else {
+    score += 12;
+  }
+
+  score += Math.min(text.length, 9_000) / 38;
+  score += Math.min(sentenceCount, 70) * 2.4;
+  score += Math.min(paragraphCount, 40) * 5;
+  score += positiveHints * 18;
+  score -= negativeHints * 24;
+  score -= linkDensity * 130;
+
+  if (linkDensity > 0.55) {
+    score -= 80;
+  }
+  if (text.length < 260) {
+    score -= 35;
+  }
+
+  return { score, text };
+}
+
+function collectHtmlContentCandidates(html: string): HtmlContentCandidate[] {
+  const candidates: HtmlContentCandidate[] = [];
+
+  const collect = (pattern: RegExp, requirePositiveHint: boolean): void => {
+    let match = pattern.exec(html);
+    while (match && candidates.length < 350) {
+      const tag = (match[1] ?? '').toLowerCase();
+      const attrsRaw = match[2] ?? '';
+      const innerHtml = match[3] ?? '';
+      const attrsLower = attrsRaw.toLowerCase();
+
+      if (innerHtml.length < 80) {
+        match = pattern.exec(html);
+        continue;
+      }
+      if (requirePositiveHint && !htmlPositiveHintPattern.test(attrsLower) && !/<(p|h1|h2|h3)\b/i.test(innerHtml)) {
+        match = pattern.exec(html);
+        continue;
+      }
+
+      const scored = scoreHtmlContentCandidate(tag, attrsRaw, innerHtml);
+      if (scored) {
+        candidates.push(scored);
+      }
+      match = pattern.exec(html);
+    }
+  };
+
+  collect(/<(article|main)\b([^>]*)>([\s\S]*?)<\/\1>/gi, false);
+  collect(/<(section|div)\b([^>]*)>([\s\S]*?)<\/\1>/gi, true);
+
+  return candidates;
+}
+
+function extractParagraphFallback(html: string, maxChars: number): string {
+  const fragments: string[] = [];
+  let totalChars = 0;
+
+  const h1Match = /<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html);
+  if (h1Match?.[1]) {
+    const heading = normalizeWhitespace(stripHtmlToText(h1Match[1], 260));
+    if (heading) {
+      fragments.push(heading);
+      totalChars += heading.length;
+    }
+  }
+
+  const paragraphPattern = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
+  let paragraphMatch = paragraphPattern.exec(html);
+  while (paragraphMatch && totalChars < maxChars) {
+    const attrsLower = (paragraphMatch[1] ?? '').toLowerCase();
+    const rawParagraph = paragraphMatch[2] ?? '';
+
+    if (htmlNoiseHintPattern.test(attrsLower)) {
+      paragraphMatch = paragraphPattern.exec(html);
+      continue;
+    }
+
+    const paragraph = normalizeReadableText(stripHtmlToText(rawParagraph, Math.min(6_000, maxChars)));
+    if (paragraph.length < 50) {
+      paragraphMatch = paragraphPattern.exec(html);
+      continue;
+    }
+
+    const linkDensity = extractLinkTextLength(rawParagraph) / Math.max(paragraph.length, 1);
+    if (linkDensity > 0.45) {
+      paragraphMatch = paragraphPattern.exec(html);
+      continue;
+    }
+
+    const projectedChars = totalChars + paragraph.length + 2;
+    if (projectedChars > maxChars && fragments.length > 0) {
+      break;
+    }
+
+    fragments.push(paragraph);
+    totalChars = projectedChars;
+    if (fragments.length >= 80) {
+      break;
+    }
+
+    paragraphMatch = paragraphPattern.exec(html);
+  }
+
+  return truncateText(normalizeReadableText(fragments.join('\n\n')), maxChars);
+}
+
+function prependTitleIfMissing(title: string, bodyText: string, maxChars: number): string {
+  const normalizedTitle = normalizeWhitespace(title);
+  const normalizedBody = normalizeReadableText(bodyText);
+
+  if (!normalizedTitle) {
+    return truncateText(normalizedBody, maxChars);
+  }
+  if (!normalizedBody) {
+    return truncateText(normalizedTitle, maxChars);
+  }
+  if (normalizedBody.toLowerCase().startsWith(normalizedTitle.toLowerCase())) {
+    return truncateText(normalizedBody, maxChars);
+  }
+
+  return truncateText(`${normalizedTitle}\n\n${normalizedBody}`, maxChars);
+}
+
+function extractReadableHtmlContent(
+  html: string,
+  maxChars = AGENT_MAX_HTML_TO_TEXT_CHARS,
+): HtmlReadableExtraction {
+  const title = extractDocumentTitle(html);
+  const cleanedHtml = stripNonContentHtml(html);
+  const candidates = collectHtmlContentCandidates(cleanedHtml);
+  const bestCandidate = candidates.sort((left, right) => right.score - left.score)[0] ?? null;
+
+  if (bestCandidate && bestCandidate.score >= 45 && bestCandidate.text.length >= 220) {
+    return {
+      text: prependTitleIfMissing(title, bestCandidate.text, maxChars),
+      source: 'main_candidate',
+    };
+  }
+
+  const paragraphFallback = extractParagraphFallback(cleanedHtml, maxChars);
+  if (paragraphFallback.length >= 140) {
+    return {
+      text: prependTitleIfMissing(title, paragraphFallback, maxChars),
+      source: 'paragraph_fallback',
+    };
+  }
+
+  const bodyMatch = /<body\b[^>]*>([\s\S]*?)<\/body>/i.exec(cleanedHtml);
+  const bodyText = stripHtmlToText(bodyMatch?.[1] ?? cleanedHtml, maxChars);
+  if (bodyText.length >= 120) {
+    return {
+      text: prependTitleIfMissing(title, bodyText, maxChars),
+      source: 'body_fallback',
+    };
+  }
+
+  const fallbackMessage = title
+    ? `${title}\n\n[Readable page content not found. The page may require JavaScript.]`
+    : '[Readable page content not found. The page may require JavaScript.]';
+  return {
+    text: truncateText(fallbackMessage, maxChars),
+    source: 'no_content',
+  };
 }
 
 function isPrivateIpAddress(value: string): boolean {
@@ -3979,11 +4268,16 @@ async function runWebFetchTool(urlRaw: string): Promise<{
 
   const contentType = response.contentType.toLowerCase();
   const isHtml = contentType.includes('text/html') || response.bodyText.includes('<html');
-  const extractedText = isHtml
-    ? stripHtmlToText(response.bodyText, AGENT_MAX_HTML_TO_TEXT_CHARS)
-    : truncateText(response.bodyText, AGENT_MAX_HTML_TO_TEXT_CHARS);
-  const cleanedText = normalizeWhitespace(extractedText.replace(/\n{3,}/g, '\n\n'));
-  const finalText = cleanedText || '[no readable text found]';
+  let extractedText = '';
+  let extractionSource = 'plain_text';
+  if (isHtml) {
+    const extraction = extractReadableHtmlContent(response.bodyText, AGENT_MAX_HTML_TO_TEXT_CHARS);
+    extractedText = extraction.text;
+    extractionSource = extraction.source;
+  } else {
+    extractedText = truncateText(normalizeReadableText(response.bodyText), AGENT_MAX_HTML_TO_TEXT_CHARS);
+  }
+  const finalText = extractedText || '[no readable text found]';
 
   return {
     summary: `Fetched ${response.url}`,
@@ -3996,6 +4290,7 @@ async function runWebFetchTool(urlRaw: string): Promise<{
       status: response.status,
       content_type: response.contentType,
       extracted_chars: finalText.length,
+      extraction_source: extractionSource,
     },
   };
 }
