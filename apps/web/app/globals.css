@@ -1177,6 +1177,7 @@ code {
   justify-content: flex-end;
   width: 100%;
   min-width: 0;
+  gap: 0.5rem;
 }
 
 .chat-model-picker {
@@ -2300,36 +2301,37 @@ code {
   }
 
   .chat-page .main-header {
-    align-items: stretch;
+    align-items: center;
+    min-height: calc(env(safe-area-inset-top) + 3.24rem);
   }
 
   .chat-page .main-header-text {
     display: none;
   }
 
-  .chat-page .main-header-text p {
-    display: none;
-  }
-
   .chat-page .main-header-right {
-    width: 100%;
+    width: auto;
+    min-width: 0;
+    flex: 1 1 auto;
+    justify-items: start;
   }
 
   .chat-page {
     --chat-jump-bottom-offset: 5.65rem;
   }
 
-  .chat-header-controls {
+  .chat-page .chat-header-controls {
+    width: auto;
     justify-content: flex-start;
   }
 
-  .chat-model-picker {
-    width: 100%;
-    max-width: none;
+  .chat-page .chat-model-picker {
+    width: clamp(152px, 58vw, 320px);
+    max-width: min(72vw, 320px);
   }
 
-  .chat-model-pill {
-    min-height: 2.25rem;
+  .chat-page .chat-model-pill {
+    min-height: 2.16rem;
   }
 
   .page-stack {
@@ -2337,8 +2339,11 @@ code {
   }
 
   .chat-header-error {
+    padding-top: 0.34rem;
     padding-left: 0.9rem;
     padding-right: 0.9rem;
+    font-size: 0.82rem;
+    line-height: 1.32;
   }
 
   .chat-messages-scroll {
@@ -2442,8 +2447,16 @@ code {
     gap: 0.5rem;
   }
 
-  .chat-header-controls {
+  .chat-page .main-header {
+    min-height: calc(env(safe-area-inset-top) + 3.08rem);
+  }
+
+  .chat-page .chat-header-controls {
     gap: 0.44rem;
+  }
+
+  .chat-page .chat-model-picker {
+    max-width: min(74vw, 300px);
   }
 
   .chat-model-pill-label {

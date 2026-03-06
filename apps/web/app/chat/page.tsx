@@ -2654,6 +2654,12 @@ export default function ChatPage() {
   const showHomeState = !selectedThreadId || (!messagesLoading && messages.length === 0);
   const latestAssistantId = latestAssistantWithSourceUser?.assistant.id ?? null;
   const canRegenerateLatestAssistant = Boolean(latestAssistantWithSourceUser?.sourceUser);
+  const showModelConfigError = allowedModels.length === 0;
+  const headerSubtitle = isMobileViewport
+    ? undefined
+    : showHomeState
+      ? 'Start a conversation'
+      : 'Conversation';
 
   const chatHeaderControls = (
     <div className="chat-header-controls">
@@ -2933,12 +2939,14 @@ export default function ChatPage() {
     <section className="chat-page app-page">
       <MainHeader
         title={selectedThread?.title ?? 'New chat'}
-        subtitle={showHomeState ? 'Start a conversation' : 'Conversation'}
+        subtitle={headerSubtitle}
         right={chatHeaderControls}
       />
 
-      {allowedModels.length === 0 ? (
-        <p className="error chat-header-error">No allowed models are configured by admin.</p>
+      {showModelConfigError ? (
+        <p className="error chat-header-error" role="status" aria-live="polite">
+          No allowed models are configured by admin.
+        </p>
       ) : null}
 
       {showHomeState ? (
