@@ -1424,6 +1424,7 @@ export default function ChatPage() {
   const streamRenderedAssistantTextRef = useRef('');
   const streamFlushFrameRef = useRef<number | null>(null);
   const streamLastFlushAtRef = useRef(0);
+  const skipNextThreadResetRef = useRef(false);
 
   const [loading, setLoading] = useState(true);
   const [messagesLoading, setMessagesLoading] = useState(false);
@@ -1969,6 +1970,13 @@ export default function ChatPage() {
   useEffect(() => {
     let cancelled = false;
 
+    if (skipNextThreadResetRef.current) {
+      skipNextThreadResetRef.current = false;
+      return () => {
+        cancelled = true;
+      };
+    }
+
     shouldAutoScrollRef.current = true;
     isAtBottomRef.current = true;
     userPausedAutoScrollRef.current = false;
@@ -2099,7 +2107,13 @@ export default function ChatPage() {
     }
 
     scheduleAutoScrollStateSync();
-  }, [messages, scheduleAutoScrollIfNeeded, scheduleAutoScrollStateSync, streamingAssistantContent]);
+  }, [
+    agentProgressItems,
+    messages,
+    scheduleAutoScrollIfNeeded,
+    scheduleAutoScrollStateSync,
+    streamingAssistantContent,
+  ]);
 
   useEffect(() => {
     adjustComposerHeight();
@@ -2528,6 +2542,9 @@ export default function ChatPage() {
         const responseThreadId = res.headers.get('x-thread-id');
         if (responseThreadId) {
           latestThreadId = responseThreadId;
+          if (!params.threadId) {
+            skipNextThreadResetRef.current = true;
+          }
           selectThread(responseThreadId);
         }
 
@@ -2910,6 +2927,7 @@ export default function ChatPage() {
   const latestAssistantId = latestAssistantWithSourceUser?.assistant.id ?? null;
   const canRegenerateLatestAssistant = Boolean(latestAssistantWithSourceUser?.sourceUser);
   const showModelConfigError = allowedModels.length === 0;
+  const showAgentProgress = chatMode === 'agent' && generationActive && agentProgressItems.length > 0;
   const modeTitle = chatMode === 'agent' ? 'Agent mode' : 'Chat mode';
   const headerSubtitle = isMobileViewport
     ? undefined
@@ -3177,8 +3195,9 @@ export default function ChatPage() {
         </div>
       ) : null}
 
-      {chatMode === 'agent' && generationActive && agentProgressItems.length > 0 ? (
-        <div className="chat-agent-progress">
+      {showAgentProgress && showHomeState ? (
+        <div className="chat-agent-progress" role="status" aria-live="polite">
+          <p className="chat-agent-progress-title">Agent activity</p>
           {agentProgressItems.map((item, index) => (
             <p key={`${item}-${index}`}>{item}</p>
           ))}
@@ -3295,6 +3314,19 @@ export default function ChatPage() {
                   />
                 );
               })}
+
+              {showAgentProgress ? (
+                <div className="chat-message-row assistant chat-agent-progress-row">
+                  <div className="chat-message-inner">
+                    <div className="chat-agent-progress chat-agent-progress-inline" role="status" aria-live="polite">
+                      <p className="chat-agent-progress-title">Agent activity</p>
+                      {agentProgressItems.map((item, index) => (
+                        <p key={`${item}-${index}`}>{item}</p>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
             </div>
 
             {showJumpToLatest && messages.length > 0 ? (
