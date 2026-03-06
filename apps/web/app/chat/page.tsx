@@ -73,6 +73,7 @@ const mobileComposerMaxHeightPx = 160;
 const desktopComposerMaxHeightPx = 220;
 const chatModelStorageKey = 'nchat_last_model';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const supportedImageExtensions = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic', 'heif']);
 const supportedDocumentMimeTypes = new Set(['text/plain', 'text/markdown', 'application/pdf']);
 const supportedDocumentExtensions = new Set(['txt', 'md', 'pdf']);
 const userMessagePlaceholderPattern = /^\[(?:image|images|file|files|attachments|non-text input)\]$/i;
@@ -1050,6 +1051,8 @@ function makeLocalMessageId(prefix: string): string {
 function imageFileExtensionFromMimeType(mimeType: string): string {
   switch (mimeType.toLowerCase()) {
     case 'image/jpeg':
+    case 'image/jpg':
+    case 'image/pjpeg':
       return 'jpg';
     case 'image/gif':
       return 'gif';
@@ -1066,23 +1069,8 @@ function imageFileExtensionFromMimeType(mimeType: string): string {
   }
 }
 
-function normalizePastedImageFile(file: File): File {
-  if (file.name && file.name.trim().length > 0) {
-    return file;
-  }
-
-  const mimeType = file.type || 'image/png';
-  const extension = imageFileExtensionFromMimeType(mimeType);
-  const now = Date.now();
-
-  return new File([file], `pasted-image-${now}.${extension}`, {
-    type: mimeType,
-    lastModified: now,
-  });
-}
-
-function isImageFile(file: File): boolean {
-  return file.type.startsWith('image/');
+function isImageMimeType(mimeType: string | null | undefined): boolean {
+  return typeof mimeType === 'string' && mimeType.toLowerCase().startsWith('image/');
 }
 
 function getFileExtension(fileName: string): string {
@@ -1091,6 +1079,73 @@ function getFileExtension(fileName: string): string {
     return '';
   }
   return fileName.slice(index + 1).toLowerCase();
+}
+
+function inferImageMimeType(fileName: string): string | null {
+  const extension = getFileExtension(fileName);
+  if (extension === 'jpg' || extension === 'jpeg') {
+    return 'image/jpeg';
+  }
+  if (extension === 'png') {
+    return 'image/png';
+  }
+  if (extension === 'webp') {
+    return 'image/webp';
+  }
+  if (extension === 'gif') {
+    return 'image/gif';
+  }
+  if (extension === 'bmp') {
+    return 'image/bmp';
+  }
+  if (extension === 'heic') {
+    return 'image/heic';
+  }
+  if (extension === 'heif') {
+    return 'image/heif';
+  }
+  return null;
+}
+
+function normalizeImageUploadFile(file: File, mimeTypeHint?: string): File {
+  const now = Date.now();
+  const normalizedMimeType = file.type.toLowerCase();
+  const normalizedMimeTypeHint = mimeTypeHint?.toLowerCase() ?? '';
+  const inferredMimeType = inferImageMimeType(file.name);
+
+  let mimeType = normalizedMimeType;
+  if (!isImageMimeType(mimeType)) {
+    if (inferredMimeType) {
+      mimeType = inferredMimeType;
+    } else if (isImageMimeType(normalizedMimeTypeHint)) {
+      mimeType = normalizedMimeTypeHint;
+    } else if (!mimeType) {
+      mimeType = 'image/png';
+    }
+  }
+
+  const hasName = file.name && file.name.trim().length > 0;
+  const fileName = hasName
+    ? file.name
+    : `pasted-image-${now}.${imageFileExtensionFromMimeType(mimeType || 'image/png')}`;
+
+  if (fileName === file.name && mimeType === file.type) {
+    return file;
+  }
+
+  return new File([file], fileName, {
+    type: mimeType,
+    lastModified: file.lastModified || now,
+  });
+}
+
+function isImageFile(file: File): boolean {
+  if (isImageMimeType(file.type)) {
+    return true;
+  }
+
+  const extension = getFileExtension(file.name);
+  return extension.length > 0 && supportedImageExtensions.has(extension);
 }
 
 function inferDocumentMimeType(fileName: string): string | null {
@@ -1355,19 +1410,49 @@ export default function ChatPage() {
 
   const appendSelectedFiles = useCallback(
     (nextFiles: File[]) => {
-      const imageFiles = nextFiles.filter((file) => isImageFile(file));
-      const docFiles = nextFiles
-        .filter((file) => !isImageFile(file) && isDocumentFile(file))
-        .map((file) => normalizeDocumentUploadFile(file));
+      const imageFiles: File[] = [];
+      const docFiles: File[] = [];
+      const unclassifiedFiles: File[] = [];
+
+      for (const file of nextFiles) {
+        if (isImageFile(file)) {
+          imageFiles.push(normalizeImageUploadFile(file));
+          continue;
+        }
+
+        if (isDocumentFile(file)) {
+          docFiles.push(normalizeDocumentUploadFile(file));
+          continue;
+        }
+
+        unclassifiedFiles.push(file);
+      }
 
       appendImages(imageFiles);
       appendDocs(docFiles);
+
+      if (unclassifiedFiles.length > 0) {
+        const hasAmbiguousFile = unclassifiedFiles.some(
+          (file) => file.type.trim().length === 0 && getFileExtension(file.name).length === 0,
+        );
+        if (hasAmbiguousFile) {
+          pushToast(
+            'error',
+            'Could not identify one or more files. Use image extensions (.jpg, .jpeg, .png, .webp, .gif, .bmp, .heic, .heif) or .pdf/.txt/.md.',
+          );
+        } else {
+          pushToast(
+            'error',
+            'Unsupported file type. Upload images (.jpg, .jpeg, .png, .webp, .gif, .bmp, .heic, .heif) or documents (.pdf, .txt, .md).',
+          );
+        }
+      }
 
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
     },
-    [appendDocs, appendImages],
+    [appendDocs, appendImages, pushToast],
   );
 
   const removeImageAtIndex = useCallback((indexToRemove: number) => {
@@ -1398,12 +1483,12 @@ export default function ChatPage() {
 
       const pastedImages: File[] = [];
       const seenPastedSignatures = new Set<string>();
-      const addPastedImage = (file: File): boolean => {
-        if (!isImageFile(file)) {
+      const addPastedImage = (file: File, mimeTypeHint?: string): boolean => {
+        if (!isImageFile(file) && !isImageMimeType(mimeTypeHint)) {
           return false;
         }
 
-        const normalized = normalizePastedImageFile(file);
+        const normalized = normalizeImageUploadFile(file, mimeTypeHint);
         const signature = `${normalized.name}:${normalized.size}:${normalized.lastModified}:${normalized.type}`;
         if (seenPastedSignatures.has(signature)) {
           return false;
@@ -1425,7 +1510,7 @@ export default function ChatPage() {
           if (!rawFile) {
             continue;
           }
-          if (addPastedImage(rawFile)) {
+          if (addPastedImage(rawFile, item.type)) {
             addedImageFromItems = true;
           }
         }
@@ -2785,7 +2870,7 @@ export default function ChatPage() {
           ref={fileInputRef}
           className="sr-only"
           type="file"
-          accept="image/*,.pdf,.txt,.md,text/plain,text/markdown,application/pdf"
+          accept="image/*,.heic,.heif,.pdf,.txt,.md,text/plain,text/markdown,application/pdf"
           multiple
           disabled={sending || editingActive}
           onChange={(event) => {
