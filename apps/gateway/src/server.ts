@@ -3,6 +3,12 @@ import multipart from '@fastify/multipart';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import { lookup as dnsLookup } from 'node:dns/promises';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { PassThrough, Readable } from 'node:stream';
 import { inflateSync } from 'node:zlib';
 import { Client as MinioClient } from 'minio';
@@ -169,6 +175,23 @@ type MessageCursor = {
   id: string;
 };
 
+type AgentToolName = 'web_search' | 'web_fetch' | 'python';
+
+type AgentRunStatus = 'running' | 'completed' | 'failed';
+
+type AgentProgressEvent = {
+  kind: 'info' | 'tool_start' | 'tool_result' | 'error';
+  message: string;
+  step?: number;
+  tool?: AgentToolName;
+  metadata?: Record<string, unknown>;
+};
+
+type AgentRunRow = {
+  id: string;
+  status: AgentRunStatus;
+};
+
 declare module 'fastify' {
   interface FastifyRequest {
     authUser?: DbUser;
@@ -187,17 +210,46 @@ function parseEnvToggle(rawValue: string | undefined): boolean {
   return truthyEnvValues.has(rawValue.trim().toLowerCase());
 }
 
+function parseEnvPositiveInteger(
+  rawValue: string | undefined,
+  fallback: number,
+  options?: { min?: number; max?: number },
+): number {
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  let normalized = Math.floor(parsed);
+  if (normalized <= 0) {
+    return fallback;
+  }
+
+  if (typeof options?.min === 'number' && normalized < options.min) {
+    normalized = options.min;
+  }
+
+  if (typeof options?.max === 'number' && normalized > options.max) {
+    normalized = options.max;
+  }
+
+  return normalized;
+}
+
 const config = {
   host: process.env.HOST ?? '0.0.0.0',
-  port: Number(process.env.PORT ?? 3001),
+  port: parseEnvPositiveInteger(process.env.PORT, 3001),
   databaseUrl: process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/newchat',
   redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
   appOrigin: process.env.APP_ORIGIN ?? 'http://localhost:3000',
   sessionCookieName: process.env.SESSION_COOKIE_NAME ?? 'nc_session',
-  sessionTtlSeconds: Number(process.env.SESSION_TTL_SECONDS ?? 60 * 60 * 24 * 7),
-  authRateLimitPerMinute: Number(process.env.AUTH_RATE_LIMIT_PER_MIN ?? 30),
+  sessionTtlSeconds: parseEnvPositiveInteger(
+    process.env.SESSION_TTL_SECONDS,
+    60 * 60 * 24 * 7,
+  ),
+  authRateLimitPerMinute: parseEnvPositiveInteger(process.env.AUTH_RATE_LIMIT_PER_MIN, 30),
   minioEndpoint: process.env.MINIO_ENDPOINT ?? 'localhost',
-  minioPort: Number(process.env.MINIO_PORT ?? 9000),
+  minioPort: parseEnvPositiveInteger(process.env.MINIO_PORT, 9000),
   minioUseSsl: process.env.MINIO_USE_SSL === 'true',
   minioAccessKey: process.env.MINIO_ACCESS_KEY ?? 'minioadmin',
   minioSecretKey: process.env.MINIO_SECRET_KEY ?? 'minioadmin',
@@ -210,12 +262,51 @@ const config = {
   oauthGoogleRedirectUri: (process.env.OAUTH_GOOGLE_REDIRECT_URI ?? '').trim(),
   disablePasswordRegister: parseEnvToggle(process.env.DISABLE_PASSWORD_REGISTER),
   disablePasswordLogin: parseEnvToggle(process.env.DISABLE_PASSWORD_LOGIN),
-  abuseThrottleDurationMinutes: Number(process.env.ABUSE_THROTTLE_DURATION_MINUTES ?? 20),
-  abuseBanDurationMinutes: Number(process.env.ABUSE_TEMP_BAN_DURATION_MINUTES ?? 60),
-  abuseThrottleScoreThreshold: Number(process.env.ABUSE_THROTTLE_SCORE_THRESHOLD ?? 55),
-  abuseBanScoreThreshold: Number(process.env.ABUSE_BAN_SCORE_THRESHOLD ?? 95),
-  abuseStreamConcurrencyLimit: Number(process.env.ABUSE_STREAM_CONCURRENCY_LIMIT ?? 2),
+  abuseThrottleDurationMinutes: parseEnvPositiveInteger(
+    process.env.ABUSE_THROTTLE_DURATION_MINUTES,
+    20,
+  ),
+  abuseBanDurationMinutes: parseEnvPositiveInteger(process.env.ABUSE_TEMP_BAN_DURATION_MINUTES, 60),
+  abuseThrottleScoreThreshold: parseEnvPositiveInteger(
+    process.env.ABUSE_THROTTLE_SCORE_THRESHOLD,
+    55,
+  ),
+  abuseBanScoreThreshold: parseEnvPositiveInteger(process.env.ABUSE_BAN_SCORE_THRESHOLD, 95),
+  abuseStreamConcurrencyLimit: parseEnvPositiveInteger(process.env.ABUSE_STREAM_CONCURRENCY_LIMIT, 2),
   telegramAlertWebhookUrl: (process.env.TELEGRAM_ALERT_WEBHOOK_URL ?? '').trim(),
+  agentModeEnabled:
+    process.env.AGENT_MODE_ENABLED === undefined
+      ? true
+      : parseEnvToggle(process.env.AGENT_MODE_ENABLED),
+  agentMaxSteps: parseEnvPositiveInteger(process.env.AGENT_MAX_STEPS, 6, {
+    min: 2,
+    max: 12,
+  }),
+  agentToolTimeoutMs: parseEnvPositiveInteger(process.env.AGENT_TOOL_TIMEOUT_MS, 12_000, {
+    min: 1000,
+    max: 120_000,
+  }),
+  agentFetchTimeoutMs: parseEnvPositiveInteger(process.env.AGENT_FETCH_TIMEOUT_MS, 10_000, {
+    min: 1000,
+    max: 120_000,
+  }),
+  agentFetchMaxBytes: parseEnvPositiveInteger(process.env.AGENT_FETCH_MAX_BYTES, 500_000, {
+    min: 50_000,
+    max: 2_000_000,
+  }),
+  agentWebSearchResultLimit: parseEnvPositiveInteger(process.env.AGENT_WEB_SEARCH_RESULT_LIMIT, 5, {
+    min: 1,
+    max: 10,
+  }),
+  agentPythonTimeoutMs: parseEnvPositiveInteger(process.env.AGENT_PYTHON_TIMEOUT_MS, 8_000, {
+    min: 1000,
+    max: 60_000,
+  }),
+  agentModelMaxOutputTokens: parseEnvPositiveInteger(
+    process.env.AGENT_MODEL_MAX_OUTPUT_TOKENS,
+    900,
+    { min: 128, max: 4096 },
+  ),
 };
 
 if (!config.keyEncryptionKey) {
@@ -331,6 +422,59 @@ redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
 return {1, active + 1}
 `;
+const AGENT_SEARCH_ENDPOINT = 'https://duckduckgo.com/html/';
+const AGENT_MAX_ACTION_JSON_CHARS = 64_000;
+const AGENT_MAX_WEB_SEARCH_QUERY_CHARS = 500;
+const AGENT_MAX_WEB_FETCH_URL_CHARS = 2000;
+const AGENT_MAX_PYTHON_CODE_CHARS = 20_000;
+const AGENT_MAX_TOOL_RESULT_CHARS = 20_000;
+const AGENT_FINAL_RESPONSE_MAX_CHARS = 60_000;
+const AGENT_RESULT_DELTA_CHUNK_CHARS = 500;
+const AGENT_MAX_FETCH_REDIRECTS = 3;
+const AGENT_MAX_HTML_TO_TEXT_CHARS = 80_000;
+const AGENT_MAX_ACTION_PARSE_REPAIR_ATTEMPTS = 2;
+const AGENT_SYSTEM_PROMPT = `You are an execution-focused assistant running in "Agent Mode V1".
+
+You must either:
+1) call one tool at a time, or
+2) return a final answer.
+
+Available tools:
+- web_search: { "query": string }
+  Use for searching the public web.
+- web_fetch: { "url": string }
+  Use for reading a specific webpage URL.
+- python: { "code": string }
+  Use for calculations, parsing, and data manipulation.
+
+Rules:
+- Think in short steps. Prefer at most one tool call per turn.
+- Use web_search before web_fetch when the user did not provide a concrete URL.
+- Use python only when computation/parsing is needed.
+- If tool results are sufficient, stop and return the final answer.
+- Keep the final answer concise, factual, and include sources when web content was used.
+
+You MUST respond with strict JSON only, no markdown, no prose outside JSON.
+JSON schema:
+For tool call:
+{
+  "type": "tool",
+  "tool": "web_search" | "web_fetch" | "python",
+  "input": { ...tool-specific fields... }
+}
+
+For final answer:
+{
+  "type": "final",
+  "answer": "string"
+}
+`;
+
+const blockedUrlHostnames = new Set([
+  'localhost',
+  'localhost.localdomain',
+  'metadata.google.internal',
+]);
 
 let rateLimitSettingsCache:
   | {
@@ -3411,6 +3555,910 @@ function extractAssistantTextFromAnthropicMessages(responseBody: unknown): strin
   }
 
   return chunks.join('\n').trim();
+}
+
+class UpstreamRequestError extends Error {
+  readonly statusCode: number;
+  readonly payload: unknown;
+
+  constructor(message: string, statusCode: number, payload: unknown) {
+    super(message);
+    this.name = 'UpstreamRequestError';
+    this.statusCode = statusCode;
+    this.payload = payload;
+  }
+}
+
+function isUpstreamRequestError(error: unknown): error is UpstreamRequestError {
+  return error instanceof UpstreamRequestError;
+}
+
+type AgentActionTool = {
+  type: 'tool';
+  tool: AgentToolName;
+  input: Record<string, unknown>;
+};
+
+type AgentActionFinal = {
+  type: 'final';
+  answer: string;
+};
+
+type AgentAction = AgentActionTool | AgentActionFinal;
+
+type AgentWebSearchResult = {
+  title: string;
+  url: string;
+  snippet: string;
+};
+
+function truncateText(value: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return '';
+  }
+  if (value.length <= maxChars) {
+    return value;
+  }
+  return `${value.slice(0, maxChars - 1)}...`;
+}
+
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function decodeHtmlEntities(value: string): string {
+  const named: Record<string, string> = {
+    amp: '&',
+    lt: '<',
+    gt: '>',
+    quot: '"',
+    apos: "'",
+    nbsp: ' ',
+  };
+
+  return value.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (full, entityRaw: string) => {
+    if (!entityRaw) {
+      return full;
+    }
+
+    const entity = String(entityRaw);
+    if (entity[0] === '#') {
+      const isHex = entity[1]?.toLowerCase() === 'x';
+      const numeric = entity.slice(isHex ? 2 : 1);
+      const codePoint = Number.parseInt(numeric, isHex ? 16 : 10);
+      if (!Number.isFinite(codePoint) || codePoint <= 0) {
+        return full;
+      }
+      try {
+        return String.fromCodePoint(codePoint);
+      } catch {
+        return full;
+      }
+    }
+
+    const lower = entity.toLowerCase();
+    return named[lower] ?? full;
+  });
+}
+
+function stripHtmlToText(html: string, maxChars = AGENT_MAX_HTML_TO_TEXT_CHARS): string {
+  const withoutScriptAndStyle = html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ');
+  const withoutComments = withoutScriptAndStyle.replace(/<!--[\s\S]*?-->/g, ' ');
+  const withBreakHints = withoutComments.replace(
+    /<\/(p|div|li|h1|h2|h3|h4|h5|h6|tr|section|article|br)>/gi,
+    '\n',
+  );
+  const plain = withBreakHints.replace(/<[^>]+>/g, ' ');
+  const decoded = decodeHtmlEntities(plain);
+  const collapsed = decoded
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return truncateText(collapsed, maxChars);
+}
+
+function isPrivateIpAddress(value: string): boolean {
+  const family = net.isIP(value);
+  if (family === 4) {
+    if (value.startsWith('10.')) {
+      return true;
+    }
+    if (value.startsWith('127.')) {
+      return true;
+    }
+    if (value.startsWith('169.254.')) {
+      return true;
+    }
+    if (value.startsWith('192.168.')) {
+      return true;
+    }
+    const octets = value.split('.').map((entry) => Number.parseInt(entry, 10));
+    const first = octets[0] ?? 0;
+    const second = octets[1] ?? 0;
+    if (first === 172 && second >= 16 && second <= 31) {
+      return true;
+    }
+    return false;
+  }
+
+  if (family === 6) {
+    const normalized = value.toLowerCase();
+    if (normalized === '::1' || normalized.startsWith('fe80:')) {
+      return true;
+    }
+    if (normalized.startsWith('fc') || normalized.startsWith('fd')) {
+      return true;
+    }
+    if (normalized.startsWith('::ffff:127.')) {
+      return true;
+    }
+    return false;
+  }
+
+  return true;
+}
+
+function isBlockedHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+
+  if (blockedUrlHostnames.has(normalized)) {
+    return true;
+  }
+
+  if (normalized.endsWith('.local') || normalized.endsWith('.internal')) {
+    return true;
+  }
+
+  return false;
+}
+
+async function assertSafePublicUrl(rawUrl: string): Promise<URL> {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error('Invalid URL');
+  }
+
+  const protocol = parsed.protocol.toLowerCase();
+  if (protocol !== 'http:' && protocol !== 'https:') {
+    throw new Error('Only http/https URLs are allowed');
+  }
+
+  if (!parsed.hostname) {
+    throw new Error('URL hostname is required');
+  }
+
+  if (isBlockedHostname(parsed.hostname)) {
+    throw new Error('Blocked hostname');
+  }
+
+  if (net.isIP(parsed.hostname)) {
+    if (isPrivateIpAddress(parsed.hostname)) {
+      throw new Error('Private network hosts are not allowed');
+    }
+    return parsed;
+  }
+
+  const records = await dnsLookup(parsed.hostname, { all: true });
+  if (!records.length) {
+    throw new Error('Could not resolve hostname');
+  }
+
+  for (const record of records) {
+    if (isPrivateIpAddress(record.address)) {
+      throw new Error('Private network targets are not allowed');
+    }
+  }
+
+  return parsed;
+}
+
+async function fetchWithRedirectValidation(params: {
+  url: string;
+  timeoutMs: number;
+  maxBytes: number;
+}): Promise<{ url: string; status: number; contentType: string; bodyText: string }> {
+  let currentUrl = params.url;
+
+  for (let redirectCount = 0; redirectCount <= AGENT_MAX_FETCH_REDIRECTS; redirectCount += 1) {
+    await assertSafePublicUrl(currentUrl);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), params.timeoutMs);
+
+    let response: Response;
+    try {
+      response = await fetch(currentUrl, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: {
+          'user-agent': 'new-chat-agent/1.0',
+          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5',
+        },
+      });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      throw new Error(error instanceof Error ? error.message : 'Failed to fetch URL');
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    const status = response.status;
+    if (status >= 300 && status < 400) {
+      const location = response.headers.get('location');
+      if (!location) {
+        throw new Error('Redirect response is missing location header');
+      }
+      const nextUrl = new URL(location, currentUrl);
+      currentUrl = nextUrl.toString();
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error(`Web request failed with status ${status}`);
+    }
+
+    const body = response.body;
+    if (!body) {
+      return {
+        url: currentUrl,
+        status,
+        contentType: response.headers.get('content-type') ?? '',
+        bodyText: '',
+      };
+    }
+
+    const reader = body.getReader();
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      const chunk = Buffer.from(value);
+      totalBytes += chunk.byteLength;
+      if (totalBytes > params.maxBytes) {
+        throw new Error(`Response exceeded ${params.maxBytes} bytes`);
+      }
+      chunks.push(chunk);
+    }
+
+    const buffer = Buffer.concat(chunks);
+    const bodyText = buffer.toString('utf8');
+    return {
+      url: currentUrl,
+      status,
+      contentType: response.headers.get('content-type') ?? '',
+      bodyText,
+    };
+  }
+
+  throw new Error('Too many redirects');
+}
+
+function parseDuckDuckGoSearchResults(html: string, maxResults: number): AgentWebSearchResult[] {
+  const results: AgentWebSearchResult[] = [];
+  const seenUrls = new Set<string>();
+  const anchorPattern = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let match: RegExpExecArray | null = anchorPattern.exec(html);
+
+  while (match && results.length < maxResults) {
+    const rawHref = decodeHtmlEntities(match[1] ?? '').trim();
+    const rawTitle = match[2] ?? '';
+    const title = normalizeWhitespace(stripHtmlToText(rawTitle, 240));
+    if (!rawHref || !title) {
+      match = anchorPattern.exec(html);
+      continue;
+    }
+
+    let normalizedUrl = rawHref;
+    try {
+      const candidate = new URL(rawHref, AGENT_SEARCH_ENDPOINT);
+      const host = candidate.hostname.toLowerCase();
+      if (host.endsWith('duckduckgo.com') && candidate.pathname.startsWith('/l/')) {
+        const redirected = candidate.searchParams.get('uddg');
+        if (redirected) {
+          normalizedUrl = decodeURIComponent(redirected);
+        } else {
+          normalizedUrl = candidate.toString();
+        }
+      } else {
+        normalizedUrl = candidate.toString();
+      }
+    } catch {
+      match = anchorPattern.exec(html);
+      continue;
+    }
+
+    const nextAnchorIndex = html.indexOf('result__a', match.index + match[0].length);
+    const snippetWindow = html.slice(
+      match.index + match[0].length,
+      nextAnchorIndex === -1 ? match.index + match[0].length + 900 : nextAnchorIndex,
+    );
+    const snippet = normalizeWhitespace(stripHtmlToText(snippetWindow, 260));
+    if (!normalizedUrl || seenUrls.has(normalizedUrl)) {
+      match = anchorPattern.exec(html);
+      continue;
+    }
+
+    seenUrls.add(normalizedUrl);
+    results.push({
+      title,
+      url: normalizedUrl,
+      snippet,
+    });
+
+    match = anchorPattern.exec(html);
+  }
+
+  return results;
+}
+
+async function runWebSearchTool(queryRaw: string): Promise<{
+  summary: string;
+  modelText: string;
+  metadata: Record<string, unknown>;
+}> {
+  const query = normalizeWhitespace(queryRaw);
+  if (!query) {
+    throw new Error('Search query is required');
+  }
+
+  const trimmedQuery = truncateText(query, AGENT_MAX_WEB_SEARCH_QUERY_CHARS);
+  const searchUrl = `${AGENT_SEARCH_ENDPOINT}?q=${encodeURIComponent(trimmedQuery)}`;
+  const response = await fetchWithRedirectValidation({
+    url: searchUrl,
+    timeoutMs: Math.min(config.agentToolTimeoutMs, config.agentFetchTimeoutMs),
+    maxBytes: config.agentFetchMaxBytes,
+  });
+
+  const results = parseDuckDuckGoSearchResults(response.bodyText, config.agentWebSearchResultLimit);
+  if (!results.length) {
+    return {
+      summary: 'No web search results found.',
+      modelText: `Tool web_search query: ${trimmedQuery}\nNo results found.`,
+      metadata: {
+        query: trimmedQuery,
+        result_count: 0,
+      },
+    };
+  }
+
+  const lines = results.map((entry, index) => {
+    const snippetPart = entry.snippet ? `\n   Snippet: ${truncateText(entry.snippet, 220)}` : '';
+    return `${index + 1}. ${entry.title}\n   URL: ${entry.url}${snippetPart}`;
+  });
+
+  return {
+    summary: `Found ${results.length} web result${results.length === 1 ? '' : 's'}.`,
+    modelText: truncateText(
+      `Tool web_search query: ${trimmedQuery}\nResults:\n${lines.join('\n')}`,
+      AGENT_MAX_TOOL_RESULT_CHARS,
+    ),
+    metadata: {
+      query: trimmedQuery,
+      result_count: results.length,
+      results: results.map((entry) => ({
+        title: entry.title,
+        url: entry.url,
+      })),
+    },
+  };
+}
+
+async function runWebFetchTool(urlRaw: string): Promise<{
+  summary: string;
+  modelText: string;
+  metadata: Record<string, unknown>;
+}> {
+  const normalizedUrlInput = urlRaw.trim();
+  if (!normalizedUrlInput) {
+    throw new Error('URL is required');
+  }
+  if (normalizedUrlInput.length > AGENT_MAX_WEB_FETCH_URL_CHARS) {
+    throw new Error('URL is too long');
+  }
+
+  const validated = await assertSafePublicUrl(normalizedUrlInput);
+  const response = await fetchWithRedirectValidation({
+    url: validated.toString(),
+    timeoutMs: Math.min(config.agentToolTimeoutMs, config.agentFetchTimeoutMs),
+    maxBytes: config.agentFetchMaxBytes,
+  });
+
+  const contentType = response.contentType.toLowerCase();
+  const isHtml = contentType.includes('text/html') || response.bodyText.includes('<html');
+  const extractedText = isHtml
+    ? stripHtmlToText(response.bodyText, AGENT_MAX_HTML_TO_TEXT_CHARS)
+    : truncateText(response.bodyText, AGENT_MAX_HTML_TO_TEXT_CHARS);
+  const cleanedText = normalizeWhitespace(extractedText.replace(/\n{3,}/g, '\n\n'));
+  const finalText = cleanedText || '[no readable text found]';
+
+  return {
+    summary: `Fetched ${response.url}`,
+    modelText: truncateText(
+      `Tool web_fetch URL: ${response.url}\nContent-Type: ${response.contentType || 'unknown'}\nExtracted text:\n${finalText}`,
+      AGENT_MAX_TOOL_RESULT_CHARS,
+    ),
+    metadata: {
+      url: response.url,
+      status: response.status,
+      content_type: response.contentType,
+      extracted_chars: finalText.length,
+    },
+  };
+}
+
+async function executeCommandWithTimeout(params: {
+  command: string;
+  args: string[];
+  cwd: string;
+  timeoutMs: number;
+  maxOutputBytes: number;
+}): Promise<{
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  timedOut: boolean;
+}> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(params.command, params.args, {
+      cwd: params.cwd,
+      env: {
+        PATH: process.env.PATH ?? '',
+        PYTHONNOUSERSITE: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let settled = false;
+
+    const limitAndAppend = (current: string, chunk: Buffer): string => {
+      const next = current + chunk.toString('utf8');
+      if (Buffer.byteLength(next, 'utf8') > params.maxOutputBytes) {
+        return truncateText(next, params.maxOutputBytes);
+      }
+      return next;
+    };
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout = limitAndAppend(stdout, chunk);
+      if (Buffer.byteLength(stdout, 'utf8') >= params.maxOutputBytes) {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr = limitAndAppend(stderr, chunk);
+      if (Buffer.byteLength(stderr, 'utf8') >= params.maxOutputBytes) {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }
+    });
+
+    child.once('error', (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(error);
+    });
+
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, params.timeoutMs);
+
+    child.once('close', (exitCode, signal) => {
+      clearTimeout(timeoutId);
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({
+        stdout,
+        stderr,
+        exitCode,
+        signal,
+        timedOut,
+      });
+    });
+  });
+}
+
+async function runPythonTool(codeRaw: string): Promise<{
+  summary: string;
+  modelText: string;
+  metadata: Record<string, unknown>;
+}> {
+  const code = codeRaw.trim();
+  if (!code) {
+    throw new Error('Python code is required');
+  }
+  if (code.length > AGENT_MAX_PYTHON_CODE_CHARS) {
+    throw new Error(`Python code exceeds ${AGENT_MAX_PYTHON_CODE_CHARS} characters`);
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'new-chat-agent-'));
+  const scriptPath = path.join(tempDir, 'agent_script.py');
+  const restrictedPrelude = `
+import builtins as _builtins
+_original_import = _builtins.__import__
+_blocked_modules = {"socket", "subprocess", "multiprocessing", "http", "urllib", "requests", "ftplib", "telnetlib", "smtplib", "imaplib", "poplib"}
+def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    root = name.split(".", 1)[0]
+    if root in _blocked_modules:
+        raise RuntimeError(f"Import '{root}' is disabled in Agent Python tool")
+    return _original_import(name, globals, locals, fromlist, level)
+_builtins.__import__ = _guarded_import
+_original_open = _builtins.open
+def _guarded_open(file, mode="r", *args, **kwargs):
+    if any(flag in mode for flag in ("w", "a", "x", "+")):
+        raise RuntimeError("File write access is disabled in Agent Python tool")
+    return _original_open(file, mode, *args, **kwargs)
+_builtins.open = _guarded_open
+`;
+
+  const script = `${restrictedPrelude}\n${code}\n`;
+  await fs.writeFile(scriptPath, script, 'utf8');
+
+  try {
+    let lastError: Error | null = null;
+    for (const binary of ['python3', 'python']) {
+      try {
+        const result = await executeCommandWithTimeout({
+          command: binary,
+          args: ['-I', scriptPath],
+          cwd: tempDir,
+          timeoutMs: Math.min(config.agentToolTimeoutMs, config.agentPythonTimeoutMs),
+          maxOutputBytes: 64 * 1024,
+        });
+
+        const stdout = result.stdout.trim();
+        const stderr = result.stderr.trim();
+        const textSegments: string[] = [];
+        if (stdout) {
+          textSegments.push(`stdout:\n${stdout}`);
+        }
+        if (stderr) {
+          textSegments.push(`stderr:\n${stderr}`);
+        }
+        if (!stdout && !stderr) {
+          textSegments.push('[no output]');
+        }
+
+        if (result.timedOut) {
+          textSegments.push('status: timed_out');
+        } else {
+          textSegments.push(`status: exit_${result.exitCode ?? 'unknown'}`);
+        }
+
+        const joined = textSegments.join('\n\n');
+        return {
+          summary: result.timedOut
+            ? 'Python tool timed out.'
+            : `Python tool finished with exit code ${result.exitCode ?? 'unknown'}.`,
+          modelText: truncateText(`Tool python code output:\n${joined}`, AGENT_MAX_TOOL_RESULT_CHARS),
+          metadata: {
+            exit_code: result.exitCode,
+            signal: result.signal,
+            timed_out: result.timedOut,
+            stdout_chars: stdout.length,
+            stderr_chars: stderr.length,
+          },
+        };
+      } catch (error) {
+        if (error && typeof error === 'object' && (error as { code?: unknown }).code === 'ENOENT') {
+          lastError = error instanceof Error ? error : new Error('Python binary not found');
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw lastError ?? new Error('Python runtime not found');
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function extractJsonObjectCandidate(input: string): string | null {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const fenceMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const unwrapped = fenceMatch ? fenceMatch[1] ?? '' : trimmed;
+  const start = unwrapped.indexOf('{');
+  const end = unwrapped.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+
+  return unwrapped.slice(start, end + 1);
+}
+
+function parseAgentAction(rawAssistantText: string): AgentAction {
+  const candidate = extractJsonObjectCandidate(truncateText(rawAssistantText, AGENT_MAX_ACTION_JSON_CHARS));
+  if (!candidate) {
+    throw new Error('Agent model did not return JSON');
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch {
+    throw new Error('Agent model returned invalid JSON');
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Agent action must be an object');
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const type = typeof record.type === 'string' ? record.type.trim() : '';
+
+  if (type === 'final') {
+    const answer = typeof record.answer === 'string' ? record.answer.trim() : '';
+    if (!answer) {
+      throw new Error('Final action requires non-empty answer');
+    }
+    return {
+      type: 'final',
+      answer: truncateText(answer, AGENT_FINAL_RESPONSE_MAX_CHARS),
+    };
+  }
+
+  if (type === 'tool') {
+    const tool = typeof record.tool === 'string' ? record.tool.trim() : '';
+    if (tool !== 'web_search' && tool !== 'web_fetch' && tool !== 'python') {
+      throw new Error(`Unknown tool "${tool}"`);
+    }
+    const input = record.input;
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      throw new Error('Tool action requires an object input');
+    }
+    return {
+      type: 'tool',
+      tool,
+      input: input as Record<string, unknown>,
+    };
+  }
+
+  throw new Error('Action type must be "tool" or "final"');
+}
+
+function buildAgentResponsesInput(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): unknown[] {
+  const items: unknown[] = [];
+  for (const message of messages) {
+    const text = message.content.trim();
+    if (!text) {
+      continue;
+    }
+    items.push({
+      role: message.role,
+      content: [
+        {
+          type: message.role === 'assistant' ? 'output_text' : 'input_text',
+          text,
+        },
+      ],
+    });
+  }
+  return items;
+}
+
+async function runAssistantTurnWithSelectedModel(params: {
+  model: ModelCatalogRow;
+  apiKey: string;
+  input: unknown;
+  request: FastifyRequest;
+}): Promise<{ assistantText: string; rawPayload: Record<string, unknown>; usageTotalTokens: number | null }> {
+  const requestBody: Record<string, unknown> = {
+    model: params.model.model_id,
+    input: params.input,
+    stream: false,
+    max_output_tokens: config.agentModelMaxOutputTokens,
+  };
+
+  let upstreamPath: '/responses' | '/chat/completions' | '/messages';
+  let upstreamRequestBody: Record<string, unknown>;
+  let upstreamHeaders: Record<string, string>;
+
+  if (params.model.provider_api_type === 'openai_responses') {
+    upstreamPath = '/responses';
+    upstreamRequestBody = requestBody;
+    upstreamHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${params.apiKey}`,
+    };
+  } else if (params.model.provider_api_type === 'openai_chat') {
+    upstreamPath = '/chat/completions';
+    upstreamRequestBody = buildChatCompletionsRequestFromResponses(requestBody);
+    upstreamHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${params.apiKey}`,
+    };
+  } else {
+    upstreamPath = '/messages';
+    upstreamRequestBody = buildAnthropicMessagesRequestFromResponses(requestBody);
+    upstreamHeaders = {
+      'content-type': 'application/json',
+      'x-api-key': params.apiKey,
+      'anthropic-version': ANTHROPIC_VERSION,
+    };
+  }
+
+  const startedAt = Date.now();
+  const upstream = await fetch(`${params.model.provider_base_url}${upstreamPath}`, {
+    method: 'POST',
+    headers: upstreamHeaders,
+    body: JSON.stringify(upstreamRequestBody),
+  });
+
+  await writeAuditEvent({
+    eventType: 'agent.upstream.response',
+    request: params.request,
+    metadata: {
+      provider: params.model.provider_code,
+      provider_api_type: params.model.provider_api_type,
+      upstream_path: upstreamPath,
+      status: upstream.status,
+      duration_ms: Date.now() - startedAt,
+    },
+  });
+
+  if (!upstream.ok) {
+    const upstreamText = await upstream.text();
+    let parsed: unknown = { error: { message: upstreamText } };
+    try {
+      parsed = JSON.parse(upstreamText);
+    } catch {
+      parsed = { error: { message: upstreamText } };
+    }
+    const message = extractErrorMessage(parsed, `Upstream request failed with status ${upstream.status}`);
+    throw new UpstreamRequestError(message, upstream.status, parsed);
+  }
+
+  const payload = (await upstream.json()) as Record<string, unknown>;
+  const assistantText =
+    params.model.provider_api_type === 'openai_responses'
+      ? extractAssistantTextFromResponses(payload)
+      : params.model.provider_api_type === 'openai_chat'
+        ? extractAssistantTextFromChatCompletions(payload)
+        : extractAssistantTextFromAnthropicMessages(payload);
+
+  return {
+    assistantText,
+    rawPayload: payload,
+    usageTotalTokens: extractUsageTotalTokens(payload),
+  };
+}
+
+async function createAgentRun(params: {
+  userId: string;
+  threadId: string;
+  modelPublicId: string;
+  inputPrompt: string;
+}): Promise<string> {
+  const result = await pool.query<AgentRunRow>(
+    `INSERT INTO agent_runs (user_id, thread_id, model_public_id, status, input_prompt)
+     VALUES ($1, $2, $3, 'running', $4)
+     RETURNING id, status`,
+    [params.userId, params.threadId, params.modelPublicId, params.inputPrompt],
+  );
+  return result.rows[0]!.id;
+}
+
+async function appendAgentRunEvent(params: {
+  runId: string;
+  userId: string;
+  threadId: string;
+  kind: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  await pool.query(
+    `INSERT INTO agent_run_events (run_id, user_id, thread_id, event_kind, message, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+    [
+      params.runId,
+      params.userId,
+      params.threadId,
+      params.kind,
+      truncateText(params.message, 4000),
+      serializeRawContentForStorage(params.metadata ?? null),
+    ],
+  );
+}
+
+async function markAgentRunCompleted(params: {
+  runId: string;
+  finalResponse: string;
+  stepsUsed: number;
+  toolCalls: number;
+}): Promise<void> {
+  await pool.query(
+    `UPDATE agent_runs
+     SET status = 'completed',
+         final_response = $2,
+         steps_used = $3,
+         tool_calls = $4,
+         updated_at = now()
+     WHERE id = $1`,
+    [params.runId, truncateText(params.finalResponse, AGENT_FINAL_RESPONSE_MAX_CHARS), params.stepsUsed, params.toolCalls],
+  );
+}
+
+async function markAgentRunFailed(params: {
+  runId: string;
+  errorMessage: string;
+  stepsUsed: number;
+  toolCalls: number;
+}): Promise<void> {
+  await pool.query(
+    `UPDATE agent_runs
+     SET status = 'failed',
+         error_message = $2,
+         steps_used = $3,
+         tool_calls = $4,
+         updated_at = now()
+     WHERE id = $1`,
+    [params.runId, truncateText(params.errorMessage, 4000), params.stepsUsed, params.toolCalls],
+  );
+}
+
+function formatAgentProgressSseEvent(event: AgentProgressEvent): string {
+  return `data: ${JSON.stringify({ type: 'agent.progress', ...event })}\n\n`;
+}
+
+function formatAgentRunCreatedSseEvent(runId: string): string {
+  return `data: ${JSON.stringify({ type: 'agent.run.created', run_id: runId })}\n\n`;
+}
+
+function chunkTextForStreaming(value: string, chunkSize: number): string[] {
+  if (!value) {
+    return [];
+  }
+  const chunks: string[] = [];
+  for (let cursor = 0; cursor < value.length; cursor += chunkSize) {
+    chunks.push(value.slice(cursor, cursor + chunkSize));
+  }
+  return chunks;
+}
+
+async function runAgentToolAction(params: {
+  action: AgentActionTool;
+}): Promise<{ summary: string; modelText: string; metadata: Record<string, unknown> }> {
+  const input = params.action.input;
+  if (params.action.tool === 'web_search') {
+    const query = typeof input.query === 'string' ? input.query : '';
+    return runWebSearchTool(query);
+  }
+
+  if (params.action.tool === 'web_fetch') {
+    const url = typeof input.url === 'string' ? input.url : '';
+    return runWebFetchTool(url);
+  }
+
+  const code = typeof input.code === 'string' ? input.code : '';
+  return runPythonTool(code);
 }
 
 function findSseBoundary(input: string): { index: number; length: number } | null {
@@ -6868,6 +7916,507 @@ async function setupServer(): Promise<void> {
     reply.header('Cache-Control', 'private, max-age=300');
     reply.header('Content-Length', String(buffer.length));
     reply.send(buffer);
+  });
+
+  app.post('/v1/agent/runs', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
+    if (!config.agentModeEnabled) {
+      reply.code(404).send({ error: 'Agent mode is disabled' });
+      return;
+    }
+
+    const user = request.authUser!;
+    const requestBody = { ...((request.body ?? {}) as Record<string, unknown>) };
+    const threadId =
+      typeof requestBody.thread_id === 'string'
+        ? (requestBody.thread_id as string)
+        : typeof requestBody.threadId === 'string'
+          ? (requestBody.threadId as string)
+          : undefined;
+    const stream = requestBody.stream === true;
+    const promptTextRaw =
+      typeof requestBody.prompt === 'string'
+        ? requestBody.prompt
+        : typeof requestBody.input === 'string'
+          ? requestBody.input
+          : extractTextFromResponsesInput(requestBody.input);
+    const promptText = normalizeWhitespace(promptTextRaw);
+
+    if (Object.prototype.hasOwnProperty.call(requestBody, 'provider')) {
+      reply.code(400).send({ error: 'provider override is not supported. Use model public_id only.' });
+      return;
+    }
+
+    if (!promptText) {
+      reply.code(400).send({ error: 'prompt is required' });
+      return;
+    }
+
+    if (promptText.length > AGENT_FINAL_RESPONSE_MAX_CHARS) {
+      reply.code(400).send({ error: `prompt exceeds ${AGENT_FINAL_RESPONSE_MAX_CHARS} characters` });
+      return;
+    }
+
+    let selectedModel: ModelCatalogRow;
+    try {
+      selectedModel = await resolveModelForRequest({
+        user,
+        requestedPublicModelId: normalizePublicModelId(requestBody.model) ?? undefined,
+      });
+    } catch (error) {
+      reply.code(400).send({ error: error instanceof Error ? error.message : 'Invalid model selection' });
+      return;
+    }
+
+    const apiKey = await getProviderSecret(selectedModel.provider_id);
+    if (!apiKey) {
+      reply.code(503).send({
+        error: `Provider "${selectedModel.provider_code}" is missing a configured platform API key`,
+      });
+      return;
+    }
+
+    const effectiveRateLimits =
+      request.effectiveRateLimits ?? (await loadEffectiveRateLimitsForUser(user.id));
+    const initialPromptTokenEstimate = estimateTokensFromText(promptText);
+    const initialReservation = await reserveTpmUsage({
+      userId: user.id,
+      tokens: initialPromptTokenEstimate,
+      limit: effectiveRateLimits.tpm_effective,
+    });
+    if (!initialReservation.allowed) {
+      await incrementAbuseCounters(user.id, [{ dimension: 'request_429', value: 1 }]);
+      await evaluateUserAbuseAndMaybeAct({
+        request,
+        user,
+        currentIp: getClientIp(request),
+        currentUa: getClientUserAgent(request),
+      });
+      reply.code(429).send({ error: 'Rate limit exceeded (TPM)' });
+      return;
+    }
+
+    const targetThreadId = await getOrCreateThread({
+      userId: user.id,
+      threadId,
+      providerId: selectedModel.provider_id,
+      model: selectedModel.public_id,
+    });
+
+    const threadContext = await loadRecentThreadContextMessages({
+      threadId: targetThreadId,
+      userId: user.id,
+    });
+    const contextMessages = threadContext.messages.filter(
+      (message) => message.role === 'user' || message.role === 'assistant',
+    );
+    const contextMessagesUsed = contextMessages.length;
+
+    await persistMessage({
+      threadId: targetThreadId,
+      userId: user.id,
+      role: 'user',
+      content: promptText,
+      rawContent: {
+        mode: 'agent_v1',
+      },
+    });
+
+    await maybeAutoRenameThread({
+      threadId: targetThreadId,
+      userId: user.id,
+      sourceText: promptText,
+    });
+
+    const runId = await createAgentRun({
+      userId: user.id,
+      threadId: targetThreadId,
+      modelPublicId: selectedModel.public_id,
+      inputPrompt: promptText,
+    });
+
+    await writeAuditEvent({
+      eventType: 'agent.run.started',
+      request,
+      userId: user.id,
+      metadata: {
+        run_id: runId,
+        thread_id: targetThreadId,
+        model_public_id: selectedModel.public_id,
+        context_messages_used: contextMessagesUsed,
+      },
+    });
+
+    let streamLease: StreamLease | null = null;
+    if (stream) {
+      const leaseResult = await acquireUserStreamLease(user.id);
+      if (!leaseResult.allowed) {
+        await incrementAbuseCounters(user.id, [
+          { dimension: 'stream_concurrency_rejected', value: 1 },
+          { dimension: 'request_429', value: 1 },
+        ]);
+        await writeAuditEvent({
+          eventType: 'abuse.stream_concurrency_blocked',
+          request,
+          userId: user.id,
+          metadata: {
+            endpoint: '/v1/agent/runs',
+            active_streams: leaseResult.active,
+            stream_limit: config.abuseStreamConcurrencyLimit,
+          },
+        });
+        await evaluateUserAbuseAndMaybeAct({
+          request,
+          user,
+          currentIp: getClientIp(request),
+          currentUa: getClientUserAgent(request),
+        });
+        reply.code(429).send({ error: 'Too many concurrent streams for this user' });
+        return;
+      }
+      streamLease = leaseResult.lease;
+      await incrementAbuseCounters(user.id, [{ dimension: 'stream_started', value: 1 }]);
+    }
+
+    const progressEvents: AgentProgressEvent[] = [];
+    let stepsUsed = 0;
+    let toolCalls = 0;
+    let streamInitialized = false;
+    let finalAnswer = '';
+    let runFailed = false;
+    let runErrorMessage = '';
+    let tpmUsageDeltaTotal = 0;
+
+    const emitProgress = async (event: AgentProgressEvent): Promise<void> => {
+      progressEvents.push(event);
+      try {
+        await appendAgentRunEvent({
+          runId,
+          userId: user.id,
+          threadId: targetThreadId,
+          kind: event.kind,
+          message: event.message,
+          metadata: {
+            step: event.step ?? null,
+            tool: event.tool ?? null,
+            ...(event.metadata ?? {}),
+          },
+        });
+      } catch (error) {
+        request.log.warn(
+          { err: error, runId, userId: user.id, threadId: targetThreadId },
+          'Failed to persist agent run event',
+        );
+      }
+
+      if (streamInitialized) {
+        reply.raw.write(formatAgentProgressSseEvent(event));
+      }
+    };
+
+    try {
+      if (stream) {
+        reply.hijack();
+        reply.raw.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          'X-Thread-Id': targetThreadId,
+          'X-Agent-Run-Id': runId,
+          'X-Context-Messages-Used': String(contextMessagesUsed),
+        });
+        streamInitialized = true;
+        reply.raw.write(formatAgentRunCreatedSseEvent(runId));
+      }
+
+      const conversationMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+        {
+          role: 'system',
+          content: `${AGENT_SYSTEM_PROMPT}\nCurrent UTC date/time: ${new Date().toISOString()}`,
+        },
+        ...contextMessages.map((entry) => ({
+          role: entry.role,
+          content: truncateText(entry.content, 6000),
+        })),
+        {
+          role: 'user',
+          content: promptText,
+        },
+      ];
+
+      await emitProgress({
+        kind: 'info',
+        message: 'Agent run started.',
+      });
+
+      let actionRepairAttempts = 0;
+
+      for (let step = 1; step <= config.agentMaxSteps; step += 1) {
+        stepsUsed = step;
+
+        const modelInput = buildAgentResponsesInput(conversationMessages);
+        const modelInputTokenEstimate = estimateTokensFromUnknown(modelInput);
+        const stepReservation = await reserveTpmUsage({
+          userId: user.id,
+          tokens: modelInputTokenEstimate,
+          limit: effectiveRateLimits.tpm_effective,
+        });
+        if (!stepReservation.allowed) {
+          throw new Error('Rate limit exceeded (TPM) while running agent steps');
+        }
+
+        const turn = await runAssistantTurnWithSelectedModel({
+          model: selectedModel,
+          apiKey,
+          input: modelInput,
+          request,
+        });
+
+        if (turn.usageTotalTokens !== null) {
+          const delta = Math.max(0, turn.usageTotalTokens - modelInputTokenEstimate);
+          tpmUsageDeltaTotal += delta;
+          await addTpmUsageEvent(user.id, delta);
+        } else {
+          const estimate = estimateTokensFromText(turn.assistantText);
+          tpmUsageDeltaTotal += estimate;
+          await addTpmUsageEvent(user.id, estimate);
+        }
+
+        let action: AgentAction;
+        try {
+          action = parseAgentAction(turn.assistantText);
+        } catch (parseError) {
+          if (actionRepairAttempts < AGENT_MAX_ACTION_PARSE_REPAIR_ATTEMPTS) {
+            actionRepairAttempts += 1;
+            const parseErrorMessage =
+              parseError instanceof Error ? parseError.message : 'Unknown action parse error';
+            await emitProgress({
+              kind: 'info',
+              message: `Agent produced invalid tool JSON. Retrying (${actionRepairAttempts}/${AGENT_MAX_ACTION_PARSE_REPAIR_ATTEMPTS}).`,
+              step,
+              metadata: {
+                parse_error: parseErrorMessage,
+              },
+            });
+            conversationMessages.push({
+              role: 'user',
+              content:
+                'Your previous response was invalid. Return only valid JSON with exactly one action object.',
+            });
+            continue;
+          }
+          throw parseError;
+        }
+
+        actionRepairAttempts = 0;
+
+        if (action.type === 'final') {
+          finalAnswer = truncateText(action.answer, AGENT_FINAL_RESPONSE_MAX_CHARS).trim();
+          await emitProgress({
+            kind: 'info',
+            message: 'Agent produced a final answer.',
+            step,
+          });
+          break;
+        }
+
+        toolCalls += 1;
+        await emitProgress({
+          kind: 'tool_start',
+          message: `Step ${step}: running ${action.tool}`,
+          step,
+          tool: action.tool,
+        });
+
+        conversationMessages.push({
+          role: 'assistant',
+          content: JSON.stringify(action),
+        });
+
+        let toolResult:
+          | {
+              summary: string;
+              modelText: string;
+              metadata: Record<string, unknown>;
+            }
+          | null = null;
+
+        try {
+          toolResult = await runAgentToolAction({ action });
+          await emitProgress({
+            kind: 'tool_result',
+            message: toolResult.summary,
+            step,
+            tool: action.tool,
+            metadata: toolResult.metadata,
+          });
+        } catch (toolError) {
+          const toolErrorMessage =
+            toolError instanceof Error ? toolError.message : 'Unknown tool execution error';
+          toolResult = {
+            summary: `${action.tool} failed: ${toolErrorMessage}`,
+            modelText: truncateText(
+              `Tool ${action.tool} failed with error: ${toolErrorMessage}`,
+              AGENT_MAX_TOOL_RESULT_CHARS,
+            ),
+            metadata: {
+              error: toolErrorMessage,
+            },
+          };
+          await emitProgress({
+            kind: 'tool_result',
+            message: toolResult.summary,
+            step,
+            tool: action.tool,
+            metadata: toolResult.metadata,
+          });
+        }
+
+        conversationMessages.push({
+          role: 'user',
+          content: truncateText(toolResult.modelText, AGENT_MAX_TOOL_RESULT_CHARS),
+        });
+      }
+
+      if (!finalAnswer) {
+        finalAnswer =
+          'I could not complete the task within the current step limit. Please narrow the request or ask me to continue in another run.';
+      }
+
+      await persistMessage({
+        threadId: targetThreadId,
+        userId: user.id,
+        role: 'assistant',
+        content: finalAnswer,
+        rawContent: {
+          mode: 'agent_v1',
+          run_id: runId,
+          steps_used: stepsUsed,
+          tool_calls: toolCalls,
+          context_messages_used: contextMessagesUsed,
+        },
+      });
+
+      await maybeAutoRenameThread({
+        threadId: targetThreadId,
+        userId: user.id,
+        sourceText: finalAnswer,
+      });
+
+      await markAgentRunCompleted({
+        runId,
+        finalResponse: finalAnswer,
+        stepsUsed,
+        toolCalls,
+      });
+
+      await writeAuditEvent({
+        eventType: 'agent.run.completed',
+        request,
+        userId: user.id,
+        metadata: {
+          run_id: runId,
+          thread_id: targetThreadId,
+          steps_used: stepsUsed,
+          tool_calls: toolCalls,
+          tpm_usage_delta_total: tpmUsageDeltaTotal,
+        },
+      });
+
+      if (streamInitialized) {
+        for (const chunk of chunkTextForStreaming(finalAnswer, AGENT_RESULT_DELTA_CHUNK_CHARS)) {
+          reply.raw.write(formatResponsesDeltaSseEvent(chunk));
+        }
+        reply.raw.write('data: [DONE]\n\n');
+        reply.raw.end();
+        return;
+      }
+
+      const downstreamPayload = buildResponsesPayloadFromAssistantText(finalAnswer);
+      reply.header('X-Thread-Id', targetThreadId);
+      reply.header('X-Agent-Run-Id', runId);
+      reply.header('X-Context-Messages-Used', String(contextMessagesUsed));
+      reply.send({
+        ...downstreamPayload,
+        agent_run: {
+          id: runId,
+          status: 'completed',
+          steps_used: stepsUsed,
+          tool_calls: toolCalls,
+          progress: progressEvents,
+        },
+      });
+    } catch (error) {
+      runFailed = true;
+      runErrorMessage =
+        error instanceof Error ? error.message : 'Agent run failed due to an unexpected error';
+
+      await markAgentRunFailed({
+        runId,
+        errorMessage: runErrorMessage,
+        stepsUsed,
+        toolCalls,
+      });
+
+      await appendAgentRunEvent({
+        runId,
+        userId: user.id,
+        threadId: targetThreadId,
+        kind: 'error',
+        message: runErrorMessage,
+      }).catch((eventError) => {
+        request.log.warn(
+          { err: eventError, runId, userId: user.id, threadId: targetThreadId },
+          'Failed to persist final agent error event',
+        );
+      });
+
+      await writeAuditEvent({
+        eventType: 'agent.run.failed',
+        request,
+        userId: user.id,
+        metadata: {
+          run_id: runId,
+          thread_id: targetThreadId,
+          steps_used: stepsUsed,
+          tool_calls: toolCalls,
+          error: runErrorMessage,
+        },
+      }).catch((auditError) => {
+        request.log.warn(
+          { err: auditError, runId, userId: user.id, threadId: targetThreadId },
+          'Failed to write audit event for agent failure',
+        );
+      });
+
+      if (streamInitialized) {
+        reply.raw.write(
+          formatAgentProgressSseEvent({
+            kind: 'error',
+            message: runErrorMessage,
+            step: stepsUsed || undefined,
+          }),
+        );
+        for (const chunk of chunkTextForStreaming(`Agent run failed: ${runErrorMessage}`, AGENT_RESULT_DELTA_CHUNK_CHARS)) {
+          reply.raw.write(formatResponsesDeltaSseEvent(chunk));
+        }
+        reply.raw.write('data: [DONE]\n\n');
+        reply.raw.end();
+        return;
+      }
+
+      if (isUpstreamRequestError(error)) {
+        reply.code(error.statusCode).send(error.payload);
+        return;
+      }
+
+      reply.code(500).send({ error: runErrorMessage });
+      return;
+    } finally {
+      await releaseUserStreamLease(streamLease);
+      if (runFailed) {
+        await incrementAbuseCounters(user.id, [{ dimension: 'request_error', value: 1 }]);
+      }
+    }
   });
 
   app.post('/v1/responses', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {

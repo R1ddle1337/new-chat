@@ -17,9 +17,14 @@ Web-only chat app (OpenAI-like UI) with a Fastify gateway, Next.js frontend, Pos
   - `grok2api` (`https://gapi.lyxnb.de5.net/v1`)
 - OpenAI-compatible API surface in the gateway:
   - `POST /v1/responses` (primary, supports `stream: true` SSE proxy)
+  - `POST /v1/agent/runs` (Agent Mode V1: multi-step tool use with progress streaming)
   - `POST /v1/chat/completions` (compat)
   - `GET /v1/models` (enabled published models only: `public_id` + `display_name`)
   - `POST /v1/files` (multipart image upload)
+- Agent mode V1:
+  - UI mode toggle (`Chat` / `Agent`) in `/chat`
+  - tool-capable orchestration loop (web search, webpage fetch/read, python execution)
+  - progress events streamed over SSE + persisted run/event records in Postgres (`agent_runs`, `agent_run_events`)
 - Vision flow: uploaded images are stored privately in MinIO, then gateway fetches image bytes and injects data URLs into upstream request payload.
 - Security controls:
   - frontend never calls upstream directly
@@ -47,6 +52,8 @@ Tables:
 - `user_provider_keys` (deprecated, no user-facing routes/UI)
 - `threads`
 - `messages`
+- `agent_runs`
+- `agent_run_events`
 - `files`
 - `audit_events`
 - (`schema_migrations` support table)
@@ -125,6 +132,7 @@ Gateway routes:
 - `GET /me/threads/:threadId/messages`
 - `GET /v1/models`
 - `POST /v1/responses`
+- `POST /v1/agent/runs`
 - `POST /v1/chat/completions`
 - `POST /v1/files`
 
@@ -134,3 +142,7 @@ Gateway routes:
 - `ADMIN_EMAIL` is optional and only bootstraps admin elevation if a login/register email matches it.
 - `APP_ORIGIN` must match the web origin used by browser clients.
 - `SECURE_COOKIES=true` should be enabled behind HTTPS.
+- Agent-mode controls:
+  - `AGENT_MODE_ENABLED` (default `true`)
+  - `AGENT_MAX_STEPS`, `AGENT_FETCH_TIMEOUT_MS`, `AGENT_FETCH_MAX_BYTES`
+  - `AGENT_WEB_SEARCH_RESULT_LIMIT`, `AGENT_PYTHON_TIMEOUT_MS`, `AGENT_MODEL_MAX_OUTPUT_TOKENS`

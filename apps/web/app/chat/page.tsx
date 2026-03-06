@@ -60,6 +60,16 @@ type Toast = {
   message: string;
 };
 
+type ChatMode = 'chat' | 'agent';
+
+type AgentProgressEventPayload = {
+  type: 'agent.progress';
+  kind?: string;
+  message?: string;
+  step?: number;
+  tool?: string;
+};
+
 const autoScrollEnterThresholdPx = 56;
 const autoScrollExitThresholdPx = 136;
 const autoScrollResumeThresholdPx = 24;
@@ -72,11 +82,13 @@ const mobileViewportBreakpointPx = 980;
 const mobileComposerMaxHeightPx = 160;
 const desktopComposerMaxHeightPx = 220;
 const chatModelStorageKey = 'nchat_last_model';
+const chatModeStorageKey = 'nchat_chat_mode';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const supportedImageExtensions = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic', 'heif']);
 const supportedDocumentMimeTypes = new Set(['text/plain', 'text/markdown', 'application/pdf']);
 const supportedDocumentExtensions = new Set(['txt', 'md', 'pdf']);
 const userMessagePlaceholderPattern = /^\[(?:image|images|file|files|attachments|non-text input)\]$/i;
+const maxAgentProgressItems = 8;
 
 type MarkdownCodeProps = ComponentPropsWithoutRef<'code'> & {
   inline?: boolean;
@@ -865,9 +877,14 @@ function findSseBoundary(input: string): { index: number; length: number } | nul
   return { index: idxCrLf, length: 4 };
 }
 
-function parseResponsesSseBuffer(buffer: string): { remaining: string; assistantDelta: string } {
+function parseResponsesSseBuffer(buffer: string): {
+  remaining: string;
+  assistantDelta: string;
+  progressEvents: AgentProgressEventPayload[];
+} {
   let remaining = buffer;
   let assistantDelta = '';
+  const progressEvents: AgentProgressEventPayload[] = [];
 
   while (true) {
     const boundary = findSseBoundary(remaining);
@@ -896,13 +913,33 @@ function parseResponsesSseBuffer(buffer: string): { remaining: string; assistant
       const parsed = JSON.parse(eventData) as Record<string, unknown>;
       if (parsed.type === 'response.output_text.delta' && typeof parsed.delta === 'string') {
         assistantDelta += parsed.delta;
+        continue;
+      }
+
+      if (parsed.type === 'agent.progress') {
+        progressEvents.push(parsed as AgentProgressEventPayload);
       }
     } catch {
       continue;
     }
   }
 
-  return { remaining, assistantDelta };
+  return { remaining, assistantDelta, progressEvents };
+}
+
+function formatAgentProgressEventLabel(event: AgentProgressEventPayload): string | null {
+  const message = typeof event.message === 'string' ? event.message.trim() : '';
+  if (!message) {
+    return null;
+  }
+
+  const stepPrefix = typeof event.step === 'number' && Number.isFinite(event.step)
+    ? `Step ${event.step}: `
+    : '';
+  const toolPrefix = typeof event.tool === 'string' && event.tool.trim()
+    ? `[${event.tool.trim()}] `
+    : '';
+  return `${stepPrefix}${toolPrefix}${message}`.trim();
 }
 
 function extractAssistantText(payload: unknown): string {
@@ -1218,6 +1255,35 @@ function writeStoredChatModelId(modelId: string): void {
   }
 }
 
+function readStoredChatMode(): ChatMode {
+  if (typeof window === 'undefined') {
+    return 'chat';
+  }
+
+  try {
+    const value = window.localStorage.getItem(chatModeStorageKey);
+    if (value === 'agent') {
+      return 'agent';
+    }
+  } catch {
+    return 'chat';
+  }
+
+  return 'chat';
+}
+
+function writeStoredChatMode(mode: ChatMode): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(chatModeStorageKey, mode);
+  } catch {
+    // Ignore localStorage write failures.
+  }
+}
+
 function distanceFromBottom(element: HTMLElement): number {
   return Math.max(0, element.scrollHeight - element.scrollTop - element.clientHeight);
 }
@@ -1298,6 +1364,41 @@ async function copyTextToClipboard(value: string): Promise<void> {
   }
 }
 
+function ChatModeToggle({
+  mode,
+  onChange,
+  disabled,
+}: {
+  mode: ChatMode;
+  onChange: (mode: ChatMode) => void;
+  disabled: boolean;
+}) {
+  return (
+    <div className="chat-mode-toggle" role="tablist" aria-label="Chat mode">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={mode === 'chat'}
+        className={`chat-mode-toggle-button${mode === 'chat' ? ' is-active' : ''}`}
+        onClick={() => onChange('chat')}
+        disabled={disabled}
+      >
+        Chat
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={mode === 'agent'}
+        className={`chat-mode-toggle-button${mode === 'agent' ? ' is-active' : ''}`}
+        onClick={() => onChange('agent')}
+        disabled={disabled}
+      >
+        Agent
+      </button>
+    </div>
+  );
+}
+
 export default function ChatPage() {
   const router = useRouter();
   const { loading: shellLoading, selectedThreadId, selectedThread, refreshThreads, selectThread } =
@@ -1335,6 +1436,7 @@ export default function ChatPage() {
   const [animatingMessageIds, setAnimatingMessageIds] = useState<string[]>([]);
   const [model, setModel] = useState('');
   const [allowedModels, setAllowedModels] = useState<AllowedModelItem[]>([]);
+  const [chatMode, setChatMode] = useState<ChatMode>(() => readStoredChatMode());
   const [streamResponses, setStreamResponses] = useState(true);
   const [sending, setSending] = useState(false);
   const [generationActive, setGenerationActive] = useState(false);
@@ -1352,14 +1454,17 @@ export default function ChatPage() {
   const [editDraftText, setEditDraftText] = useState('');
   const [editDraftAttachments, setEditDraftAttachments] = useState<MessageAttachment[]>([]);
   const [editSavePending, setEditSavePending] = useState(false);
+  const [agentProgressItems, setAgentProgressItems] = useState<string[]>([]);
 
   const editingActive = editingMessageId !== null;
+  const attachmentsEnabled = chatMode === 'chat' && !editingActive;
   const canSend =
     !sending &&
     !editingActive &&
     Boolean(model.trim()) &&
-    (input.trim().length > 0 || images.length > 0 || docs.length > 0);
-  const composerActive = composerFocused || Boolean(input.trim()) || images.length > 0 || docs.length > 0;
+    (input.trim().length > 0 || (chatMode === 'chat' && (images.length > 0 || docs.length > 0)));
+  const composerActive =
+    composerFocused || Boolean(input.trim()) || (chatMode === 'chat' && (images.length > 0 || docs.length > 0));
 
   const pushToast = useCallback((kind: ToastKind, message: string) => {
     const id = toastCounterRef.current + 1;
@@ -1477,7 +1582,7 @@ export default function ChatPage() {
 
   const handleComposerPaste = useCallback(
     (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
-      if (editingActive) {
+      if (editingActive || chatMode === 'agent') {
         return;
       }
 
@@ -1527,7 +1632,7 @@ export default function ChatPage() {
         appendImages(pastedImages);
       }
     },
-    [appendImages, editingActive],
+    [appendImages, chatMode, editingActive],
   );
 
   const adjustComposerHeight = useCallback(() => {
@@ -1881,6 +1986,7 @@ export default function ChatPage() {
     setEditDraftText('');
     setEditDraftAttachments([]);
     setEditSavePending(false);
+    setAgentProgressItems([]);
     latestAssistantTextRef.current = '';
     streamBufferedAssistantTextRef.current = '';
     streamRenderedAssistantTextRef.current = '';
@@ -2129,6 +2235,22 @@ export default function ChatPage() {
     writeStoredChatModelId(nextModelId);
   }, []);
 
+  const handleChatModeChange = useCallback(
+    (nextMode: ChatMode) => {
+      if (sending) {
+        return;
+      }
+      setChatMode(nextMode);
+      writeStoredChatMode(nextMode);
+      setAgentProgressItems([]);
+      if (nextMode === 'agent') {
+        clearImages();
+        clearDocs();
+      }
+    },
+    [clearDocs, clearImages, sending],
+  );
+
   const updateMessageContent = useCallback((messageId: string, nextContent: string) => {
     setMessages((previous) => {
       const targetIndex = previous.findIndex((message) => message.id === messageId);
@@ -2209,12 +2331,16 @@ export default function ChatPage() {
       clearComposerOnStart?: boolean;
     }): Promise<void> => {
       const normalizedPromptText = params.promptText.trim();
-      const imageFiles = params.imageFiles ?? [];
-      const docFiles = params.docFiles ?? [];
-      const preloadedAttachments = params.existingAttachments ?? [];
+      const chatModeActive = chatMode;
+      const imageFiles = chatModeActive === 'chat' ? params.imageFiles ?? [] : [];
+      const docFiles = chatModeActive === 'chat' ? params.docFiles ?? [] : [];
+      const preloadedAttachments = chatModeActive === 'chat' ? params.existingAttachments ?? [] : [];
       if (
         sending ||
-        (!normalizedPromptText && imageFiles.length === 0 && docFiles.length === 0 && preloadedAttachments.length === 0)
+        (!normalizedPromptText &&
+          imageFiles.length === 0 &&
+          docFiles.length === 0 &&
+          preloadedAttachments.length === 0)
       ) {
         return;
       }
@@ -2236,6 +2362,7 @@ export default function ChatPage() {
       let latestThreadId = params.threadId;
 
       try {
+        setAgentProgressItems([]);
         const uploadedAttachments: MessageAttachment[] = [...preloadedAttachments];
 
         const uploadAttachment = async (
@@ -2268,57 +2395,67 @@ export default function ChatPage() {
           };
         };
 
-        for (const image of imageFiles) {
-          uploadedAttachments.push(await uploadAttachment(image, 'image/*', 'Image upload failed'));
-        }
-
-        for (const doc of docFiles) {
-          uploadedAttachments.push(
-            await uploadAttachment(
-              doc,
-              inferDocumentMimeType(doc.name) ?? 'application/octet-stream',
-              'File upload failed',
-            ),
-          );
-        }
-
-        const content: Array<Record<string, unknown>> = [];
-        if (normalizedPromptText) {
-          content.push({
-            type: 'input_text',
-            text: normalizedPromptText,
-          });
-        }
-
-        for (const attachment of uploadedAttachments) {
-          if (attachment.mime_type.startsWith('image/')) {
-            content.push({
-              type: 'input_image',
-              file_id: attachment.file_id,
-            });
-            continue;
+        if (chatModeActive === 'chat') {
+          for (const image of imageFiles) {
+            uploadedAttachments.push(await uploadAttachment(image, 'image/*', 'Image upload failed'));
           }
 
-          content.push({
-            type: 'input_file',
-            file_id: attachment.file_id,
-          });
-        }
-
-        if (content.length === 0) {
-          throw new Error('Message cannot be empty');
+          for (const doc of docFiles) {
+            uploadedAttachments.push(
+              await uploadAttachment(
+                doc,
+                inferDocumentMimeType(doc.name) ?? 'application/octet-stream',
+                'File upload failed',
+              ),
+            );
+          }
         }
 
         const body: Record<string, unknown> = {
-          input: [
+          stream: streamResponses,
+          model: model.trim(),
+        };
+
+        if (chatModeActive === 'chat') {
+          const content: Array<Record<string, unknown>> = [];
+          if (normalizedPromptText) {
+            content.push({
+              type: 'input_text',
+              text: normalizedPromptText,
+            });
+          }
+
+          for (const attachment of uploadedAttachments) {
+            if (attachment.mime_type.startsWith('image/')) {
+              content.push({
+                type: 'input_image',
+                file_id: attachment.file_id,
+              });
+              continue;
+            }
+
+            content.push({
+              type: 'input_file',
+              file_id: attachment.file_id,
+            });
+          }
+
+          if (content.length === 0) {
+            throw new Error('Message cannot be empty');
+          }
+
+          body.input = [
             {
               role: 'user',
               content,
             },
-          ],
-          stream: streamResponses,
-          model: model.trim(),
-        };
+          ];
+        } else {
+          if (!normalizedPromptText) {
+            throw new Error('Agent mode requires a text prompt');
+          }
+          body.prompt = normalizedPromptText;
+        }
 
         if (params.threadId) {
           body.thread_id = params.threadId;
@@ -2344,9 +2481,12 @@ export default function ChatPage() {
           {
             id: optimisticUserId,
             role: 'user',
-            content: buildUserMessagePreview(normalizedPromptText, uploadedAttachments),
+            content:
+              chatModeActive === 'chat'
+                ? buildUserMessagePreview(normalizedPromptText, uploadedAttachments)
+                : normalizedPromptText,
             created_at: new Date().toISOString(),
-            attachments: uploadedAttachments,
+            attachments: chatModeActive === 'chat' ? uploadedAttachments : [],
           },
           {
             id: optimisticAssistantMessageId,
@@ -2361,12 +2501,16 @@ export default function ChatPage() {
           setInput('');
           clearImages();
           clearDocs();
+          setAgentProgressItems([]);
           if (fileInputRef.current) {
             fileInputRef.current.value = '';
           }
         }
 
-        const res = await fetch('/api/v1/responses', {
+        const responsePath =
+          chatModeActive === 'agent' ? '/api/v1/agent/runs' : '/api/v1/responses';
+
+        const res = await fetch(responsePath, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -2426,6 +2570,29 @@ export default function ChatPage() {
             streamFlushFrameRef.current = window.requestAnimationFrame(flushFrame);
           };
 
+          const appendAgentProgress = (events: AgentProgressEventPayload[]) => {
+            if (chatModeActive !== 'agent' || events.length === 0) {
+              return;
+            }
+            setAgentProgressItems((previous) => {
+              const next = previous.slice();
+              for (const event of events) {
+                const line = formatAgentProgressEventLabel(event);
+                if (!line) {
+                  continue;
+                }
+                if (next[next.length - 1] === line) {
+                  continue;
+                }
+                next.push(line);
+              }
+              if (next.length <= maxAgentProgressItems) {
+                return next;
+              }
+              return next.slice(next.length - maxAgentProgressItems);
+            });
+          };
+
           try {
             while (true) {
               const { done, value } = await reader.read();
@@ -2438,6 +2605,7 @@ export default function ChatPage() {
 
               const parsed = parseResponsesSseBuffer(parserBuffer);
               parserBuffer = parsed.remaining;
+              appendAgentProgress(parsed.progressEvents);
               if (!parsed.assistantDelta) {
                 continue;
               }
@@ -2451,6 +2619,7 @@ export default function ChatPage() {
             if (tail) {
               parserBuffer += tail;
               const parsedTail = parseResponsesSseBuffer(parserBuffer);
+              appendAgentProgress(parsedTail.progressEvents);
               streamBufferedAssistantTextRef.current += parsedTail.assistantDelta;
             }
 
@@ -2483,7 +2652,7 @@ export default function ChatPage() {
           }
         }
 
-        pushToast('success', 'Response received');
+        pushToast('success', chatModeActive === 'agent' ? 'Agent response received' : 'Response received');
       } catch (requestError) {
         const isAbortError = requestError instanceof Error && requestError.name === 'AbortError';
         if (isAbortError) {
@@ -2501,7 +2670,7 @@ export default function ChatPage() {
           }
 
           await refreshThreads(latestThreadId);
-          pushToast('info', 'Generation stopped');
+          pushToast('info', chatModeActive === 'agent' ? 'Agent run stopped' : 'Generation stopped');
         } else {
           setMessages((previous) =>
             previous.filter((message) => !optimisticMessageIds.includes(message.id)),
@@ -2538,6 +2707,7 @@ export default function ChatPage() {
       }
     },
     [
+      chatMode,
       clearDocs,
       clearImages,
       loadMessages,
@@ -2740,14 +2910,22 @@ export default function ChatPage() {
   const latestAssistantId = latestAssistantWithSourceUser?.assistant.id ?? null;
   const canRegenerateLatestAssistant = Boolean(latestAssistantWithSourceUser?.sourceUser);
   const showModelConfigError = allowedModels.length === 0;
+  const modeTitle = chatMode === 'agent' ? 'Agent mode' : 'Chat mode';
   const headerSubtitle = isMobileViewport
     ? undefined
     : showHomeState
-      ? 'Start a conversation'
-      : 'Conversation';
+      ? modeTitle
+      : chatMode === 'agent'
+        ? 'Agent conversation'
+        : 'Conversation';
 
   const chatHeaderControls = (
     <div className="chat-header-controls">
+      <ChatModeToggle
+        mode={chatMode}
+        onChange={handleChatModeChange}
+        disabled={sending || editSavePending || regeneratingAssistantId !== null}
+      />
       <ModelPicker
         options={allowedModels}
         value={model}
@@ -2762,7 +2940,7 @@ export default function ChatPage() {
       ref={composerRegionRef}
       className={`chat-composer-region${showHomeState ? ' chat-composer-region-home' : ''}`}
     >
-      {imagePreviewUrls.length > 0 ? (
+      {chatMode === 'chat' && imagePreviewUrls.length > 0 ? (
         <div className="chat-image-preview-row">
           <div className="chat-image-preview-grid">
             {imagePreviewUrls.map((previewUrl, index) => {
@@ -2803,7 +2981,7 @@ export default function ChatPage() {
         </div>
       ) : null}
 
-      {docs.length > 0 ? (
+      {chatMode === 'chat' && docs.length > 0 ? (
         <div className="chat-doc-preview-row">
           <div className="chat-doc-chip-list">
             {docs.map((doc, index) => (
@@ -2872,36 +3050,42 @@ export default function ChatPage() {
           type="file"
           accept="image/*,.heic,.heif,.pdf,.txt,.md,text/plain,text/markdown,application/pdf"
           multiple
-          disabled={sending || editingActive}
+          disabled={sending || !attachmentsEnabled}
           onChange={(event) => {
             appendSelectedFiles(Array.from(event.target.files ?? []));
           }}
         />
 
-        <button
-          type="button"
-          className="chat-attach-button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={
-            sending ||
-            editingActive ||
-            (images.length >= maxComposerImages && docs.length >= maxComposerDocs)
-          }
-          aria-label="Attach files"
-          title={
-            images.length >= maxComposerImages && docs.length >= maxComposerDocs
-              ? `Maximum ${maxComposerImages} images and ${maxComposerDocs} files`
-              : editingActive
-                ? 'Editing uses the original attachments'
-                : 'Attach image or file'
-          }
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M12 5v14" />
-            <path d="M5 12h14" />
-          </svg>
-          <span className="sr-only">Attach files</span>
-        </button>
+        {chatMode === 'chat' ? (
+          <button
+            type="button"
+            className="chat-attach-button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={
+              sending ||
+              !attachmentsEnabled ||
+              (images.length >= maxComposerImages && docs.length >= maxComposerDocs)
+            }
+            aria-label="Attach files"
+            title={
+              images.length >= maxComposerImages && docs.length >= maxComposerDocs
+                ? `Maximum ${maxComposerImages} images and ${maxComposerDocs} files`
+                : editingActive
+                  ? 'Editing uses the original attachments'
+                  : 'Attach image or file'
+            }
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v14" />
+              <path d="M5 12h14" />
+            </svg>
+            <span className="sr-only">Attach files</span>
+          </button>
+        ) : (
+          <span className="chat-agent-pill" aria-hidden="true">
+            Agent
+          </span>
+        )}
 
         <textarea
           ref={composerInputRef}
@@ -2943,7 +3127,13 @@ export default function ChatPage() {
               void sendMessage();
             }
           }}
-          placeholder={editingActive ? 'edit your message' : 'ask anything'}
+          placeholder={
+            editingActive
+              ? 'edit your message'
+              : chatMode === 'agent'
+                ? 'ask agent to research, browse, or run python'
+                : 'ask anything'
+          }
           disabled={sending}
         />
 
@@ -2982,8 +3172,16 @@ export default function ChatPage() {
         <div className="chat-composer-status">
           <span className="chat-streaming-indicator" role="status" aria-live="polite">
             <span className="chat-streaming-dot" />
-            Generating response
+            {chatMode === 'agent' ? 'Agent is working' : 'Generating response'}
           </span>
+        </div>
+      ) : null}
+
+      {chatMode === 'agent' && generationActive && agentProgressItems.length > 0 ? (
+        <div className="chat-agent-progress">
+          {agentProgressItems.map((item, index) => (
+            <p key={`${item}-${index}`}>{item}</p>
+          ))}
         </div>
       ) : null}
 
@@ -3038,7 +3236,11 @@ export default function ChatPage() {
         <div className="chat-home-shell">
           <div className="chat-home-card chat-message-enter">
             <h2 className="chat-home-title">How can I help you today?</h2>
-            <p className="chat-home-subtitle">Start a chat with text or images.</p>
+            <p className="chat-home-subtitle">
+              {chatMode === 'agent'
+                ? 'Agent mode can search the web, read pages, and run Python.'
+                : 'Start a chat with text or images.'}
+            </p>
             {composerRegion}
           </div>
         </div>

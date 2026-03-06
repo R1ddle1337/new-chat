@@ -1194,6 +1194,44 @@ code {
   gap: 0.5rem;
 }
 
+.chat-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #d8dde6;
+  border-radius: 999px;
+  background: #f3f5f8;
+  padding: 0.14rem;
+  gap: 0.12rem;
+}
+
+.chat-mode-toggle-button {
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #4b5563;
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1;
+  padding: 0.42rem 0.7rem;
+  min-height: 30px;
+  white-space: nowrap;
+}
+
+.chat-mode-toggle-button:hover:not(:disabled) {
+  background: rgba(100, 116, 139, 0.12);
+}
+
+.chat-mode-toggle-button.is-active {
+  background: #ffffff;
+  color: #111827;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.12);
+}
+
+.chat-mode-toggle-button:disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+
 .chat-model-picker {
   position: relative;
   width: clamp(190px, 24vw, 320px);
@@ -2016,6 +2054,22 @@ code {
   color: #374151;
 }
 
+.chat-agent-pill {
+  flex: 0 0 auto;
+  min-height: 34px;
+  border: 1px solid #d6dbe3;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  padding: 0.3rem 0.62rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .chat-composer-input {
   flex: 1 1 auto;
   border: 0;
@@ -2126,6 +2180,24 @@ code {
   margin: 0.43rem auto 0;
   display: flex;
   align-items: center;
+}
+
+.chat-agent-progress {
+  max-width: var(--content-max);
+  margin: 0.36rem auto 0;
+  border: 1px solid #dbe1ea;
+  border-radius: 10px;
+  background: #f8fafc;
+  padding: 0.46rem 0.58rem;
+  display: grid;
+  gap: 0.22rem;
+}
+
+.chat-agent-progress p {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.38;
+  color: #334155;
 }
 
 .chat-edit-region {
@@ -2396,6 +2468,15 @@ code {
     justify-content: flex-start;
   }
 
+  .chat-page .chat-mode-toggle {
+    flex: 0 0 auto;
+  }
+
+  .chat-page .chat-mode-toggle-button {
+    padding: 0.36rem 0.6rem;
+    min-height: 28px;
+  }
+
   .chat-page .chat-model-picker {
     width: clamp(152px, 58vw, 320px);
     max-width: min(72vw, 320px);
@@ -2481,6 +2562,7 @@ code {
   .chat-doc-preview-row,
   .chat-composer-bar,
   .chat-composer-status,
+  .chat-agent-progress,
   .chat-edit-region {
     max-width: none;
     width: 100%;
@@ -2524,6 +2606,11 @@ code {
 
   .chat-page .chat-header-controls {
     gap: 0.44rem;
+  }
+
+  .chat-page .chat-mode-toggle-button {
+    font-size: 0.74rem;
+    padding: 0.34rem 0.56rem;
   }
 
   .chat-page .chat-model-picker {
