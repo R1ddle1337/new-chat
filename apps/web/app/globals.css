@@ -2210,8 +2210,7 @@ code {
 }
 
 @media (max-width: 980px) {
-  .app-shell,
-  .app-shell.sidebar-collapsed {
+  .app-shell {
     grid-template-columns: 1fr;
     overflow-x: hidden;
   }
@@ -2402,29 +2401,6 @@ code {
     min-height: 38px;
   }
 
-  .app-shell.sidebar-collapsed .sidebar-brand-label {
-    display: inline;
-  }
-
-  .app-shell.sidebar-collapsed .sidebar-toolbar {
-    display: grid;
-  }
-
-  .app-shell.sidebar-collapsed .sidebar-thread-list {
-    display: grid;
-  }
-
-  .app-shell.sidebar-collapsed .sidebar-nav-label {
-    display: inline;
-  }
-
-  .app-shell.sidebar-collapsed .sidebar-feedback {
-    display: block;
-  }
-
-  .app-shell.sidebar-collapsed .sidebar-nav-link {
-    justify-content: flex-start;
-  }
 }
 
 @media (max-width: 760px) {

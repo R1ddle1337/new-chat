@@ -7,10 +7,11 @@ import { useChatShell } from './chat-shell-context';
 
 type SidebarProps = {
   collapsed: boolean;
+  isMobile: boolean;
   mobileOpen: boolean;
   onOpenMobile: () => void;
   onCloseMobile: () => void;
-  onToggleCollapse: () => void;
+  onToggleDesktopCollapse: () => void;
 };
 
 function formatThreadUpdatedAt(timestamp: string): string {
@@ -34,10 +35,11 @@ function formatThreadUpdatedAt(timestamp: string): string {
 
 export default function Sidebar({
   collapsed,
+  isMobile,
   mobileOpen,
   onOpenMobile,
   onCloseMobile,
-  onToggleCollapse,
+  onToggleDesktopCollapse,
 }: SidebarProps) {
   const pathname = usePathname();
   const {
@@ -123,7 +125,7 @@ export default function Sidebar({
         searchInputRef.current.select();
       };
 
-      const shouldOpenMobileFirst = window.matchMedia('(max-width: 980px)').matches && !mobileOpen;
+      const shouldOpenMobileFirst = isMobile && !mobileOpen;
       if (shouldOpenMobileFirst) {
         onOpenMobile();
         window.setTimeout(focusSearch, 220);
@@ -137,7 +139,7 @@ export default function Sidebar({
     return () => {
       window.removeEventListener('keydown', handleShortcut);
     };
-  }, [mobileOpen, onOpenMobile]);
+  }, [isMobile, mobileOpen, onOpenMobile]);
 
   useEffect(() => {
     if (!mobileActionThreadId) {
@@ -262,6 +264,20 @@ export default function Sidebar({
   };
 
   const isNavItemActive = (href: string) => pathname === href || pathname.startsWith(`${href}/`);
+  const collapseButtonLabel = isMobile
+    ? 'Close sidebar'
+    : collapsed
+      ? 'Expand sidebar'
+      : 'Collapse sidebar';
+  const collapseButtonGlyph = isMobile ? '<' : collapsed ? '>' : '<';
+  const handleCollapseButtonClick = () => {
+    if (isMobile) {
+      onCloseMobile();
+      return;
+    }
+
+    onToggleDesktopCollapse();
+  };
 
   return (
     <aside className="app-sidebar">
@@ -273,11 +289,11 @@ export default function Sidebar({
         <button
           type="button"
           className="sidebar-collapse-btn"
-          onClick={onToggleCollapse}
-          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          onClick={handleCollapseButtonClick}
+          aria-label={collapseButtonLabel}
+          title={collapseButtonLabel}
         >
-          {collapsed ? '>' : '<'}
+          {collapseButtonGlyph}
         </button>
       </div>
 

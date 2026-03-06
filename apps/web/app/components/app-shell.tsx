@@ -9,23 +9,49 @@ type AppShellProps = {
   children: ReactNode;
 };
 
+const MOBILE_VIEWPORT_QUERY = '(max-width: 980px)';
+
 function AppShellChrome({ children }: AppShellProps) {
   const pathname = usePathname();
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [mobileOpen, setMobileOpen] = useState(false);
+  const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState(false);
+  const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
+  const [isMobileViewport, setIsMobileViewport] = useState(false);
 
-  const handleSidebarToggle = () => {
-    if (window.matchMedia('(max-width: 980px)').matches) {
-      setMobileOpen(false);
+  const sidebarCollapsed = desktopSidebarCollapsed && !isMobileViewport;
+  const mobileOpen = mobileDrawerOpen && isMobileViewport;
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia(MOBILE_VIEWPORT_QUERY);
+    const syncViewportMode = () => {
+      setIsMobileViewport(mediaQuery.matches);
+    };
+
+    syncViewportMode();
+
+    if (typeof mediaQuery.addEventListener === 'function') {
+      mediaQuery.addEventListener('change', syncViewportMode);
+      return () => {
+        mediaQuery.removeEventListener('change', syncViewportMode);
+      };
+    }
+
+    mediaQuery.addListener(syncViewportMode);
+    return () => {
+      mediaQuery.removeListener(syncViewportMode);
+    };
+  }, []);
+
+  useEffect(() => {
+    setMobileDrawerOpen(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (isMobileViewport) {
       return;
     }
 
-    setSidebarCollapsed((current) => !current);
-  };
-
-  useEffect(() => {
-    setMobileOpen(false);
-  }, [pathname]);
+    setMobileDrawerOpen(false);
+  }, [isMobileViewport]);
 
   useEffect(() => {
     if (!mobileOpen) {
@@ -34,7 +60,7 @@ function AppShellChrome({ children }: AppShellProps) {
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        setMobileOpen(false);
+        setMobileDrawerOpen(false);
       }
     };
 
@@ -49,18 +75,27 @@ function AppShellChrome({ children }: AppShellProps) {
       className={`app-shell${sidebarCollapsed ? ' sidebar-collapsed' : ''}${mobileOpen ? ' mobile-open' : ''}`}
     >
       <Sidebar
-        collapsed={sidebarCollapsed}
+        collapsed={desktopSidebarCollapsed}
+        isMobile={isMobileViewport}
         mobileOpen={mobileOpen}
-        onOpenMobile={() => setMobileOpen(true)}
-        onCloseMobile={() => setMobileOpen(false)}
-        onToggleCollapse={handleSidebarToggle}
+        onOpenMobile={() => {
+          if (isMobileViewport) {
+            setMobileDrawerOpen(true);
+          }
+        }}
+        onCloseMobile={() => setMobileDrawerOpen(false)}
+        onToggleDesktopCollapse={() => setDesktopSidebarCollapsed((current) => !current)}
       />
 
       <div className="app-main">
         <button
           type="button"
           className="app-mobile-toggle"
-          onClick={() => setMobileOpen(true)}
+          onClick={() => {
+            if (isMobileViewport) {
+              setMobileDrawerOpen(true);
+            }
+          }}
           aria-label="Open sidebar"
         >
           <span className="app-mobile-toggle-bar" />
@@ -73,7 +108,7 @@ function AppShellChrome({ children }: AppShellProps) {
       <button
         type="button"
         className={`app-mobile-overlay${mobileOpen ? ' open' : ''}`}
-        onClick={() => setMobileOpen(false)}
+        onClick={() => setMobileDrawerOpen(false)}
         aria-label="Close sidebar"
         aria-hidden={!mobileOpen}
         tabIndex={mobileOpen ? 0 : -1}
