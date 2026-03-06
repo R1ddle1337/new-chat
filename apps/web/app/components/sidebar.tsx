@@ -61,6 +61,7 @@ export default function Sidebar({
   const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
+  const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
 
   const navItems = useMemo(() => {
     const baseItems: Array<{ href: string; label: string }> = [
@@ -87,6 +88,9 @@ export default function Sidebar({
     () => threads.find((thread) => thread.id === mobileActionThreadId) ?? null,
     [mobileActionThreadId, threads],
   );
+  const hasSearchQuery = searchQuery.trim().length > 0;
+  const mobileSearchVisible = mobileSearchOpen || hasSearchQuery;
+  const showSearchInput = !isMobile || mobileSearchVisible;
 
   useEffect(() => {
     if (!headerMenuOpen) {
@@ -111,7 +115,7 @@ export default function Sidebar({
 
       event.preventDefault();
 
-      const focusSearch = () => {
+      const focusSearchInput = () => {
         if (!searchInputRef.current) {
           return;
         }
@@ -123,6 +127,16 @@ export default function Sidebar({
 
         searchInputRef.current.focus();
         searchInputRef.current.select();
+      };
+
+      const focusSearch = () => {
+        if (isMobile) {
+          setMobileSearchOpen(true);
+          window.setTimeout(focusSearchInput, 40);
+          return;
+        }
+
+        focusSearchInput();
       };
 
       const shouldOpenMobileFirst = isMobile && !mobileOpen;
@@ -157,6 +171,14 @@ export default function Sidebar({
       window.removeEventListener('keydown', handleEscape);
     };
   }, [mobileActionThreadId]);
+
+  useEffect(() => {
+    if (!isMobile || mobileOpen) {
+      return;
+    }
+
+    setMobileSearchOpen(false);
+  }, [isMobile, mobileOpen]);
 
   const handleCreateThread = async () => {
     setFeedback(null);
@@ -262,6 +284,23 @@ export default function Sidebar({
     setMobileActionThreadId(null);
     setRenamingThreadId(null);
   };
+  const handleMobileSearchToggle = () => {
+    if (!isMobile) {
+      return;
+    }
+
+    if (mobileSearchVisible) {
+      setSearchQuery('');
+      setMobileSearchOpen(false);
+      return;
+    }
+
+    setMobileSearchOpen(true);
+    window.setTimeout(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    }, 40);
+  };
 
   const isNavItemActive = (href: string) => pathname === href || pathname.startsWith(`${href}/`);
   const collapseButtonLabel = isMobile
@@ -278,6 +317,40 @@ export default function Sidebar({
 
     onToggleDesktopCollapse();
   };
+  const toolbarActions = (
+    <div className="sidebar-toolbar-actions">
+      <button type="button" className="sidebar-new-chat" onClick={() => void handleCreateThread()}>
+        <span className="sidebar-new-chat-plus">+</span>
+        <span className="sidebar-new-chat-label">New chat</span>
+      </button>
+
+      <div className="sidebar-header-menu-wrap" onClick={(event) => event.stopPropagation()}>
+        <button
+          type="button"
+          className="sidebar-kebab"
+          aria-label="Thread list actions"
+          aria-expanded={headerMenuOpen}
+          aria-haspopup="menu"
+          onClick={() => setHeaderMenuOpen((current) => !current)}
+        >
+          ...
+        </button>
+        <div
+          className={`sidebar-thread-menu sidebar-header-menu${headerMenuOpen ? ' open' : ''}`}
+          role="menu"
+          aria-hidden={!headerMenuOpen}
+        >
+          <button
+            type="button"
+            className="sidebar-thread-menu-item sidebar-thread-menu-item-danger"
+            onClick={() => void handleClearAll()}
+          >
+            Clear all
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 
   return (
     <aside className="app-sidebar">
@@ -298,50 +371,51 @@ export default function Sidebar({
       </div>
 
       <div className="sidebar-toolbar">
-        <label htmlFor="sidebar-thread-search" className="sr-only">
-          Search chats
-        </label>
-        <input
-          id="sidebar-thread-search"
-          ref={searchInputRef}
-          className="sidebar-search-input"
-          placeholder="Search chats"
-          value={searchQuery}
-          onChange={(event) => setSearchQuery(event.target.value)}
-        />
-
-        <div className="sidebar-toolbar-actions">
-          <button type="button" className="sidebar-new-chat" onClick={() => void handleCreateThread()}>
-            <span className="sidebar-new-chat-plus">+</span>
-            <span className="sidebar-new-chat-label">New chat</span>
-          </button>
-
-          <div className="sidebar-header-menu-wrap" onClick={(event) => event.stopPropagation()}>
+        {isMobile ? (
+          <>
+            {toolbarActions}
             <button
               type="button"
-              className="sidebar-kebab"
-              aria-label="Thread list actions"
-              aria-expanded={headerMenuOpen}
-              aria-haspopup="menu"
-              onClick={() => setHeaderMenuOpen((current) => !current)}
+              className={`sidebar-search-toggle${mobileSearchVisible ? ' active' : ''}`}
+              onClick={handleMobileSearchToggle}
+              aria-expanded={mobileSearchVisible}
+              aria-controls="sidebar-thread-search"
             >
-              ...
+              <span>{mobileSearchVisible ? (hasSearchQuery ? 'Clear search' : 'Hide search') : 'Search chats'}</span>
+              <span className="sidebar-search-toggle-state">{mobileSearchVisible ? 'On' : 'Off'}</span>
             </button>
-            <div
-              className={`sidebar-thread-menu sidebar-header-menu${headerMenuOpen ? ' open' : ''}`}
-              role="menu"
-              aria-hidden={!headerMenuOpen}
-            >
-              <button
-                type="button"
-                className="sidebar-thread-menu-item sidebar-thread-menu-item-danger"
-                onClick={() => void handleClearAll()}
-              >
-                Clear all
-              </button>
-            </div>
-          </div>
-        </div>
+            {showSearchInput ? (
+              <div className="sidebar-search-row">
+                <label htmlFor="sidebar-thread-search" className="sr-only">
+                  Search chats
+                </label>
+                <input
+                  id="sidebar-thread-search"
+                  ref={searchInputRef}
+                  className="sidebar-search-input"
+                  placeholder="Search chats"
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                />
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <label htmlFor="sidebar-thread-search" className="sr-only">
+              Search chats
+            </label>
+            <input
+              id="sidebar-thread-search"
+              ref={searchInputRef}
+              className="sidebar-search-input"
+              placeholder="Search chats"
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+            />
+            {toolbarActions}
+          </>
+        )}
       </div>
 
       <div className="sidebar-thread-list" aria-label="Conversations">
