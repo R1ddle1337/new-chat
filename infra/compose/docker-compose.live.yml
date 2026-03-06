@@ -1,5 +1,6 @@
 services:
   postgres:
+    restart: unless-stopped
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: newchat
@@ -14,11 +15,13 @@ services:
       retries: 10
 
   redis:
+    restart: unless-stopped
     image: redis:7-alpine
     volumes:
       - redis_data:/data
 
   minio:
+    restart: unless-stopped
     image: minio/minio:latest
     command: server /data --console-address ':9001'
     environment:
@@ -28,6 +31,7 @@ services:
       - minio_data:/data
 
   gateway:
+    restart: unless-stopped
     build:
       context: ../../
       dockerfile: apps/gateway/Dockerfile
@@ -65,6 +69,7 @@ services:
       - '127.0.0.1:3101:3001'
 
   web:
+    restart: unless-stopped
     build:
       context: ../../
       dockerfile: apps/web/Dockerfile
