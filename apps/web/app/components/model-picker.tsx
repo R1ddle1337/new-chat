@@ -14,33 +14,12 @@ import { createPortal } from 'react-dom';
 
 const mobileBreakpointPx = 980;
 
-function detectCoarsePointerPreference(): boolean {
+function detectMobileViewport(): boolean {
   if (typeof window === 'undefined') {
     return false;
   }
 
-  return (
-    window.matchMedia('(pointer: coarse)').matches ||
-    window.matchMedia('(hover: none) and (pointer: coarse)').matches
-  );
-}
-
-function detectBottomSheetPreference(): boolean {
-  if (typeof window === 'undefined') {
-    return false;
-  }
-
-  const pointerCoarse = detectCoarsePointerPreference();
-  const narrow = window.matchMedia(`(max-width: ${mobileBreakpointPx}px)`).matches;
-  return pointerCoarse || narrow;
-}
-
-function detectBottomSheetPreferenceAtOpen(): boolean {
-  if (typeof window === 'undefined') {
-    return false;
-  }
-
-  return detectCoarsePointerPreference() || window.innerWidth <= mobileBreakpointPx;
+  return window.innerWidth <= mobileBreakpointPx;
 }
 
 export type ModelPickerOption = {
@@ -67,8 +46,7 @@ function getSecondaryLabel(option: ModelPickerOption): string | null {
 
 function ModelPickerComponent({ options, value, onChange, disabled = false }: ModelPickerProps) {
   const [isOpen, setIsOpen] = useState(false);
-  const [useBottomSheet, setUseBottomSheet] = useState(() => detectBottomSheetPreference());
-  const [hasCoarsePointer, setHasCoarsePointer] = useState(() => detectCoarsePointerPreference());
+  const [useBottomSheet, setUseBottomSheet] = useState(() => detectMobileViewport());
   const [portalRoot, setPortalRoot] = useState<HTMLElement | null>(null);
   const [search, setSearch] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
@@ -83,7 +61,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
 
   const hasOptions = options.length > 0;
   const isDisabled = disabled || !hasOptions;
-  const shouldRenderBottomSheet = useBottomSheet || (isOpen && hasCoarsePointer);
+  const shouldRenderBottomSheet = useBottomSheet;
 
   const selectedOption = useMemo(() => {
     return options.find((option) => option.id === value) ?? null;
@@ -113,14 +91,9 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
     }
 
     const narrowQuery = window.matchMedia(`(max-width: ${mobileBreakpointPx}px)`);
-    const pointerCoarseQuery = window.matchMedia('(pointer: coarse)');
-    const hoverNoneAndPointerCoarseQuery = window.matchMedia('(hover: none) and (pointer: coarse)');
 
     const syncUseBottomSheet = () => {
-      const pointerCoarse =
-        pointerCoarseQuery.matches || hoverNoneAndPointerCoarseQuery.matches;
-      setHasCoarsePointer(pointerCoarse);
-      setUseBottomSheet(pointerCoarse || narrowQuery.matches);
+      setUseBottomSheet(narrowQuery.matches);
     };
 
     const addMediaListener = (query: MediaQueryList, listener: () => void) => {
@@ -144,13 +117,9 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
     syncUseBottomSheet();
 
     addMediaListener(narrowQuery, syncUseBottomSheet);
-    addMediaListener(pointerCoarseQuery, syncUseBottomSheet);
-    addMediaListener(hoverNoneAndPointerCoarseQuery, syncUseBottomSheet);
 
     return () => {
       removeMediaListener(narrowQuery, syncUseBottomSheet);
-      removeMediaListener(pointerCoarseQuery, syncUseBottomSheet);
-      removeMediaListener(hoverNoneAndPointerCoarseQuery, syncUseBottomSheet);
     };
   }, []);
 
@@ -262,8 +231,7 @@ function ModelPickerComponent({ options, value, onChange, disabled = false }: Mo
     }
 
     if (!isOpen) {
-      setHasCoarsePointer(detectCoarsePointerPreference());
-      setUseBottomSheet(detectBottomSheetPreferenceAtOpen());
+      setUseBottomSheet(detectMobileViewport());
     }
 
     setIsOpen((current) => !current);

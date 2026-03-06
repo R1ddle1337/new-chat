@@ -64,6 +64,9 @@ const autoScrollThresholdPx = 120;
 const streamingRenderIntervalMs = 50;
 const maxComposerImages = 6;
 const maxComposerDocs = 5;
+const mobileViewportBreakpointPx = 980;
+const mobileComposerMaxHeightPx = 160;
+const desktopComposerMaxHeightPx = 220;
 const chatModelStorageKey = 'nchat_last_model';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const supportedDocumentMimeTypes = new Set(['text/plain', 'text/markdown', 'application/pdf']);
@@ -1172,6 +1175,14 @@ function detectCoarsePointerDevice(): boolean {
   );
 }
 
+function detectMobileViewport(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  return window.innerWidth <= mobileViewportBreakpointPx;
+}
+
 function addMediaListener(query: MediaQueryList, listener: () => void): void {
   if (typeof query.addEventListener === 'function') {
     query.addEventListener('change', listener);
@@ -1262,6 +1273,7 @@ export default function ChatPage() {
   const [desktopComposerEnterSends, setDesktopComposerEnterSends] = useState(
     () => !detectCoarsePointerDevice(),
   );
+  const [isMobileViewport, setIsMobileViewport] = useState(() => detectMobileViewport());
   const [activeAbortController, setActiveAbortController] = useState<AbortController | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
@@ -1426,13 +1438,16 @@ export default function ChatPage() {
       return;
     }
 
+    const maxHeight = isMobileViewport ? mobileComposerMaxHeightPx : desktopComposerMaxHeightPx;
     const computedMinHeight = Number.parseFloat(window.getComputedStyle(textarea).minHeight);
     const minHeight = Number.isFinite(computedMinHeight) ? computedMinHeight : 44;
 
-    textarea.style.height = '0px';
-    const nextHeight = Math.min(textarea.scrollHeight, 220);
+    textarea.style.height = 'auto';
+    const contentHeight = textarea.scrollHeight;
+    const nextHeight = Math.min(contentHeight, maxHeight);
     textarea.style.height = `${Math.max(nextHeight, minHeight)}px`;
-  }, []);
+    textarea.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
+  }, [isMobileViewport]);
 
   const setAutoScrollState = useCallback((atBottom: boolean) => {
     shouldAutoScrollRef.current = atBottom;
@@ -1542,6 +1557,27 @@ export default function ChatPage() {
     window.addEventListener('storage', handleStorage);
     return () => {
       window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const mobileViewportQuery = window.matchMedia(`(max-width: ${mobileViewportBreakpointPx}px)`);
+    const syncMobileViewport = () => {
+      setIsMobileViewport((previous) => {
+        const next = mobileViewportQuery.matches;
+        return previous === next ? previous : next;
+      });
+    };
+
+    syncMobileViewport();
+    addMediaListener(mobileViewportQuery, syncMobileViewport);
+
+    return () => {
+      removeMediaListener(mobileViewportQuery, syncMobileViewport);
     };
   }, []);
 
@@ -1749,6 +1785,79 @@ export default function ChatPage() {
   useEffect(() => {
     adjustComposerHeight();
   }, [adjustComposerHeight, input]);
+
+  useEffect(() => {
+    if (!isMobileViewport) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      adjustComposerHeight();
+      const container = messageListRef.current;
+      if (!container) {
+        return;
+      }
+
+      if (shouldAutoScrollRef.current || isNearBottom(container)) {
+        scrollToLatest('auto');
+      }
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+    };
+  }, [
+    adjustComposerHeight,
+    docs.length,
+    editingActive,
+    generationActive,
+    images.length,
+    isMobileViewport,
+    scrollToLatest,
+  ]);
+
+  useEffect(() => {
+    let frame: number | null = null;
+    const scheduleSync = () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
+
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        adjustComposerHeight();
+
+        if (!isMobileViewport) {
+          return;
+        }
+
+        const container = messageListRef.current;
+        if (!container) {
+          return;
+        }
+
+        if (shouldAutoScrollRef.current || isNearBottom(container)) {
+          scrollToLatest('auto');
+        }
+      });
+    };
+
+    scheduleSync();
+    window.addEventListener('resize', scheduleSync);
+
+    const visualViewport = window.visualViewport;
+    visualViewport?.addEventListener('resize', scheduleSync);
+    visualViewport?.addEventListener('scroll', scheduleSync);
+
+    return () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
+      window.removeEventListener('resize', scheduleSync);
+      visualViewport?.removeEventListener('resize', scheduleSync);
+      visualViewport?.removeEventListener('scroll', scheduleSync);
+    };
+  }, [adjustComposerHeight, isMobileViewport, scrollToLatest]);
 
   useEffect(() => {
     const nextPreviewUrls = images.map((file) => URL.createObjectURL(file));
@@ -2494,11 +2603,19 @@ export default function ChatPage() {
         className={`chat-composer-bar${composerActive ? ' is-active' : ''}`}
         onFocusCapture={() => setComposerFocused(true)}
         onBlurCapture={(event) => {
+          const currentTarget = event.currentTarget;
           const nextTarget = event.relatedTarget;
-          if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) {
+          if (nextTarget instanceof Node && currentTarget.contains(nextTarget)) {
             return;
           }
-          setComposerFocused(false);
+
+          window.requestAnimationFrame(() => {
+            const activeElement = document.activeElement;
+            if (activeElement instanceof Node && currentTarget.contains(activeElement)) {
+              return;
+            }
+            setComposerFocused(false);
+          });
         }}
         onSubmit={(event) => {
           event.preventDefault();
@@ -2555,6 +2672,23 @@ export default function ChatPage() {
             }
           }}
           onPaste={handleComposerPaste}
+          onFocus={() => {
+            window.requestAnimationFrame(() => {
+              adjustComposerHeight();
+              if (!isMobileViewport) {
+                return;
+              }
+
+              const container = messageListRef.current;
+              if (!container) {
+                return;
+              }
+
+              if (shouldAutoScrollRef.current || isNearBottom(container)) {
+                scrollToLatest('auto');
+              }
+            });
+          }}
           onKeyDown={(event) => {
             if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) {
               return;
