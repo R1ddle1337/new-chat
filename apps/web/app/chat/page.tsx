@@ -60,7 +60,11 @@ type Toast = {
   message: string;
 };
 
-const autoScrollThresholdPx = 120;
+const autoScrollEnterThresholdPx = 56;
+const autoScrollExitThresholdPx = 136;
+const autoScrollResumeThresholdPx = 24;
+const programmaticScrollAutoGuardMs = 140;
+const programmaticScrollSmoothGuardMs = 720;
 const streamingRenderIntervalMs = 50;
 const maxComposerImages = 6;
 const maxComposerDocs = 5;
@@ -1159,9 +1163,12 @@ function writeStoredChatModelId(modelId: string): void {
   }
 }
 
-function isNearBottom(element: HTMLElement): boolean {
-  const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
-  return distance <= autoScrollThresholdPx;
+function distanceFromBottom(element: HTMLElement): number {
+  return Math.max(0, element.scrollHeight - element.scrollTop - element.clientHeight);
+}
+
+function isNearBottom(element: HTMLElement, thresholdPx: number): boolean {
+  return distanceFromBottom(element) <= thresholdPx;
 }
 
 function detectCoarsePointerDevice(): boolean {
@@ -1242,8 +1249,14 @@ export default function ChatPage() {
     useChatShell();
 
   const messageListRef = useRef<HTMLDivElement | null>(null);
+  const composerRegionRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const isAtBottomRef = useRef(true);
+  const userPausedAutoScrollRef = useRef(false);
+  const lastKnownScrollTopRef = useRef(0);
+  const programmaticScrollUntilRef = useRef(0);
+  const pendingAutoScrollFrameRef = useRef<number | null>(null);
+  const pendingScrollStateFrameRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const toastCounterRef = useRef(0);
@@ -1449,6 +1462,14 @@ export default function ChatPage() {
     textarea.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
   }, [isMobileViewport]);
 
+  const markProgrammaticScroll = useCallback((durationMs: number) => {
+    const now =
+      typeof window !== 'undefined' && typeof window.performance !== 'undefined'
+        ? window.performance.now()
+        : Date.now();
+    programmaticScrollUntilRef.current = now + durationMs;
+  }, []);
+
   const setAutoScrollState = useCallback((atBottom: boolean) => {
     shouldAutoScrollRef.current = atBottom;
     isAtBottomRef.current = atBottom;
@@ -1458,6 +1479,67 @@ export default function ChatPage() {
     });
   }, []);
 
+  const resolveAtBottomState = useCallback((container: HTMLElement): boolean => {
+    const atAbsoluteBottom = isNearBottom(container, autoScrollResumeThresholdPx);
+    if (atAbsoluteBottom) {
+      userPausedAutoScrollRef.current = false;
+    }
+
+    if (userPausedAutoScrollRef.current && !atAbsoluteBottom) {
+      return false;
+    }
+
+    const threshold = isAtBottomRef.current ? autoScrollExitThresholdPx : autoScrollEnterThresholdPx;
+    return isNearBottom(container, threshold);
+  }, []);
+
+  const syncAutoScrollStateFromContainer = useCallback((): boolean => {
+    const container = messageListRef.current;
+    if (!container) {
+      return false;
+    }
+
+    const atBottom = resolveAtBottomState(container);
+    setAutoScrollState(atBottom);
+    lastKnownScrollTopRef.current = container.scrollTop;
+    return atBottom;
+  }, [resolveAtBottomState, setAutoScrollState]);
+
+  const scheduleAutoScrollStateSync = useCallback(() => {
+    if (pendingScrollStateFrameRef.current !== null) {
+      return;
+    }
+
+    pendingScrollStateFrameRef.current = window.requestAnimationFrame(() => {
+      pendingScrollStateFrameRef.current = null;
+      syncAutoScrollStateFromContainer();
+    });
+  }, [syncAutoScrollStateFromContainer]);
+
+  const scheduleAutoScrollIfNeeded = useCallback(() => {
+    if (pendingAutoScrollFrameRef.current !== null) {
+      return;
+    }
+
+    pendingAutoScrollFrameRef.current = window.requestAnimationFrame(() => {
+      pendingAutoScrollFrameRef.current = null;
+      const container = messageListRef.current;
+      if (!container) {
+        return;
+      }
+
+      if (!shouldAutoScrollRef.current) {
+        scheduleAutoScrollStateSync();
+        return;
+      }
+
+      markProgrammaticScroll(programmaticScrollAutoGuardMs);
+      container.scrollTop = container.scrollHeight;
+      lastKnownScrollTopRef.current = container.scrollTop;
+      setAutoScrollState(true);
+    });
+  }, [markProgrammaticScroll, scheduleAutoScrollStateSync, setAutoScrollState]);
+
   const scrollToLatest = useCallback(
     (behavior: ScrollBehavior = 'auto') => {
       const container = messageListRef.current;
@@ -1465,15 +1547,21 @@ export default function ChatPage() {
         return;
       }
 
+      userPausedAutoScrollRef.current = false;
+      markProgrammaticScroll(
+        behavior === 'smooth' ? programmaticScrollSmoothGuardMs : programmaticScrollAutoGuardMs,
+      );
+
       if (behavior === 'smooth') {
         container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
       } else {
         container.scrollTop = container.scrollHeight;
       }
 
+      lastKnownScrollTopRef.current = container.scrollTop;
       setAutoScrollState(true);
     },
-    [setAutoScrollState],
+    [markProgrammaticScroll, setAutoScrollState],
   );
 
   const updateAutoScrollState = useCallback(() => {
@@ -1482,8 +1570,38 @@ export default function ChatPage() {
       return;
     }
 
-    setAutoScrollState(isNearBottom(container));
-  }, [setAutoScrollState]);
+    const now =
+      typeof window !== 'undefined' && typeof window.performance !== 'undefined'
+        ? window.performance.now()
+        : Date.now();
+    const isProgrammaticScroll = now <= programmaticScrollUntilRef.current;
+    const nextScrollTop = container.scrollTop;
+    const previousScrollTop = lastKnownScrollTopRef.current;
+
+    if (!isProgrammaticScroll) {
+      const isUserScrollingUp = nextScrollTop < previousScrollTop - 2;
+      if (isUserScrollingUp && !isNearBottom(container, autoScrollResumeThresholdPx)) {
+        userPausedAutoScrollRef.current = true;
+      }
+    }
+
+    lastKnownScrollTopRef.current = nextScrollTop;
+
+    if (isProgrammaticScroll) {
+      return;
+    }
+
+    scheduleAutoScrollStateSync();
+  }, [scheduleAutoScrollStateSync]);
+
+  const handleMessageListLayoutShift = useCallback(() => {
+    if (shouldAutoScrollRef.current) {
+      scheduleAutoScrollIfNeeded();
+      return;
+    }
+
+    scheduleAutoScrollStateSync();
+  }, [scheduleAutoScrollIfNeeded, scheduleAutoScrollStateSync]);
 
   const loadAllowedModels = async (): Promise<AllowedModelItem[]> => {
     const response = await fetch('/api/v1/models', { credentials: 'include' });
@@ -1663,6 +1781,9 @@ export default function ChatPage() {
 
     shouldAutoScrollRef.current = true;
     isAtBottomRef.current = true;
+    userPausedAutoScrollRef.current = false;
+    lastKnownScrollTopRef.current = 0;
+    programmaticScrollUntilRef.current = 0;
     setShowJumpToLatest(false);
     seenMessageIdsRef.current = new Set();
     seededMessageIdsRef.current = false;
@@ -1682,6 +1803,14 @@ export default function ChatPage() {
     if (streamFlushFrameRef.current !== null) {
       window.cancelAnimationFrame(streamFlushFrameRef.current);
       streamFlushFrameRef.current = null;
+    }
+    if (pendingAutoScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(pendingAutoScrollFrameRef.current);
+      pendingAutoScrollFrameRef.current = null;
+    }
+    if (pendingScrollStateFrameRef.current !== null) {
+      window.cancelAnimationFrame(pendingScrollStateFrameRef.current);
+      pendingScrollStateFrameRef.current = null;
     }
     stopRequestedRef.current = false;
 
@@ -1754,6 +1883,14 @@ export default function ChatPage() {
         window.cancelAnimationFrame(streamFlushFrameRef.current);
         streamFlushFrameRef.current = null;
       }
+      if (pendingAutoScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(pendingAutoScrollFrameRef.current);
+        pendingAutoScrollFrameRef.current = null;
+      }
+      if (pendingScrollStateFrameRef.current !== null) {
+        window.cancelAnimationFrame(pendingScrollStateFrameRef.current);
+        pendingScrollStateFrameRef.current = null;
+      }
     };
   }, []);
 
@@ -1765,22 +1902,13 @@ export default function ChatPage() {
   );
 
   useEffect(() => {
-    const frame = window.requestAnimationFrame(() => {
-      const container = messageListRef.current;
-      if (!container) {
-        return;
-      }
+    if (shouldAutoScrollRef.current) {
+      scheduleAutoScrollIfNeeded();
+      return;
+    }
 
-      if (shouldAutoScrollRef.current || isNearBottom(container)) {
-        scrollToLatest('auto');
-        return;
-      }
-
-      setAutoScrollState(false);
-    });
-
-    return () => window.cancelAnimationFrame(frame);
-  }, [messages, scrollToLatest, setAutoScrollState, streamingAssistantContent]);
+    scheduleAutoScrollStateSync();
+  }, [messages, scheduleAutoScrollIfNeeded, scheduleAutoScrollStateSync, streamingAssistantContent]);
 
   useEffect(() => {
     adjustComposerHeight();
@@ -1793,14 +1921,7 @@ export default function ChatPage() {
 
     const frame = window.requestAnimationFrame(() => {
       adjustComposerHeight();
-      const container = messageListRef.current;
-      if (!container) {
-        return;
-      }
-
-      if (shouldAutoScrollRef.current || isNearBottom(container)) {
-        scrollToLatest('auto');
-      }
+      handleMessageListLayoutShift();
     });
 
     return () => {
@@ -1811,9 +1932,9 @@ export default function ChatPage() {
     docs.length,
     editingActive,
     generationActive,
+    handleMessageListLayoutShift,
     images.length,
     isMobileViewport,
-    scrollToLatest,
   ]);
 
   useEffect(() => {
@@ -1826,19 +1947,7 @@ export default function ChatPage() {
       frame = window.requestAnimationFrame(() => {
         frame = null;
         adjustComposerHeight();
-
-        if (!isMobileViewport) {
-          return;
-        }
-
-        const container = messageListRef.current;
-        if (!container) {
-          return;
-        }
-
-        if (shouldAutoScrollRef.current || isNearBottom(container)) {
-          scrollToLatest('auto');
-        }
+        handleMessageListLayoutShift();
       });
     };
 
@@ -1857,7 +1966,48 @@ export default function ChatPage() {
       visualViewport?.removeEventListener('resize', scheduleSync);
       visualViewport?.removeEventListener('scroll', scheduleSync);
     };
-  }, [adjustComposerHeight, isMobileViewport, scrollToLatest]);
+  }, [adjustComposerHeight, handleMessageListLayoutShift]);
+
+  useEffect(() => {
+    const composerRegion = composerRegionRef.current;
+    if (!composerRegion) {
+      return;
+    }
+
+    let frame: number | null = null;
+    const scheduleSync = () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
+
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        handleMessageListLayoutShift();
+      });
+    };
+
+    scheduleSync();
+
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', scheduleSync);
+      return () => {
+        if (frame !== null) {
+          window.cancelAnimationFrame(frame);
+        }
+        window.removeEventListener('resize', scheduleSync);
+      };
+    }
+
+    const observer = new ResizeObserver(scheduleSync);
+    observer.observe(composerRegion);
+
+    return () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
+      observer.disconnect();
+    };
+  }, [handleMessageListLayoutShift]);
 
   useEffect(() => {
     const nextPreviewUrls = images.map((file) => URL.createObjectURL(file));
@@ -2517,7 +2667,10 @@ export default function ChatPage() {
   );
 
   const composerRegion = (
-    <div className={`chat-composer-region${showHomeState ? ' chat-composer-region-home' : ''}`}>
+    <div
+      ref={composerRegionRef}
+      className={`chat-composer-region${showHomeState ? ' chat-composer-region-home' : ''}`}
+    >
       {imagePreviewUrls.length > 0 ? (
         <div className="chat-image-preview-row">
           <div className="chat-image-preview-grid">
@@ -2679,14 +2832,12 @@ export default function ChatPage() {
                 return;
               }
 
-              const container = messageListRef.current;
-              if (!container) {
+              if (shouldAutoScrollRef.current) {
+                scheduleAutoScrollIfNeeded();
                 return;
               }
 
-              if (shouldAutoScrollRef.current || isNearBottom(container)) {
-                scrollToLatest('auto');
-              }
+              scheduleAutoScrollStateSync();
             });
           }}
           onKeyDown={(event) => {
@@ -2801,7 +2952,13 @@ export default function ChatPage() {
       ) : (
         <>
           <div className="chat-surface">
-            <div ref={messageListRef} className="chat-messages-scroll" onScroll={updateAutoScrollState}>
+            <div
+              ref={messageListRef}
+              className="chat-messages-scroll"
+              onScroll={updateAutoScrollState}
+              onLoadCapture={handleMessageListLayoutShift}
+              onErrorCapture={handleMessageListLayoutShift}
+            >
               {messagesLoading ? (
                 <div className="chat-empty-state">Loading conversation...</div>
               ) : null}
