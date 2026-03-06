@@ -290,9 +290,9 @@ const config = {
     min: 1000,
     max: 120_000,
   }),
-  agentFetchMaxBytes: parseEnvPositiveInteger(process.env.AGENT_FETCH_MAX_BYTES, 500_000, {
+  agentFetchMaxBytes: parseEnvPositiveInteger(process.env.AGENT_FETCH_MAX_BYTES, 2_000_000, {
     min: 50_000,
-    max: 2_000_000,
+    max: 5_000_000,
   }),
   agentWebSearchResultLimit: parseEnvPositiveInteger(process.env.AGENT_WEB_SEARCH_RESULT_LIMIT, 5, {
     min: 1,
@@ -432,6 +432,7 @@ const AGENT_FINAL_RESPONSE_MAX_CHARS = 60_000;
 const AGENT_RESULT_DELTA_CHUNK_CHARS = 500;
 const AGENT_MAX_FETCH_REDIRECTS = 3;
 const AGENT_MAX_HTML_TO_TEXT_CHARS = 80_000;
+const AGENT_WEB_FETCH_MIN_DOWNLOAD_BYTES = 2_000_000;
 const AGENT_MAX_ACTION_PARSE_REPAIR_ATTEMPTS = 2;
 const AGENT_SYSTEM_PROMPT = `You are an execution-focused assistant running in "Agent Mode V1".
 
@@ -4053,8 +4054,17 @@ async function fetchWithRedirectValidation(params: {
   url: string;
   timeoutMs: number;
   maxBytes: number;
-}): Promise<{ url: string; status: number; contentType: string; bodyText: string }> {
+  overflowStrategy?: 'error' | 'truncate';
+}): Promise<{
+  url: string;
+  status: number;
+  contentType: string;
+  bodyText: string;
+  bodyBytes: number;
+  truncated: boolean;
+}> {
   let currentUrl = params.url;
+  const overflowStrategy = params.overflowStrategy ?? 'error';
 
   for (let redirectCount = 0; redirectCount <= AGENT_MAX_FETCH_REDIRECTS; redirectCount += 1) {
     await assertSafePublicUrl(currentUrl);
@@ -4062,9 +4072,8 @@ async function fetchWithRedirectValidation(params: {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), params.timeoutMs);
 
-    let response: Response;
     try {
-      response = await fetch(currentUrl, {
+      const response = await fetch(currentUrl, {
         method: 'GET',
         redirect: 'manual',
         signal: controller.signal,
@@ -4073,64 +4082,116 @@ async function fetchWithRedirectValidation(params: {
           accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5',
         },
       });
-    } catch (error) {
-      clearTimeout(timeoutId);
-      throw new Error(error instanceof Error ? error.message : 'Failed to fetch URL');
-    } finally {
-      clearTimeout(timeoutId);
-    }
 
-    const status = response.status;
-    if (status >= 300 && status < 400) {
-      const location = response.headers.get('location');
-      if (!location) {
-        throw new Error('Redirect response is missing location header');
+      const status = response.status;
+      if (status >= 300 && status < 400) {
+        const location = response.headers.get('location');
+        if (!location) {
+          throw new Error('Redirect response is missing location header');
+        }
+        const nextUrl = new URL(location, currentUrl);
+        currentUrl = nextUrl.toString();
+        continue;
       }
-      const nextUrl = new URL(location, currentUrl);
-      currentUrl = nextUrl.toString();
-      continue;
-    }
 
-    if (!response.ok) {
-      throw new Error(`Web request failed with status ${status}`);
-    }
+      if (!response.ok) {
+        throw new Error(`Web request failed with status ${status}`);
+      }
 
-    const body = response.body;
-    if (!body) {
+      const body = response.body;
+      if (!body) {
+        return {
+          url: currentUrl,
+          status,
+          contentType: response.headers.get('content-type') ?? '',
+          bodyText: '',
+          bodyBytes: 0,
+          truncated: false,
+        };
+      }
+
+      const contentLengthHeader = response.headers.get('content-length');
+      const contentLength =
+        contentLengthHeader && /^[0-9]+$/.test(contentLengthHeader)
+          ? Number.parseInt(contentLengthHeader, 10)
+          : null;
+      if (contentLength !== null && contentLength > params.maxBytes && overflowStrategy === 'error') {
+        throw new Error(`Response exceeded ${params.maxBytes} bytes`);
+      }
+
+      const reader = body.getReader();
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      let truncated = false;
+      let shouldCancelReader = false;
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+
+          const chunk = Buffer.from(value);
+          const remainingBytes = params.maxBytes - totalBytes;
+          if (remainingBytes <= 0) {
+            if (overflowStrategy === 'truncate') {
+              truncated = true;
+              shouldCancelReader = true;
+              break;
+            }
+            shouldCancelReader = true;
+            throw new Error(`Response exceeded ${params.maxBytes} bytes`);
+          }
+
+          if (chunk.byteLength > remainingBytes) {
+            if (overflowStrategy === 'truncate') {
+              chunks.push(chunk.subarray(0, remainingBytes));
+              totalBytes += remainingBytes;
+              truncated = true;
+              shouldCancelReader = true;
+              break;
+            }
+            shouldCancelReader = true;
+            throw new Error(`Response exceeded ${params.maxBytes} bytes`);
+          }
+
+          chunks.push(chunk);
+          totalBytes += chunk.byteLength;
+        }
+      } finally {
+        if (shouldCancelReader) {
+          try {
+            await reader.cancel();
+          } catch {
+            // Ignore cancellation errors from already-closed streams.
+          }
+        }
+        try {
+          reader.releaseLock();
+        } catch {
+          // No-op.
+        }
+      }
+
+      const buffer = Buffer.concat(chunks);
+      const bodyText = buffer.toString('utf8');
       return {
         url: currentUrl,
         status,
         contentType: response.headers.get('content-type') ?? '',
-        bodyText: '',
+        bodyText,
+        bodyBytes: totalBytes,
+        truncated,
       };
-    }
-
-    const reader = body.getReader();
-    const chunks: Buffer[] = [];
-    let totalBytes = 0;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`Web request timed out after ${params.timeoutMs}ms`);
       }
-
-      const chunk = Buffer.from(value);
-      totalBytes += chunk.byteLength;
-      if (totalBytes > params.maxBytes) {
-        throw new Error(`Response exceeded ${params.maxBytes} bytes`);
-      }
-      chunks.push(chunk);
+      throw new Error(error instanceof Error ? error.message : 'Failed to fetch URL');
+    } finally {
+      clearTimeout(timeoutId);
     }
-
-    const buffer = Buffer.concat(chunks);
-    const bodyText = buffer.toString('utf8');
-    return {
-      url: currentUrl,
-      status,
-      contentType: response.headers.get('content-type') ?? '',
-      bodyText,
-    };
   }
 
   throw new Error('Too many redirects');
@@ -4260,10 +4321,12 @@ async function runWebFetchTool(urlRaw: string): Promise<{
   }
 
   const validated = await assertSafePublicUrl(normalizedUrlInput);
+  const maxWebFetchBytes = Math.max(config.agentFetchMaxBytes, AGENT_WEB_FETCH_MIN_DOWNLOAD_BYTES);
   const response = await fetchWithRedirectValidation({
     url: validated.toString(),
     timeoutMs: Math.min(config.agentToolTimeoutMs, config.agentFetchTimeoutMs),
-    maxBytes: config.agentFetchMaxBytes,
+    maxBytes: maxWebFetchBytes,
+    overflowStrategy: 'truncate',
   });
 
   const contentType = response.contentType.toLowerCase();
@@ -4278,17 +4341,23 @@ async function runWebFetchTool(urlRaw: string): Promise<{
     extractedText = truncateText(normalizeReadableText(response.bodyText), AGENT_MAX_HTML_TO_TEXT_CHARS);
   }
   const finalText = extractedText || '[no readable text found]';
+  const truncationNote = response.truncated
+    ? `\n[Source was truncated after ${response.bodyBytes} bytes for safety.]`
+    : '';
 
   return {
-    summary: `Fetched ${response.url}`,
+    summary: response.truncated ? `Fetched ${response.url} (source truncated safely)` : `Fetched ${response.url}`,
     modelText: truncateText(
-      `Tool web_fetch URL: ${response.url}\nContent-Type: ${response.contentType || 'unknown'}\nExtracted text:\n${finalText}`,
+      `Tool web_fetch URL: ${response.url}\nContent-Type: ${response.contentType || 'unknown'}\nExtracted text:\n${finalText}${truncationNote}`,
       AGENT_MAX_TOOL_RESULT_CHARS,
     ),
     metadata: {
       url: response.url,
       status: response.status,
       content_type: response.contentType,
+      response_bytes: response.bodyBytes,
+      response_truncated: response.truncated,
+      fetch_max_bytes: maxWebFetchBytes,
       extracted_chars: finalText.length,
       extraction_source: extractionSource,
     },
