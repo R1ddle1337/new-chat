@@ -3,13 +3,14 @@ import multipart from '@fastify/multipart';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
-import { promises as fs } from 'node:fs';
+import { createReadStream, createWriteStream, promises as fs } from 'node:fs';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { PassThrough, Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { Readable, Transform } from 'node:stream';
 import { inflateSync } from 'node:zlib';
 import { Client as MinioClient } from 'minio';
 import { Pool } from 'pg';
@@ -8080,7 +8081,8 @@ async function setupServer(): Promise<void> {
     }
 
     const objectKey = `${user.id}/${crypto.randomUUID()}-${file.filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-    const passthrough = new PassThrough();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'new-chat-upload-'));
+    const tempFilePath = path.join(tempDir, 'upload.bin');
     const shouldCapturePlainText = isPlainTextUploadMimeType(uploadMimeType);
     const capturedTextChunks: Buffer[] = [];
     let capturedTextBytes = 0;
@@ -8099,151 +8101,172 @@ async function setupServer(): Promise<void> {
       }
     };
 
-    passthrough.on('data', (chunk) => {
-      const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      bytes += chunkBuffer.length;
-
-      if (!shouldCapturePlainText || capturedTextBytes >= MAX_STREAMED_TEXT_CAPTURE_BYTES) {
-        return;
+    const cleanupTempUploadBuffer = async (): Promise<void> => {
+      try {
+        await fs.rm(tempDir, { recursive: true, force: true });
+      } catch (error) {
+        request.log.warn(
+          { err: error, userId: user.id, tempDir },
+          'Failed to cleanup temp upload buffer',
+        );
       }
-
-      const remainingBytes = MAX_STREAMED_TEXT_CAPTURE_BYTES - capturedTextBytes;
-      const captureChunk =
-        chunkBuffer.length > remainingBytes ? chunkBuffer.subarray(0, remainingBytes) : chunkBuffer;
-      capturedTextChunks.push(Buffer.from(captureChunk));
-      capturedTextBytes += captureChunk.length;
-    });
+    };
 
     file.file.on('limit', () => {
       multipartLimitExceeded = true;
-      const limitError = new Error('multipart file too large');
-      multipartStreamError = limitError;
-      if (!passthrough.destroyed) {
-        passthrough.destroy(limitError);
-      }
+      multipartStreamError = new Error('multipart file too large');
     });
 
     file.file.on('error', (error) => {
       multipartStreamError = error;
-      if (!passthrough.destroyed) {
-        passthrough.destroy(error instanceof Error ? error : new Error('multipart stream error'));
-      }
     });
 
-    file.file.pipe(passthrough);
-
     try {
-      await minio.putObject(config.minioBucket, objectKey, passthrough, undefined, {
-        'Content-Type': uploadMimeType,
-      });
-    } catch (error) {
-      const limitExceeded = multipartLimitExceeded || file.file.truncated || isMultipartLimitError(error);
-      if (limitExceeded) {
-        await cleanupUploadedObject();
+      try {
+        await pipeline(
+          file.file,
+          new Transform({
+            transform(chunk, _encoding, callback) {
+              const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+              bytes += chunkBuffer.length;
+
+              if (shouldCapturePlainText && capturedTextBytes < MAX_STREAMED_TEXT_CAPTURE_BYTES) {
+                const remainingBytes = MAX_STREAMED_TEXT_CAPTURE_BYTES - capturedTextBytes;
+                const captureChunk =
+                  chunkBuffer.length > remainingBytes ? chunkBuffer.subarray(0, remainingBytes) : chunkBuffer;
+                capturedTextChunks.push(Buffer.from(captureChunk));
+                capturedTextBytes += captureChunk.length;
+              }
+
+              callback(null, chunkBuffer);
+            },
+          }),
+          createWriteStream(tempFilePath),
+        );
+      } catch (error) {
+        const limitExceeded = multipartLimitExceeded || file.file.truncated || isMultipartLimitError(error);
+        if (limitExceeded) {
+          reply.code(400).send({ error: 'File too large. Maximum upload size is 100MB' });
+          return;
+        }
+
+        if (multipartStreamError) {
+          reply.code(400).send({ error: 'Invalid multipart upload stream' });
+          return;
+        }
+
+        throw error;
+      }
+
+      if (multipartLimitExceeded || file.file.truncated) {
         reply.code(400).send({ error: 'File too large. Maximum upload size is 100MB' });
         return;
       }
 
-      if (multipartStreamError) {
+      try {
+        await minio.putObject(config.minioBucket, objectKey, createReadStream(tempFilePath), bytes, {
+          'Content-Type': uploadMimeType,
+        });
+      } catch (error) {
+        const limitExceeded = multipartLimitExceeded || file.file.truncated || isMultipartLimitError(error);
+        if (limitExceeded) {
+          await cleanupUploadedObject();
+          reply.code(400).send({ error: 'File too large. Maximum upload size is 100MB' });
+          return;
+        }
+
+        if (multipartStreamError) {
+          await cleanupUploadedObject();
+          reply.code(400).send({ error: 'Invalid multipart upload stream' });
+          return;
+        }
+
         await cleanupUploadedObject();
-        reply.code(400).send({ error: 'Invalid multipart upload stream' });
+        request.log.error(
+          {
+            err: error,
+            userId: user.id,
+            bucket: config.minioBucket,
+            objectKey,
+            mimeType: uploadMimeType,
+            sizeBytes: bytes,
+          },
+          'Failed to upload buffered file to object storage',
+        );
+        reply.code(502).send({ error: 'Upstream storage error' });
         return;
       }
 
-      request.log.error(
-        {
-          err: error,
-          userId: user.id,
-          bucket: config.minioBucket,
-          objectKey,
-          mimeType: uploadMimeType,
-        },
-        'Failed to upload file to object storage',
+      const insert = await pool.query<{ id: string; created_at: string }>(
+        `INSERT INTO files (user_id, bucket, object_key, filename, mime_type, size_bytes)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, created_at`,
+        [user.id, config.minioBucket, objectKey, file.filename, uploadMimeType, bytes],
       );
-      if (!passthrough.destroyed) {
-        passthrough.destroy(error instanceof Error ? error : new Error('minio upload failed'));
-      }
-      if (!file.file.destroyed) {
-        file.file.destroy(error instanceof Error ? error : new Error('minio upload failed'));
-      }
-      reply.code(502).send({ error: 'Upstream storage error' });
-      return;
-    }
 
-    if (multipartLimitExceeded || file.file.truncated) {
-      await cleanupUploadedObject();
-      reply.code(400).send({ error: 'File too large. Maximum upload size is 100MB' });
-      return;
-    }
+      const record = insert.rows[0]!;
 
-    const insert = await pool.query<{ id: string; created_at: string }>(
-      `INSERT INTO files (user_id, bucket, object_key, filename, mime_type, size_bytes)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, created_at`,
-      [user.id, config.minioBucket, objectKey, file.filename, uploadMimeType, bytes],
-    );
-
-    const record = insert.rows[0]!;
-
-    if (isDocumentUploadMimeType(uploadMimeType)) {
-      try {
-        let extractedText: string | null = null;
-        if (isPlainTextUploadMimeType(uploadMimeType)) {
-          extractedText = normalizeExtractedFileText(Buffer.concat(capturedTextChunks).toString('utf8'));
-        } else if (uploadMimeType === 'application/pdf') {
-          const maxInlinePdfExtractionBytes = Math.min(MAX_INLINE_PDF_EXTRACTION_BYTES, MAX_UPLOAD_FILE_BYTES);
-          if (bytes <= maxInlinePdfExtractionBytes) {
-            const objectStream = await getMinioObjectStream(config.minioBucket, objectKey);
-            const pdfBuffer = await streamToBuffer(objectStream);
-            extractedText = await extractTextFromUploadedBuffer(pdfBuffer, uploadMimeType);
-          } else {
-            request.log.warn(
-              {
-                fileId: record.id,
-                userId: user.id,
-                mimeType: uploadMimeType,
-                sizeBytes: bytes,
-                thresholdBytes: maxInlinePdfExtractionBytes,
-              },
-              'Skipped PDF extraction due to size',
-            );
+      if (isDocumentUploadMimeType(uploadMimeType)) {
+        try {
+          let extractedText: string | null = null;
+          if (isPlainTextUploadMimeType(uploadMimeType)) {
+            extractedText = normalizeExtractedFileText(Buffer.concat(capturedTextChunks).toString('utf8'));
+          } else if (uploadMimeType === 'application/pdf') {
+            const maxInlinePdfExtractionBytes = Math.min(MAX_INLINE_PDF_EXTRACTION_BYTES, MAX_UPLOAD_FILE_BYTES);
+            if (bytes <= maxInlinePdfExtractionBytes) {
+              const pdfBuffer = await fs.readFile(tempFilePath);
+              extractedText = await extractTextFromUploadedBuffer(pdfBuffer, uploadMimeType);
+            } else {
+              request.log.warn(
+                {
+                  fileId: record.id,
+                  userId: user.id,
+                  mimeType: uploadMimeType,
+                  sizeBytes: bytes,
+                  thresholdBytes: maxInlinePdfExtractionBytes,
+                },
+                'Skipped PDF extraction due to size',
+              );
+            }
           }
-        }
 
-        if (extractedText !== null) {
-          await upsertExtractedFileText(record.id, extractedText);
+          if (extractedText !== null) {
+            await upsertExtractedFileText(record.id, extractedText);
+          }
+        } catch (error) {
+          request.log.warn(
+            {
+              err: error,
+              fileId: record.id,
+              userId: user.id,
+              mimeType: uploadMimeType,
+            },
+            'Failed to extract text from uploaded file',
+          );
         }
-      } catch (error) {
-        request.log.warn(
-          {
-            err: error,
-            fileId: record.id,
-            userId: user.id,
-            mimeType: uploadMimeType,
-          },
-          'Failed to extract text from uploaded file',
-        );
       }
+
+      await writeAuditEvent({
+        eventType: 'files.uploaded',
+        request,
+        userId: user.id,
+        metadata: {
+          mime_type: uploadMimeType,
+          size_bytes: bytes,
+        },
+      });
+
+      reply.send({
+        id: record.id,
+        object: 'file',
+        bytes,
+        created_at: Math.floor(new Date(record.created_at).getTime() / 1000),
+        filename: file.filename,
+        purpose: 'vision',
+      });
+    } finally {
+      await cleanupTempUploadBuffer();
     }
-
-    await writeAuditEvent({
-      eventType: 'files.uploaded',
-      request,
-      userId: user.id,
-      metadata: {
-        mime_type: uploadMimeType,
-        size_bytes: bytes,
-      },
-    });
-
-    reply.send({
-      id: record.id,
-      object: 'file',
-      bytes,
-      created_at: Math.floor(new Date(record.created_at).getTime() / 1000),
-      filename: file.filename,
-      purpose: 'vision',
-    });
   });
 
   app.get('/v1/files/:fileId/content', { preHandler: [requireAuth, v1RateLimit] }, async (request, reply) => {
